@@ -1,0 +1,5 @@
+python-telegram-bot
+anthropic
+python-dotenv
+httpx
+apscheduler
