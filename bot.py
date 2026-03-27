@@ -1254,10 +1254,16 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # 스케줄러 (보험료 자동 등록 KST 19:00)
+   async def post_init(application):
     scheduler = AsyncIOScheduler(timezone=KST)
     scheduler.add_job(auto_insurance, "cron", hour=19, minute=0)
     scheduler.start()
 
+app = Application.builder().token(TELEGRAM_TOKEN)\
+    .post_init(post_init).build()
+
+# scheduler.start() 줄 삭제
+app.run_polling(allowed_updates=["message", "callback_query"])
     logger.info(f"자비스 v5.1 시작 — KST {now_kst().strftime('%Y-%m-%d %H:%M')}")
     app.run_polling(allowed_updates=["message", "callback_query"])
 
