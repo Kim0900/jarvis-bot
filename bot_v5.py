@@ -1076,7 +1076,7 @@ def main():
 
     # 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("명령어", cmd_help))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
