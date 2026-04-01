@@ -243,7 +243,8 @@ async def ocr_payment_history(image_bytes: bytes) -> list:
     prompt = (
         "이 카카오T 수익관리/결제내역 화면에서 모든 운행 건을 추출해서 JSON 배열만 반환해줘.\n"
         '[{"날짜":"YYYY-MM-DD","시각":"HH:MM","요금":숫자,"결제방법":"카드 또는 현금"}, ...]\n'
-        "날짜가 없으면 오늘 날짜로 추정하지 말고 null로 표기.\n"
+        "화면 상단 또는 각 건의 날짜(예: 2026/03/15 또는 2026-03-15)를 반드시 읽어서 YYYY-MM-DD 형식으로 변환해줘.\n"
+        "날짜를 확인할 수 없으면 null로 표기. 절대 오늘 날짜로 추정하지 말 것.\n"
         "JSON 배열만 반환. 설명 금지."
     )
     raw = await claude_vision(image_bytes, prompt, max_tokens=800)
@@ -433,10 +434,17 @@ async def process_payment_history(update: Update, image_bytes: bytes):
         return
 
     saved = 0
-    today = str(today_kst())
+    skipped = 0
+    date_warn = []
     for item in items:
+        날짜 = item.get("날짜")
+        # 날짜 없으면 저장 거부 — 오늘 날짜로 대체하지 않음
+        if not 날짜 or 날짜 == "null":
+            skipped += 1
+            date_warn.append(item.get("시각", "?"))
+            continue
         payload = {
-            "날짜": item.get("날짜") or today,
+            "날짜": 날짜,
             "시각": item.get("시각"),
             "요금": item.get("요금"),
             "결제방법": item.get("결제방법", "카드"),
