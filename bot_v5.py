@@ -1124,13 +1124,13 @@ def main():
     # Telegram application
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 이미지 큐 초기화 및 워커 등록
-    loop = asyncio.new_event_loop()
-
     async def post_init(application):
         global image_queue
         image_queue = asyncio.Queue()
         asyncio.create_task(process_image_queue_worker())
+        # 기존 webhook 제거 + 이전 인스턴스 세션 정리 — Conflict 방지
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook 삭제 완료 — 폴링 시작")
 
     app.post_init = post_init
 
@@ -1143,7 +1143,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("자비스 v5 시작")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message"],
+        timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+    )
 
 if __name__ == "__main__":
     main()
