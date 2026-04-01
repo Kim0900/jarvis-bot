@@ -37,7 +37,7 @@ DOW_KOR = ["월", "화", "수", "목", "금", "토", "일"]
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 ALLOWED_IDS_RAW    = [
     os.getenv("ALLOWED_CHAT_ID", ""),
-    os.getenv("ALLOWED_CHAT_ID_2", ""),
+    os.getenv("ALLOWED_CHAT_ID2", ""),
 ]
 ALLOWED_IDS = {x for x in ALLOWED_IDS_RAW if x}
 
