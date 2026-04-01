@@ -1122,7 +1122,14 @@ def main():
     threading.Thread(target=insurance_scheduler, daemon=True).start()
 
     # Telegram application
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .build()
+    )
 
     async def post_init(application):
         global image_queue
@@ -1146,10 +1153,6 @@ def main():
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=["message"],
-        timeout=30,
-        read_timeout=30,
-        write_timeout=30,
-        connect_timeout=30,
     )
 
 if __name__ == "__main__":
