@@ -374,6 +374,28 @@ async def confirm_baehoe_classification(date_str: str) -> str:
 
 # ──────────────────────────────────────────────
 # 이미지 처리 함수
+
+# ──────────────────────────────────────────────
+# 중복 체크 헬퍼
+# ──────────────────────────────────────────────
+async def check_duplicate_call(날짜: str, 배차시각: str, 요금: int) -> bool:
+    """raw_calls 중복 체크: 날짜+배차시각+요금 동일하면 True"""
+    rows = await sb_select("raw_calls", {
+        "날짜": f"eq.{날짜}",
+        "배차시각": f"eq.{배차시각}",
+        "요금": f"eq.{요금}",
+    })
+    return len(rows) > 0
+
+async def check_duplicate_payment(날짜: str, 시각: str, 요금: int) -> bool:
+    """payment_receipts 중복 체크: 날짜+시각+요금 동일하면 True"""
+    rows = await sb_select("payment_receipts", {
+        "날짜": f"eq.{날짜}",
+        "시각": f"eq.{시각}",
+        "요금": f"eq.{요금}",
+    })
+    return len(rows) > 0
+
 # ──────────────────────────────────────────────
 async def process_call_card(update: Update, image_bytes: bytes):
     data = await ocr_call_card(image_bytes)
@@ -383,23 +405,35 @@ async def process_call_card(update: Update, image_bytes: bytes):
 
     today = str(today_kst())
     dow = get_dow()
+    배차시각 = data.get("배차시각")
+    요금 = data.get("요금", 0)
+
+    # 중복 체크
+    is_dup = await check_duplicate_call(today, 배차시각, 요금)
+    if is_dup:
+        await update.message.reply_text(
+            f"⚠️ 중복 감지 — 저장 안 됨\n"
+            f"{배차시각} {fmt(요금)} 이미 DB에 존재\n"
+            f"동일 콜카드를 두 번 올리신 건 아닌지 확인해주세요."
+        )
+        return
+
     payload = {
         "날짜": today,
         "요일": dow,
-        "배차시각": data.get("배차시각"),
+        "배차시각": 배차시각,
         "출발지": data.get("출발지"),
         "도착지": data.get("도착지"),
-        "요금": data.get("요금"),
+        "요금": 요금,
         "콜유형": data.get("콜유형", "카카오T"),
         "비고": data.get("카드사"),
     }
     result = await sb_insert("raw_calls", payload)
     if result:
-        fee = data.get("요금", 0)
         await update.message.reply_text(
             f"✅ 콜 저장\n"
-            f"{data.get('배차시각','?')} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
-            f"{fmt(fee)} [{data.get('콜유형','카카오T')}]"
+            f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
+            f"{fmt(요금)} [{data.get('콜유형','카카오T')}]"
         )
     else:
         await update.message.reply_text("❌ DB 저장 실패")
@@ -435,7 +469,9 @@ async def process_payment_history(update: Update, image_bytes: bytes):
 
     saved = 0
     skipped = 0
+    duplicated = 0
     date_warn = []
+    dup_list = []
     for item in items:
         날짜 = item.get("날짜")
         # 날짜 없으면 저장 거부 — 오늘 날짜로 대체하지 않음
@@ -443,20 +479,36 @@ async def process_payment_history(update: Update, image_bytes: bytes):
             skipped += 1
             date_warn.append(item.get("시각", "?"))
             continue
+        시각 = item.get("시각")
+        요금 = item.get("요금", 0)
+        # 중복 체크
+        is_dup = await check_duplicate_payment(날짜, 시각, 요금)
+        if is_dup:
+            duplicated += 1
+            dup_list.append(f"{시각} {fmt(요금)}")
+            continue
         payload = {
             "날짜": 날짜,
-            "시각": item.get("시각"),
-            "요금": item.get("요금"),
+            "시각": 시각,
+            "요금": 요금,
             "결제방법": item.get("결제방법", "카드"),
         }
         r = await sb_insert("payment_receipts", payload)
         if r:
             saved += 1
 
-    await update.message.reply_text(
-        f"💳 결제내역 {saved}/{len(items)}건 저장\n"
-        f"교차대조: '대조 {today}' 입력"
-    )
+    dates = list(set(item.get("날짜") for item in items if item.get("날짜") and item.get("날짜") != "null"))
+    msg = f"💳 결제내역 {saved}건 저장"
+    if dates:
+        msg += f" ({', '.join(dates)})"
+    if duplicated > 0:
+        msg += f"\n⚠️ 중복 {duplicated}건 저장 안 됨: {', '.join(dup_list)}"
+    if skipped > 0:
+        msg += f"\n⚠️ 날짜 인식 실패 {skipped}건 저장 안 됨"
+        msg += f"\n  시각: {', '.join(date_warn)} → 날짜 보이는 캡처로 재전송"
+    if saved > 0 and dates:
+        msg += f"\n교차대조: '대조 {dates[0]}' 입력"
+    await update.message.reply_text(msg)
 
 async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
