@@ -223,8 +223,9 @@ async def classify_image(image_bytes: bytes) -> str:
 async def ocr_call_card(image_bytes: bytes) -> dict | None:
     prompt = (
         "이 콜카드 이미지에서 정보를 추출해서 JSON만 반환해줘.\n"
-        '{"배차시각":"HH:MM","출발지":"OO구 OO동","도착지":"OO구 OO동",'
+        '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"OO구 OO동","도착지":"OO구 OO동",'
         '"요금":숫자,"카드사":"카드사명","콜유형":"카카오T 또는 배회"}\n'
+        "배차시각=승차 시각, 하차시각=하차 완료 시각. 없으면 null.\n"
         "JSON만 반환. 설명 금지."
     )
     raw = await claude_vision(image_bytes, prompt, max_tokens=200)
@@ -276,77 +277,127 @@ async def ocr_payment_history(image_bytes: bytes) -> list:
 # ──────────────────────────────────────────────
 async def cross_check(date_str: str) -> str:
     """
-    지정 날짜의 raw_calls(콜카드 OCR)와 payment_receipts(결제내역 OCR) 교차대조.
-    - 시각 ±3분 매칭
-    - 미매칭 콜카드 → 배회영업 후보
-    - 미매칭 결제내역 → 누락 콜카드 후보
+    콜카드(raw_calls) ↔ 결제내역(payment_receipts) 교차대조.
+    매칭 기준: 콜카드 하차시각 ↔ 결제시각 ±5분 + 날짜 자정넘김 처리
+    하차시각 없으면 배차시각+20분으로 추정
     """
-    calls = await sb_select("raw_calls", {"날짜": f"eq.{date_str}", "order": "배차시각.asc"})
-    receipts = await sb_select("payment_receipts", {"날짜": f"eq.{date_str}", "order": "시각.asc"})
+    from datetime import date as date_cls
+
+    calls = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    # 결제내역은 당일 + 익일(자정 넘김) 동시 조회
+    try:
+        y, mo, d = date_str.split("-")
+        next_date = date_cls(int(y), int(mo), int(d))
+        from datetime import timedelta
+        next_date_str = str(next_date + timedelta(days=1))
+    except Exception:
+        next_date_str = date_str
+
+    receipts_today = await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})
+    receipts_next  = await sb_select("payment_receipts", {"날짜": f"eq.{next_date_str}"})
+    receipts = receipts_today + receipts_next
 
     if not calls and not receipts:
         return f"⚠️ {date_str} 데이터 없음 (콜카드·결제내역 모두 미입력)"
 
-    matched_call_ids = set()
-    matched_receipt_ids = set()
-
-    def to_minutes(t_str: str) -> int | None:
+    def to_min_smart(배차시각, 대상시각, 대상날짜):
+        """배차시각 기준으로 하차/결제시각 분 계산 (자정 넘김 자동 처리)"""
         try:
-            h, m = t_str.split(":")
-            return int(h) * 60 + int(m)
+            bh, bm = 배차시각.split(":")
+            base = int(bh)*60 + int(bm)
+            th, tm = 대상시각.split(":")
+            target = int(th)*60 + int(tm)
+            # 결제날짜가 콜날짜+1이면 +1440
+            if 대상날짜 == next_date_str:
+                target += 1440
+            elif target < base - 60:
+                # 날짜 같지만 자정 넘긴 경우 (배차보다 1시간 이상 작음)
+                target += 1440
+            return target
         except Exception:
             return None
 
-    # 매칭: 시각 ±3분 + 요금 일치 우선, 요금 없으면 시각만
+    matched_call_ids = set()
+    matched_receipt_ids = set()
+
+    # 매칭: 하차시각(없으면 배차+20분 추정) ↔ 결제시각 ±5분
     for i, call in enumerate(calls):
-        call_min = to_minutes(call.get("배차시각", "") or "")
+        배차 = call.get("배차시각") or ""
+        하차 = call.get("하차시각")
+
+        # 하차시각 없으면 배차+20분 추정
+        if not 하차:
+            try:
+                bh, bm = 배차.split(":")
+                est = int(bh)*60+int(bm)+20
+                하차 = f"{est//60%24:02d}:{est%60:02d}"
+                call_date_for_est = next_date_str if est >= 1440 else date_str
+            except Exception:
+                continue
+        else:
+            call_date_for_est = date_str
+
+        call_min = to_min_smart(배차, 하차, call_date_for_est)
         call_fee = call.get("요금") or 0
+
+        best_j, best_diff = None, 99999
         for j, rcpt in enumerate(receipts):
             if j in matched_receipt_ids:
                 continue
-            rcpt_min = to_minutes(rcpt.get("시각", "") or "")
-            rcpt_fee = rcpt.get("요금") or 0
-            if call_min is None or rcpt_min is None:
+            rcpt_date = rcpt.get("날짜", date_str)
+            rcpt_min = to_min_smart(배차, rcpt.get("시각") or "", rcpt_date)
+            if rcpt_min is None or call_min is None:
                 continue
-            time_diff = abs(call_min - rcpt_min)
-            if time_diff <= 20:  # 결제완료 시각 기준 ±20분
-                # 시각 매칭 → 요금까지 확인
-                if call_fee == rcpt_fee or call_fee == 0 or rcpt_fee == 0:
-                    matched_call_ids.add(i)
-                    matched_receipt_ids.add(j)
-                    break
-                elif abs(call_fee - rcpt_fee) <= 500:
-                    # 요금 500원 오차 허용 (할증 등)
-                    matched_call_ids.add(i)
-                    matched_receipt_ids.add(j)
-                    break
+            diff = abs(call_min - rcpt_min)
+            rcpt_fee = rcpt.get("요금") or 0
+            # 요금 일치 + 시각 ±5분 우선
+            if diff <= 5 and (call_fee == rcpt_fee or call_fee == 0 or rcpt_fee == 0):
+                if diff < best_diff:
+                    best_diff = diff
+                    best_j = j
+        # 요금 미일치라도 시각 ±10분이면 후보
+        if best_j is None:
+            for j, rcpt in enumerate(receipts):
+                if j in matched_receipt_ids:
+                    continue
+                rcpt_date = rcpt.get("날짜", date_str)
+                rcpt_min = to_min_smart(배차, rcpt.get("시각") or "", rcpt_date)
+                if rcpt_min is None or call_min is None:
+                    continue
+                diff = abs(call_min - rcpt_min)
+                if diff <= 10 and diff < best_diff:
+                    best_diff = diff
+                    best_j = j
 
-    unmatched_calls = [c for i, c in enumerate(calls) if i not in matched_call_ids]
-    unmatched_receipts = [r for j, r in enumerate(receipts) if j not in matched_receipt_ids]
+        if best_j is not None:
+            matched_call_ids.add(i)
+            matched_receipt_ids.add(best_j)
+
+    unmatched_calls    = [c for i,c in enumerate(calls)    if i not in matched_call_ids]
+    unmatched_receipts = [r for j,r in enumerate(receipts) if j not in matched_receipt_ids]
 
     lines = [f"📊 교차대조 결과 — {date_str}"]
     lines.append(f"콜카드 {len(calls)}건 / 결제내역 {len(receipts)}건 / 매칭 {len(matched_call_ids)}건")
     lines.append("")
 
     if unmatched_calls:
-        lines.append("🟠 콜카드에만 있음 (배회영업 후보):")
+        lines.append(f"🟠 콜카드에만 있음 (배회영업 후보):")
         for c in unmatched_calls:
             lines.append(f"  {c.get('배차시각','-')} {c.get('출발지','')}→{c.get('도착지','')} {fmt(c.get('요금') or 0)}")
         lines.append("")
 
     if unmatched_receipts:
-        lines.append("🔴 결제내역에만 있음 (누락 콜카드 후보):")
+        lines.append(f"🔴 결제내역에만 있음 (누락 콜카드 후보):")
         for r in unmatched_receipts:
-            lines.append(f"  {r.get('시각','-')} {fmt(r.get('요금') or 0)} ({r.get('결제방법','')})")
+            날짜표시 = f"({r.get('날짜','')})" if r.get("날짜") != date_str else ""
+            lines.append(f"  {r.get('시각','-')}{날짜표시} {fmt(r.get('요금') or 0)} ({r.get('결제방법','')})")
         lines.append("")
 
     if not unmatched_calls and not unmatched_receipts:
         lines.append("✅ 완전 매칭 — 누락 없음")
 
-    # 배회 자동 분류 제안
     if unmatched_calls:
-        lines.append(f"💡 콜카드 미매칭 {len(unmatched_calls)}건 → 배회영업으로 분류할까요?")
-        lines.append("  '배회분류 확정 YYYY-MM-DD' 로 확정 가능")
+        lines.append(f"💡 미매칭 {len(unmatched_calls)}건 → '배회분류 확정 {date_str}' 입력")
 
     return "\n".join(lines)
 
@@ -437,6 +488,7 @@ async def process_call_card(update: Update, image_bytes: bytes):
         "날짜": today,
         "요일": dow,
         "배차시각": 배차시각,
+        "하차시각": data.get("하차시각"),
         "출발지": data.get("출발지"),
         "도착지": data.get("도착지"),
         "요금": 요금,
