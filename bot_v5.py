@@ -124,8 +124,14 @@ def get_dow(d=None) -> str:
     d = d or today_kst()
     return DOW_KOR[d.weekday()]
 
-def fmt(n: int) -> str:
-    return f"{n:,}원"
+def fmt(n) -> str:
+    """None·문자열 안전 처리"""
+    if n is None:
+        return "0원"
+    try:
+        return f"{int(n):,}원"
+    except (ValueError, TypeError):
+        return "0원"
 
 def calc_net(매출: int, 지출: int) -> int:
     return int(매출 * (1 - CARD_FEE_RATE)) - 지출
@@ -316,13 +322,13 @@ async def cross_check(date_str: str) -> str:
     if unmatched_calls:
         lines.append("🟠 콜카드에만 있음 (배회영업 후보):")
         for c in unmatched_calls:
-            lines.append(f"  {c.get('배차시각','-')} {c.get('출발지','')}→{c.get('도착지','')} {fmt(c.get('요금',0))}")
+            lines.append(f"  {c.get('배차시각','-')} {c.get('출발지','')}→{c.get('도착지','')} {fmt(c.get('요금') or 0)}")
         lines.append("")
 
     if unmatched_receipts:
         lines.append("🔴 결제내역에만 있음 (누락 콜카드 후보):")
         for r in unmatched_receipts:
-            lines.append(f"  {r.get('시각','-')} {fmt(r.get('요금',0))} ({r.get('결제방법','')})")
+            lines.append(f"  {r.get('시각','-')} {fmt(r.get('요금') or 0)} ({r.get('결제방법','')})")
         lines.append("")
 
     if not unmatched_calls and not unmatched_receipts:
