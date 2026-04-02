@@ -1016,7 +1016,11 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    await image_queue.put((update, context))
+    try:
+        await image_queue.put((update, context))
+    except Exception as e:
+        logger.error(f"이미지 큐 오류: {e}")
+        await update.message.reply_text("❌ 이미지 처리 오류. 다시 시도해주세요.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -1036,14 +1040,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 교차대조
     if text.startswith("대조 "):
         date_str = text[3:].strip()
-        result = await cross_check(date_str)
-        await update.message.reply_text(result)
+        try:
+            result = await cross_check(date_str)
+            # Telegram 4096자 제한 처리
+            if len(result) > 4000:
+                result = result[:4000] + "\n...(생략)"
+            await update.message.reply_text(result)
+        except Exception as e:
+            logger.error(f"교차대조 오류: {e}")
+            await update.message.reply_text(f"❌ 교차대조 오류: {str(e)[:200]}")
         return
 
     if text.startswith("배회분류 확정 "):
         date_str = text[8:].strip()
-        result = await confirm_baehoe_classification(date_str)
-        await update.message.reply_text(result)
+        try:
+            result = await confirm_baehoe_classification(date_str)
+            await update.message.reply_text(result)
+        except Exception as e:
+            logger.error(f"배회분류 오류: {e}")
+            await update.message.reply_text(f"❌ 배회분류 오류: {str(e)[:200]}")
         return
 
     # 조회
@@ -1107,7 +1122,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 미인식
-    await update.message.reply_text("❓ 명령어를 인식하지 못했습니다. /명령어 로 확인해주세요.")
+    await update.message.reply_text("❓ 명령어를 인식하지 못했습니다. /help 로 확인해주세요.")
 
 # ──────────────────────────────────────────────
 # main()
@@ -1128,6 +1143,7 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
+        .get_updates_read_timeout(10)   # 폴링 빠른 타임아웃 → Conflict 최소화
         .build()
     )
 
