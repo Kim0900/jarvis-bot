@@ -103,6 +103,15 @@ async def sb_upsert(table: str, data: dict, on_conflict: str) -> dict | None:
         params={"on_conflict": on_conflict}
     )
 
+async def sb_delete_receipt(conditions: dict) -> int:
+    """payment_receipts 조건부 삭제. 삭제 건수 반환"""
+    query = "&".join(f"{k}={v}" for k, v in conditions.items())
+    r = await sb_h("DELETE", f"payment_receipts?{query}")
+    # Supabase DELETE는 삭제된 행 반환 (Prefer: return=representation)
+    if isinstance(r, list):
+        return len(r)
+    return 0
+
 async def sb_delete_last(table: str, filter_params: dict) -> bool:
     rows = await sb_select(table, {**filter_params, "order": "id.desc", "limit": "1"})
     if not rows:
@@ -300,7 +309,7 @@ async def cross_check(date_str: str) -> str:
             if call_min is None or rcpt_min is None:
                 continue
             time_diff = abs(call_min - rcpt_min)
-            if time_diff <= 3:
+            if time_diff <= 20:  # 결제완료 시각 기준 ±20분
                 # 시각 매칭 → 요금까지 확인
                 if call_fee == rcpt_fee or call_fee == 0 or rcpt_fee == 0:
                     matched_call_ids.add(i)
@@ -756,6 +765,85 @@ async def handle_expense_check(update: Update):
     lines.append(f"합계: {fmt(total)}")
     await update.message.reply_text("\n".join(lines))
 
+
+async def handle_receipt_delete(update, text: str):
+    """
+    결제내역 삭제 명령어
+    결제삭제 YYYY-MM-DD 운행외  → 02:01~18:59 시간대 삭제
+    결제삭제 YYYY-MM-DD 0원     → 요금 0원·null 삭제
+    결제삭제 YYYY-MM-DD 전체    → 해당 날짜 전체 삭제
+    결제삭제 YYYY-MM-DD HH:MM   → 특정 시각 삭제
+    """
+    parts = text.strip().split(" ", 2)
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "형식:\n"
+            "결제삭제 YYYY-MM-DD 운행외\n"
+            "결제삭제 YYYY-MM-DD 0원\n"
+            "결제삭제 YYYY-MM-DD 전체\n"
+            "결제삭제 YYYY-MM-DD HH:MM"
+        )
+        return
+
+    date_str = parts[1].strip()
+    mode = parts[2].strip()
+
+    try:
+        rows = await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})
+        if not rows:
+            await update.message.reply_text(f"⚠️ {date_str} 결제내역 없음")
+            return
+
+        delete_ids = []
+
+        if mode == "운행외":
+            for r in rows:
+                t = r.get("시각", "") or ""
+                try:
+                    h, m = t.split(":")
+                    mins = int(h) * 60 + int(m)
+                    # 운행시간 외: 02:01~18:59
+                    if 121 <= mins <= 1139:
+                        delete_ids.append(r["id"])
+                except Exception:
+                    delete_ids.append(r["id"])
+
+        elif mode == "0원":
+            for r in rows:
+                fee = r.get("요금")
+                if fee is None or int(fee) == 0:
+                    delete_ids.append(r["id"])
+
+        elif mode == "전체":
+            delete_ids = [r["id"] for r in rows]
+
+        elif ":" in mode:
+            for r in rows:
+                if r.get("시각", "") == mode:
+                    delete_ids.append(r["id"])
+        else:
+            await update.message.reply_text(f"❓ 알 수 없는 모드: {mode}")
+            return
+
+        if not delete_ids:
+            await update.message.reply_text(f"✅ 삭제 대상 없음 ({mode})")
+            return
+
+        deleted = 0
+        for rid in delete_ids:
+            await sb_h("DELETE", f"payment_receipts?id=eq.{rid}")
+            deleted += 1
+
+        await update.message.reply_text(
+            f"🗑️ 삭제 완료\n"
+            f"{date_str} | 조건: {mode}\n"
+            f"{deleted}건 삭제 (전체 {len(rows)}건 중)"
+        )
+
+    except Exception as e:
+        logger.error(f"결제삭제 오류: {e}")
+        await update.message.reply_text(f"❌ 삭제 오류: {str(e)[:200]}")
+
 async def handle_db_check(update: Update):
     calls = await sb_select("raw_calls", {"order": "id.desc", "limit": "1"})
     total_calls = await sb_select("raw_calls", {})
@@ -1042,6 +1130,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (update.message.text or "").strip()
     lower = text.lower()
+
+    # 결제내역 삭제 명령어
+    # "결제삭제 YYYY-MM-DD 운행외" → 운행시간(19~02시) 외 데이터 삭제
+    # "결제삭제 YYYY-MM-DD 0원"    → 요금 0원 데이터 삭제
+    # "결제삭제 YYYY-MM-DD 전체"   → 해당 날짜 전체 삭제
+    if text.startswith("결제삭제 "):
+        await handle_receipt_delete(update, text)
+        return
 
     # 교차대조
     if text.startswith("대조 "):
