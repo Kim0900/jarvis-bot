@@ -206,15 +206,18 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
-        "이 이미지가 무엇인지 한 단어로만 답해줘.\n"
-        "- 콜카드 (택시 콜카드/운행기록)\n"
-        "- 충전 (전기차 충전 내역/영수증)\n"
-        "- 결제 (카카오T 결제내역/수익관리 화면)\n"
-        "- 세큐티 (세큐티 등급/리포트)\n"
-        "- 기타\n"
-        "한 단어만 답해. 설명 금지."
+        "이 이미지의 종류를 아래 중 하나로만 답해줘.\n\n"
+        "- 콜카드: 택시 배차·승차·하차 정보, 출발지·도착지 주소가 있는 카카오T 콜카드\n"
+        "- 충전: kWh·충전량·충전소 정보가 있는 전기차 충전 영수증\n"
+        "- 결제: 거래일자·카드사·금액이 표로 나열된 카카오T 결제내역/수익관리 화면 "
+        "(1승인정상 텍스트 또는 거래일자 컬럼 포함)\n"
+        "- 세큐티: 세큐티 등급·점수 리포트\n"
+        "- 기타: 위에 해당 없음\n\n"
+        "충전과 결제를 혼동하지 말 것: "
+        "충전=kWh 단위 있음, 결제=카드사·승인번호 있음.\n"
+        "반드시 위 5개 중 하나만 답해. 다른 말 금지."
     )
-    result = await claude_vision(image_bytes, prompt, max_tokens=10)
+    result = await claude_vision(image_bytes, prompt, max_tokens=15)
     for keyword in ["콜카드", "충전", "결제", "세큐티"]:
         if keyword in result:
             return keyword
@@ -1290,9 +1293,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("이번 주", "이번주", "주간"):
         await handle_weekly(update)
         return
-    if text.startswith("월간 ") and len(text.split(" ")) >= 2:
-        ym = text.split(" ")[1].strip()
-        await handle_download_month(update, ym)
+    import re as _re2
+    _ym = _re2.match(r"^월간\s+(\d{4}-\d{2})\s*$", text.strip())
+    if _ym:
+        await handle_download_month(update, _ym.group(1))
         return
 
     if text in ("이번 달", "이번달", "월간"):
@@ -1324,6 +1328,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_download(update, "전체")
         else:
             await update.message.reply_text("주간·월간·전체 다운로드 중 선택해주세요.")
+        return
+
+    # 특정 월 다운로드: "월간 2026-03" or "월간2026-03"
+    import re as _re
+    _ym_match = _re.match(r"^월간\s*(\d{4}-\d{2})$", text.strip())
+    if _ym_match:
+        await handle_download_month(update, _ym_match.group(1))
         return
 
     # 휴무
