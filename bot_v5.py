@@ -206,16 +206,28 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
-        "이 이미지의 종류를 아래 중 하나로만 답해줘.\n\n"
-        "- 콜카드: 택시 배차·승차·하차 정보, 출발지·도착지 주소가 있는 카카오T 콜카드\n"
-        "- 충전: kWh·충전량·충전소 정보가 있는 전기차 충전 영수증\n"
-        "- 결제: 거래일자·카드사·금액이 표로 나열된 카카오T 결제내역/수익관리 화면 "
-        "(1승인정상 텍스트 또는 거래일자 컬럼 포함)\n"
-        "- 세큐티: 세큐티 등급·점수 리포트\n"
-        "- 기타: 위에 해당 없음\n\n"
-        "충전과 결제를 혼동하지 말 것: "
-        "충전=kWh 단위 있음, 결제=카드사·승인번호 있음.\n"
-        "반드시 위 5개 중 하나만 답해. 다른 말 금지."
+        "이 이미지가 아래 중 어느 종류인지 판단해서 해당 단어 하나만 답해줘.\n\n"
+        "【충전】\n"
+        "  전기차 충전 앱 이용내역. 아래 특징 중 하나라도 있으면 반드시 '충전':\n"
+        "  · '충전완료' 또는 '충전량' 텍스트\n"
+        "  · kWh 단위\n"
+        "  · '충전소' 항목\n"
+        "  · '전기차 충전' 탭\n\n"
+        "【결제】\n"
+        "  카카오T 수익관리/결제내역 화면. 아래 특징이 있으면 '결제':\n"
+        "  · '거래일자' 컬럼 (YYYY-MM-DD HH:MM:SS 형식)\n"
+        "  · '카드사' 컬럼 (KB카드, 신한카드 등)\n"
+        "  · '1승인 정상' 텍스트\n\n"
+        "【콜카드】\n"
+        "  카카오T 택시 운행기록. '배차', '승차', '하차', 출발지·도착지 주소 있음.\n\n"
+        "【세큐티】\n"
+        "  세큐티 등급·점수 리포트.\n\n"
+        "【기타】\n"
+        "  위 4가지에 해당 없음.\n\n"
+        "⚠️ 주의: '결제 금액'이라는 텍스트만으로 '결제'로 판단하지 말 것.\n"
+        "   충전 앱에도 '결제 금액' 항목이 있음.\n"
+        "   kWh·충전량·충전소가 보이면 무조건 '충전'으로 답할 것.\n\n"
+        "반드시 콜카드·충전·결제·세큐티·기타 중 하나만 답해. 다른 말 금지."
     )
     result = await claude_vision(image_bytes, prompt, max_tokens=15)
     for keyword in ["콜카드", "충전", "결제", "세큐티"]:
@@ -1248,11 +1260,106 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ xlsx 파일만 이식 가능합니다.")
 
+
+async def _process_single_command(update, context, text: str) -> str | None:
+    """단일 명령어 처리. 줄바꿈 다중 명령어 시 각 줄 처리용."""
+
+    # 결제삭제
+    if text.startswith("결제삭제 "):
+        parts = text.strip().split(" ", 2)
+        if len(parts) < 3:
+            return "❌ 형식: 결제삭제 YYYY-MM-DD 운행외|0원|전체|HH:MM"
+        date_str = parts[1].strip()
+        mode = parts[2].strip()
+        try:
+            rows = await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})
+            if not rows:
+                return f"⚠️ {date_str} 결제내역 없음"
+            delete_ids = []
+            if mode == "운행외":
+                for r in rows:
+                    t = r.get("시각", "") or ""
+                    try:
+                        h, m = t.split(":")
+                        mins = int(h)*60+int(m)
+                        if 121 <= mins <= 1019:
+                            delete_ids.append(r["id"])
+                    except Exception:
+                        delete_ids.append(r["id"])
+            elif mode == "0원":
+                for r in rows:
+                    fee = r.get("요금")
+                    if fee is None or int(fee) == 0:
+                        delete_ids.append(r["id"])
+            elif mode == "전체":
+                delete_ids = [r["id"] for r in rows]
+            elif ":" in mode:
+                for r in rows:
+                    if r.get("시각","") == mode:
+                        delete_ids.append(r["id"])
+            else:
+                return f"❓ 알 수 없는 모드: {mode}"
+            if not delete_ids:
+                return f"✅ {date_str} 삭제 대상 없음 ({mode})"
+            for rid in delete_ids:
+                await sb_h("DELETE", f"payment_receipts?id=eq.{rid}")
+            return f"🗑️ {date_str} {mode} {len(delete_ids)}건 삭제"
+        except Exception as e:
+            return f"❌ 삭제 오류: {str(e)[:100]}"
+
+    # 수동 콜
+    parsed_call = parse_manual_call(text)
+    if parsed_call:
+        today = str(today_kst())
+        payload = {
+            "날짜": today, "요일": get_dow(),
+            "배차시각": now_kst().strftime("%H:%M"),
+            "요금": parsed_call["요금"],
+            "콜유형": parsed_call["콜유형"],
+            "도착지": parsed_call.get("도착지힌트"),
+        }
+        r = await sb_insert("raw_calls", payload)
+        return f"✅ {parsed_call['콜유형']} {fmt(parsed_call['요금'])} 입력" if r else "❌ 저장 실패"
+
+    # 지출
+    parsed_exp = parse_expense(text)
+    if parsed_exp:
+        today = str(today_kst())
+        payload = {
+            "날짜": today,
+            "카테고리": parsed_exp["카테고리"],
+            "금액": parsed_exp["금액"],
+            "메모": parsed_exp.get("메모",""),
+            "자동여부": False,
+        }
+        r = await sb_insert("expenses", payload)
+        return f"✅ {parsed_exp['카테고리']} {fmt(parsed_exp['금액'])} 입력" if r else "❌ 저장 실패"
+
+    return f"❓ '{text[:20]}' 인식 불가"
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     text = (update.message.text or "").strip()
     lower = text.lower()
+
+    # ── 줄바꿈 다중 명령어 처리 ──
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) > 1:
+        results = []
+        for line in lines:
+            # 각 줄을 개별 명령어로 처리
+            fake_update = update
+            line_text = line
+            try:
+                result = await _process_single_command(fake_update, context, line_text)
+                if result:
+                    results.append(result)
+            except Exception as e:
+                results.append(f"❌ '{line_text[:20]}' 오류: {str(e)[:50]}")
+        if results:
+            await update.message.reply_text("\n".join(results))
+        return
 
     # 결제내역 삭제 명령어
     # "결제삭제 YYYY-MM-DD 운행외" → 운행시간(19~02시) 외 데이터 삭제
