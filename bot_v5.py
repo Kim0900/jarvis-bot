@@ -911,6 +911,96 @@ async def handle_receipt_delete(update, text: str):
         logger.error(f"결제삭제 오류: {e}")
         await update.message.reply_text(f"❌ 삭제 오류: {str(e)[:200]}")
 
+
+async def handle_date_query(update, date_str: str):
+    """특정 날짜 조회: 운행 내역 + 요약 + 지출"""
+    import re
+    from datetime import date as date_cls
+
+    text = date_str.replace("조회","").replace("일","").strip()
+    today_d = today_kst()
+    parsed = None
+
+    for pattern, mode in [
+        (r"^(\d{4})-(\d{1,2})-(\d{1,2})$", "full"),
+        (r"^(\d{1,2})-(\d{1,2})$",           "md"),
+        (r"^(\d{1,2})/(\d{1,2})$",           "md"),
+    ]:
+        m = re.match(pattern, text)
+        if m:
+            g = m.groups()
+            try:
+                if mode == "full":
+                    parsed = date_cls(int(g[0]), int(g[1]), int(g[2]))
+                else:
+                    parsed = date_cls(today_d.year, int(g[0]), int(g[1]))
+                break
+            except ValueError:
+                pass
+
+    if not parsed:
+        await update.message.reply_text(
+            "❓ 날짜 형식 오류\n"
+            "예시: 3-2 조회 / 3/2 조회 / 2026-03-02 조회"
+        )
+        return
+
+    date_key = str(parsed)
+    dow_map = ["월","화","수","목","금","토","일"]
+    dow = dow_map[parsed.weekday()]
+
+    calls    = await sb_select("raw_calls", {"날짜": f"eq.{date_key}", "order": "배차시각.asc"})
+    expenses = await sb_select("expenses",  {"날짜": f"eq.{date_key}", "order": "id.asc"})
+
+    if not calls and not expenses:
+        await update.message.reply_text(f"📭 {date_key} ({dow}) 데이터 없음")
+        return
+
+    result_lines = [f"📅 {date_key} ({dow}) 조회\n"]
+
+    if calls:
+        총매출 = sum(c.get("요금") or 0 for c in calls)
+        result_lines.append(f"[운행] {len(calls)}콜 | {fmt(총매출)}")
+        for c in calls:
+            배차 = c.get("배차시각") or "-"
+            출발 = (c.get("출발지") or "")[:8]
+            도착 = (c.get("도착지") or "")[:8]
+            요금 = fmt(c.get("요금") or 0)
+            유형 = c.get("콜유형") or "카카오T"
+            icon = "🚕" if 유형 == "카카오T" else "🚶"
+            result_lines.append(f"  {icon}{배차} {출발}→{도착} {요금}")
+    else:
+        총매출 = 0
+        result_lines.append("[운행] 없음")
+
+    result_lines.append("")
+
+    총지출 = sum(e.get("금액") or 0 for e in expenses)
+    if expenses:
+        result_lines.append(f"[지출] {fmt(총지출)}")
+        for e in expenses:
+            cat = e.get("카테고리") or ""
+            amt = fmt(e.get("금액") or 0)
+            auto = " (자동)" if e.get("자동여부") else ""
+            result_lines.append(f"  {cat} {amt}{auto}")
+    else:
+        result_lines.append("[지출] 없음")
+
+    result_lines.append("")
+    순수익 = calc_net(총매출, 총지출)
+    달성률 = min(int(순수익 / NET_GOAL * 100), 999) if NET_GOAL else 0
+    달성바 = "█" * min(달성률//10, 10) + "░" * max(10 - 달성률//10, 0)
+    result_lines.append("[요약]")
+    result_lines.append(f"  매출 {fmt(총매출)} | 지출 {fmt(총지출)}")
+    result_lines.append(f"  순수익 {fmt(순수익)}")
+    result_lines.append(f"  목표 [{달성바}] {달성률}%")
+
+    msg = "\n".join(result_lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n...(생략)"
+    await update.message.reply_text(msg)
+
+
 async def handle_db_check(update: Update):
     calls = await sb_select("raw_calls", {"order": "id.desc", "limit": "1"})
     total_calls = await sb_select("raw_calls", {})
@@ -1391,6 +1481,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"배회분류 오류: {e}")
             await update.message.reply_text(f"❌ 배회분류 오류: {str(e)[:200]}")
+        return
+
+    # 특정 날짜 조회
+    if "조회" in text:
+        await handle_date_query(update, text)
         return
 
     # 조회
