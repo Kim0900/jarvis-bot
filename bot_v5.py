@@ -965,6 +965,74 @@ async def handle_magi_update(update: Update, content: str):
 # ──────────────────────────────────────────────
 # 핸들러 — 엑셀 다운로드
 # ──────────────────────────────────────────────
+
+async def handle_download_month(update, ym: str):
+    """특정 월 다운로드 (예: 2026-03)"""
+    try:
+        year, month = ym.split("-")
+        year, month = int(year), int(month)
+    except Exception:
+        await update.message.reply_text("❌ 형식 오류: YYYY-MM (예: 2026-03)")
+        return
+
+    from datetime import date, timedelta
+    start_date = date(year, month, 1)
+    if month == 12:
+        end_date = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = date(year, month + 1, 1) - timedelta(days=1)
+
+    start_str = str(start_date)
+    end_str   = str(end_date)
+
+    # AND 조건 (날짜 키 중복 버그 방지)
+    calls    = await sb_select("raw_calls",    {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"})
+    expenses = await sb_select("expenses",     {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"})
+    charging = await sb_select("charging_log", {"and": f"(충전일.gte.{start_str},충전일.lte.{end_str})"})
+
+    wb = openpyxl.Workbook()
+
+    ws1 = wb.active
+    ws1.title = "운행기록"
+    headers1 = ["날짜","요일","배차시각","출발지","도착지","요금","콜유형","비고"]
+    for col, h in enumerate(headers1, 1):
+        cell = ws1.cell(1, col, h)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="4A90D9")
+    for c in calls:
+        ws1.append([c.get("날짜"),c.get("요일"),c.get("배차시각"),
+                    c.get("출발지"),c.get("도착지"),c.get("요금"),
+                    c.get("콜유형"),c.get("비고")])
+
+    ws2 = wb.create_sheet("지출")
+    headers2 = ["날짜","카테고리","금액","메모","자동여부"]
+    for col, h in enumerate(headers2, 1):
+        cell = ws2.cell(1, col, h)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="F5A623")
+    for e in expenses:
+        ws2.append([e.get("날짜"),e.get("카테고리"),e.get("금액"),
+                    e.get("메모"),e.get("자동여부")])
+
+    ws3 = wb.create_sheet("충전기록")
+    headers3 = ["충전일","충전량(kWh)","충전금액","충전소"]
+    for col, h in enumerate(headers3, 1):
+        cell = ws3.cell(1, col, h)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="7ED321")
+    for ch in charging:
+        ws3.append([ch.get("충전일"),ch.get("충전량_kwh"),
+                    ch.get("충전금액"),ch.get("충전소")])
+
+    filepath = f"/tmp/자비스_월간_{ym}.xlsx"
+    wb.save(filepath)
+
+    await update.message.reply_document(
+        document=open(filepath, "rb"),
+        filename=f"자비스_월간_{ym}.xlsx",
+        caption=f"📊 {ym} 데이터 ({len(calls)}건)"
+    )
+
 async def handle_download(update: Update, scope: str):
     today = today_kst()
     if scope == "주간":
@@ -1222,6 +1290,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("이번 주", "이번주", "주간"):
         await handle_weekly(update)
         return
+    if text.startswith("월간 ") and len(text.split(" ")) >= 2:
+        ym = text.split(" ")[1].strip()
+        await handle_download_month(update, ym)
+        return
+
     if text in ("이번 달", "이번달", "월간"):
         await handle_monthly(update)
         return
