@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters
@@ -341,6 +341,7 @@ async def cross_check(date_str: str) -> str:
     # STEP 1: 하차시각 ↔ 결제시각 ±20분 매칭
     matched_call_ids    = set()
     matched_receipt_ids = set()
+    fee_mismatches      = []  # 금액 불일치 목록
 
     for i, call in enumerate(calls):
         배차 = call.get("배차시각") or ""
@@ -365,6 +366,18 @@ async def cross_check(date_str: str) -> str:
         if best_j is not None:
             matched_call_ids.add(i)
             matched_receipt_ids.add(best_j)
+            # 금액 비교 → 불일치 기록
+            rcpt_fee = receipts[best_j].get("요금") or 0
+            if call_fee > 0 and rcpt_fee > 0:
+                fee_diff = abs(call_fee - rcpt_fee)
+                if fee_diff >= FEE_DIFF_THRESHOLD:
+                    fee_mismatches.append({
+                        "call_id": call.get("id"),
+                        "배차시각": 배차,
+                        "call_fee": call_fee,
+                        "rcpt_fee": rcpt_fee,
+                        "diff": fee_diff,
+                    })
 
     unmatched_calls    = [c for i,c in enumerate(calls)    if i not in matched_call_ids]
     unmatched_receipts = [r for j,r in enumerate(receipts) if j not in matched_receipt_ids]
@@ -423,8 +436,22 @@ async def cross_check(date_str: str) -> str:
             lines_out.append(f"  {r.get('시각','-')}{날짜표시} {fmt(r.get('요금') or 0)}")
         lines_out.append("")
 
+    # 금액 불일치 표시
+    if fee_mismatches:
+        lines_out.append(f"💰 금액 불일치 {len(fee_mismatches)}건 (차이 ≥500원):")
+        for fm in fee_mismatches:
+            lines_out.append(
+                f"  {fm['배차시각']} 콜카드:{fmt(fm['call_fee'])} vs "
+                f"결제:{fmt(fm['rcpt_fee'])} (차이 {fm['diff']:,}원)"
+            )
+        lines_out.append("  → '대조 금액확인 YYYY-MM-DD' 로 버튼 선택")
+        lines_out.append("")
+
     if not unmatched_calls and not unmatched_receipts:
-        lines_out.append("✅ 완전 매칭 — 누락 없음")
+        if fee_mismatches:
+            lines_out.append("⚠️ 매칭 완료 — 금액 불일치 확인 필요")
+        else:
+            lines_out.append("✅ 완전 매칭 — 누락 없음")
 
     if unmatched_calls:
         lines_out.append(f"💡 '배회분류 확정 {date_str}' → 콜카드 미매칭 배회 처리")
@@ -507,15 +534,10 @@ async def process_call_card(update: Update, image_bytes: bytes):
     배차시각 = data.get("배차시각")
     요금 = data.get("요금", 0)
 
-    # 중복 체크
-    is_dup = await check_duplicate_call(today, 배차시각, 요금)
-    if is_dup:
-        await update.message.reply_text(
-            f"⚠️ 중복 감지 — 저장 안 됨\n"
-            f"{배차시각} {fmt(요금)} 이미 DB에 존재\n"
-            f"동일 콜카드를 두 번 올리신 건 아닌지 확인해주세요."
-        )
-        return
+    # 중복 체크 → 자동 삭제 후 재저장
+    deleted = await delete_duplicate_call(today, 배차시각, 요금)
+    if deleted:
+        logger.info(f"중복 콜카드 자동 삭제 후 재저장: {today} {배차시각} {요금}")
 
     payload = {
         "날짜": today,
@@ -581,12 +603,10 @@ async def process_payment_history(update: Update, image_bytes: bytes):
             continue
         시각 = item.get("시각")
         요금 = item.get("요금", 0)
-        # 중복 체크
-        is_dup = await check_duplicate_payment(날짜, 시각, 요금)
-        if is_dup:
-            duplicated += 1
-            dup_list.append(f"{시각} {fmt(요금)}")
-            continue
+        # 중복 체크 → 자동 삭제 후 재저장
+        deleted = await delete_duplicate_payment(날짜, 시각, 요금)
+        if deleted:
+            logger.info(f"중복 결제내역 자동 삭제: {날짜} {시각} {요금}")
         payload = {
             "날짜": 날짜,
             "시각": 시각,
@@ -1051,6 +1071,89 @@ async def confirm_cross_check(date_str: str) -> str:
         f"  결제내역 {len(receipts)}건 → {'✅ 완전매칭' if total_calls == len(receipts) else f'⚠️ 차이 {abs(total_calls - len(receipts))}건'}",
     ]
     return "\n".join(lines)
+
+
+async def handle_fee_confirm_request(update, date_str: str):
+    """
+    '대조 금액확인 YYYY-MM-DD' 명령어.
+    해당 날짜 매칭 건 중 금액 불일치(≥500원) 건에 대해
+    InlineKeyboard 버튼으로 확인 요청.
+    """
+    from datetime import date as date_cls, timedelta
+
+    calls    = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    try:
+        y,mo,d = date_str.split("-")
+        next_d = str(date_cls(int(y),int(mo),int(d)) + timedelta(days=1))
+    except: next_d = date_str
+
+    receipts = (await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})) +                (await sb_select("payment_receipts", {"날짜": f"eq.{next_d}"}))
+
+    def to_min(배차, 대상, 대상날짜):
+        try:
+            bh,bm = 배차.split(":"); base = int(bh)*60+int(bm)
+            th,tm = 대상.split(":"); target = int(th)*60+int(tm)
+            if 대상날짜 == next_d: target += 1440
+            elif target < base-60: target += 1440
+            return target
+        except: return None
+
+    matched_r = set()
+    mismatches = []
+
+    for call in calls:
+        배차 = call.get("배차시각") or ""
+        하차 = call.get("하차시각") or ""
+        if not 하차:
+            try:
+                bh,bm = 배차.split(":"); est = int(bh)*60+int(bm)+20
+                하차 = f"{est//60%24:02d}:{est%60:02d}"
+            except: continue
+        c_min = to_min(배차, 하차, date_str)
+        call_fee = call.get("요금") or 0
+        best_j, best_diff = None, 99999
+        for j, r in enumerate(receipts):
+            if j in matched_r: continue
+            r_min = to_min(배차, r.get("시각","") or "", r.get("날짜", date_str))
+            if r_min and c_min:
+                diff = abs(c_min - r_min)
+                if diff <= 20 and diff < best_diff:
+                    best_diff = diff; best_j = j
+        if best_j is not None:
+            matched_r.add(best_j)
+            rcpt_fee = receipts[best_j].get("요금") or 0
+            fee_diff = abs(call_fee - rcpt_fee)
+            if fee_diff >= FEE_DIFF_THRESHOLD:
+                mismatches.append({
+                    "call_id": call.get("id"),
+                    "배차시각": 배차,
+                    "call_fee": call_fee,
+                    "rcpt_fee": rcpt_fee,
+                    "diff": fee_diff,
+                })
+
+    if not mismatches:
+        await update.message.reply_text(f"✅ {date_str} 금액 불일치 없음")
+        return
+
+    for fm in mismatches:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"콜카드 {fm['call_fee']:,}원",
+                callback_data=f"fee:{fm['call_id']}:{fm['call_fee']}"
+            ),
+            InlineKeyboardButton(
+                f"결제내역 {fm['rcpt_fee']:,}원",
+                callback_data=f"fee:{fm['call_id']}:{fm['rcpt_fee']}"
+            ),
+        ]])
+        await update.message.reply_text(
+            f"⚠️ 금액 불일치 확인\n"
+            f"배차: {fm['배차시각']}\n"
+            f"콜카드: {fm['call_fee']:,}원 | 결제: {fm['rcpt_fee']:,}원\n"
+            f"차이: {fm['diff']:,}원",
+            reply_markup=keyboard
+        )
 
 async def handle_date_stat(update, text: str):
     """
@@ -1634,6 +1737,82 @@ def fish_scheduler(app):
 
         time.sleep(30)
 
+
+# ──────────────────────────────────────────────
+# 중복 자동 삭제 + 금액 불일치 처리
+# ──────────────────────────────────────────────
+FEE_DIFF_THRESHOLD = 500  # 이 이상 차이면 확인 요청
+
+async def delete_duplicate_call(날짜: str, 배차시각: str, 요금: int) -> bool:
+    """날짜+배차시각+요금 완전 일치 건 삭제. 삭제되면 True."""
+    rows = await sb_select("raw_calls", {
+        "날짜": f"eq.{날짜}",
+        "배차시각": f"eq.{배차시각}",
+        "요금": f"eq.{요금}",
+    })
+    if not rows:
+        return False
+    for row in rows:
+        await sb_h("DELETE", f"raw_calls?id=eq.{row['id']}")
+    return True
+
+async def delete_duplicate_payment(날짜: str, 시각: str, 요금: int) -> bool:
+    """날짜+시각+요금 완전 일치 결제내역 삭제."""
+    rows = await sb_select("payment_receipts", {
+        "날짜": f"eq.{날짜}",
+        "시각": f"eq.{시각}",
+        "요금": f"eq.{요금}",
+    })
+    if not rows:
+        return False
+    for row in rows:
+        await sb_h("DELETE", f"payment_receipts?id=eq.{row['id']}")
+    return True
+
+async def send_fee_confirm(update, call_id: int, 배차시각: str,
+                            call_fee: int, rcpt_fee: int, diff: int):
+    """금액 불일치 ≥500원 시 InlineKeyboard 확인 요청 발송."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"콜카드 {call_fee:,}원",
+                callback_data=f"fee:{call_id}:{call_fee}"
+            ),
+            InlineKeyboardButton(
+                f"결제내역 {rcpt_fee:,}원",
+                callback_data=f"fee:{call_id}:{rcpt_fee}"
+            ),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ 금액 불일치 확인 요청\n"
+        f"배차: {배차시각}\n"
+        f"콜카드: {call_fee:,}원\n"
+        f"결제내역: {rcpt_fee:,}원\n"
+        f"차이: {diff:,}원\n\n"
+        f"어느 금액으로 저장할까요?",
+        reply_markup=keyboard
+    )
+
+async def handle_fee_callback(update, context):
+    """InlineKeyboard 버튼 클릭 처리."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # "fee:call_id:선택금액"
+    try:
+        _, call_id_str, fee_str = data.split(":")
+        call_id = int(call_id_str)
+        selected_fee = int(fee_str)
+        # raw_calls 요금 업데이트
+        await sb_h("PATCH", f"raw_calls?id=eq.{call_id}",
+                   json={"요금": selected_fee})
+        await query.edit_message_text(
+            f"✅ {selected_fee:,}원으로 저장 완료"
+        )
+    except Exception as e:
+        logger.error(f"fee callback 오류: {e}")
+        await query.edit_message_text("❌ 처리 오류")
+
 # ──────────────────────────────────────────────
 # 보험 스케줄러
 # ──────────────────────────────────────────────
@@ -1990,6 +2169,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    from telegram.ext import CallbackQueryHandler
+    app.add_handler(CallbackQueryHandler(handle_fee_callback, pattern=r"^fee:"))
 
     logger.info("자비스 v5 시작")
     app.run_polling(
