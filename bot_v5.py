@@ -1851,7 +1851,7 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
-        .get_updates_read_timeout(10)   # 폴링 빠른 타임아웃 → Conflict 최소화
+        .get_updates_read_timeout(5)    # 폴링 빠른 타임아웃 → Conflict 최소화
         .build()
     )
 
