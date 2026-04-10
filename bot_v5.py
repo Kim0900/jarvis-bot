@@ -739,15 +739,37 @@ async def handle_expense_cancel(update: Update):
     else:
         await update.message.reply_text("⚠️ 삭제할 수동 지출 없음")
 
-async def handle_rest_day(update: Update):
-    today = str(today_kst())
-    dow = get_dow()
+async def handle_rest_day(update: Update, text: str = "휴무"):
+    """휴무 처리. '4-7 휴무' 형식으로 날짜 지정 가능."""
+    import re
+    from datetime import date as date_cls
+
+    target = today_kst()
+    date_pat = r"(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[-/](\d{1,2})"
+    m = re.search(date_pat, text)
+    if m:
+        g = m.groups()
+        try:
+            if g[0]:
+                target = date_cls(int(g[0]), int(g[1]), int(g[2]))
+            else:
+                target = date_cls(today_kst().year, int(g[3]), int(g[4]))
+        except ValueError:
+            await update.message.reply_text("❌ 잘못된 날짜입니다.")
+            return
+
+    dow_map = ["월","화","수","목","금","토","일"]
+    date_str = str(target)
+    dow = dow_map[target.weekday()]
+
     await sb_upsert("daily_summary", {
-        "날짜": today, "요일": dow,
+        "날짜": date_str, "요일": dow,
         "휴무여부": True, "정상여부": "휴무",
     }, on_conflict="날짜")
-    await insert_insurance(today_kst())
-    await update.message.reply_text(f"✅ {today} 휴무 처리 + 보험료 자동 기록")
+    await insert_insurance(target)
+    await update.message.reply_text(
+        f"✅ {date_str} ({dow}) 휴무 처리\n보험료 {INSURANCE_DAILY:,}원 자동 기록"
+    )
 
 # ──────────────────────────────────────────────
 # 핸들러 — 조회
@@ -910,6 +932,100 @@ async def handle_receipt_delete(update, text: str):
     except Exception as e:
         logger.error(f"결제삭제 오류: {e}")
         await update.message.reply_text(f"❌ 삭제 오류: {str(e)[:200]}")
+
+
+
+async def handle_date_stat(update, text: str):
+    """
+    날짜+통계 키워드 조합 처리
+    예: '3-17 총건수', '3-17 매출', '3-17 순수익', '3-17 지출'
+    """
+    import re
+    from datetime import date as date_cls
+
+    today_d = today_kst()
+    dow_map = ["월","화","수","목","금","토","일"]
+
+    # 날짜 추출
+    parsed = None
+    for pat, mode in [
+        (r"(\d{4})-(\d{1,2})-(\d{1,2})", "full"),
+        (r"(\d{1,2})-(\d{1,2})",           "md"),
+        (r"(\d{1,2})/(\d{1,2})",           "md"),
+    ]:
+        m = re.search(pat, text)
+        if m:
+            g = m.groups()
+            try:
+                parsed = date_cls(int(g[0]),int(g[1]),int(g[2])) if mode=="full"                          else date_cls(today_d.year, int(g[0]), int(g[1]))
+                break
+            except ValueError:
+                pass
+
+    if not parsed:
+        await update.message.reply_text("❓ 날짜 인식 실패\n예: 3-17 총건수")
+        return
+
+    date_key = str(parsed)
+    dow = dow_map[parsed.weekday()]
+    header = f"📅 {date_key} ({dow})"
+
+    # 통계 키워드 판단
+    if any(kw in text for kw in ["총건수", "건수"]):
+        calls = await sb_select("raw_calls", {"날짜": f"eq.{date_key}"})
+        카카오 = sum(1 for c in calls if (c.get("콜유형") or "") == "카카오T")
+        배회   = sum(1 for c in calls if (c.get("콜유형") or "") == "배회")
+        총매출 = sum(c.get("요금") or 0 for c in calls)
+        건당   = 총매출 // len(calls) if calls else 0
+        await update.message.reply_text(
+            f"{header} 총건수\n"
+            f"총 {len(calls)}콜\n"
+            f"  🚕 카카오T {카카오}건\n"
+            f"  🚶 배회 {배회}건\n"
+            f"건당 평균 {fmt(건당)}"
+        )
+
+    elif "매출" in text:
+        calls = await sb_select("raw_calls", {"날짜": f"eq.{date_key}"})
+        총매출 = sum(c.get("요금") or 0 for c in calls)
+        건수   = len(calls)
+        건당   = 총매출 // 건수 if 건수 else 0
+        await update.message.reply_text(
+            f"{header} 매출\n"
+            f"총매출 {fmt(총매출)}\n"
+            f"콜수 {건수}건 | 건당 {fmt(건당)}"
+        )
+
+    elif "순수익" in text:
+        calls    = await sb_select("raw_calls",  {"날짜": f"eq.{date_key}"})
+        expenses = await sb_select("expenses",   {"날짜": f"eq.{date_key}"})
+        총매출 = sum(c.get("요금") or 0 for c in calls)
+        총지출 = sum(e.get("금액") or 0 for e in expenses)
+        순수익 = calc_net(총매출, 총지출)
+        달성률 = min(int(순수익 / NET_GOAL * 100), 999) if NET_GOAL else 0
+        달성바 = "█" * min(달성률//10,10) + "░" * max(10-달성률//10,0)
+        await update.message.reply_text(
+            f"{header} 순수익\n"
+            f"매출 {fmt(총매출)} | 지출 {fmt(총지출)}\n"
+            f"순수익 {fmt(순수익)}\n"
+            f"목표 [{달성바}] {달성률}%"
+        )
+
+    elif "지출" in text:
+        expenses = await sb_select("expenses", {"날짜": f"eq.{date_key}", "order": "id.asc"})
+        총지출 = sum(e.get("금액") or 0 for e in expenses)
+        if not expenses:
+            await update.message.reply_text(f"{header}\n지출 없음")
+            return
+        lines_out = [f"{header} 지출 {fmt(총지출)}"]
+        for e in expenses:
+            auto = " (자동)" if e.get("자동여부") else ""
+            lines_out.append(f"  {e.get('카테고리','')} {fmt(e.get('금액') or 0)}{auto}")
+        await update.message.reply_text("\n".join(lines_out))
+
+    else:
+        # 전체 조회로 위임
+        await handle_date_query(update, text)
 
 
 async def handle_date_query(update, date_str: str):
@@ -1279,6 +1395,128 @@ async def handle_excel_import(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✅ 이식 완료\n저장: {total_saved}건 | 중복스킵: {total_skip}건"
     )
 
+
+# ══════════════════════════════════════════════
+# 어군탐지기 v2 — 자동 브리핑 시스템
+# ══════════════════════════════════════════════
+
+FISH_DATA = {
+    "월": {
+        "19~21": [["달서구 신당동",      "8",  "9,500",  "S", "신당동 주택가 도로변",   "카카오T 공식 평일 호출 1위"]],
+        "21~24": [["달서구 신당동",      "9",  "10,200", "S", "신당동 상가 밀집",       "평일 23시 호출 1위"]],
+        "00~02": [["중구 성내1·2동",     "9",  "10,800", "S", "성내2동 앵커",           "유흥가 마감 귀가 폭증"]],
+    },
+    "화": {
+        "19~21": [["수성구 범어·만촌",   "7",  "8,200",  "A", "범어역~만촌역",          "화요일 수성구 준수"]],
+        "21~24": [["달서구 신당동",      "7",  "9,500",  "A", "신당동 상가",             "화요일 야간 준수"]],
+        "00~02": [["중구 성내1·2동",     "8",  "10,200", "S", "성내2동 앵커",            "화요일 심야 귀가"]],
+    },
+    "수": {
+        "19~21": [["수성구 범어·만촌",   "7",  "8,500",  "A", "범어역~만촌역",          "수요일 수성구 준수"]],
+        "21~24": [["중구 동성로/삼덕동", "8",  "9,800",  "A", "삼덕동 먹자골목",        "수요일 야간 선호"]],
+        "00~02": [["중구 성내1·2동",     "8",  "10,500", "S", "성내2동 앵커",            "수요일 심야 귀가"]],
+    },
+    "목": {
+        "19~21": [["달서구 신당동",      "6",  "7,800",  "B", "신당동 주택가",           "목요일 콜 저조 — 단축 검토"]],
+        "21~24": [["달서구 신당동",      "7",  "9,200",  "A", "신당동 상가",             "목요일 막판 집중"]],
+        "00~02": [["중구 성내1·2동",     "7",  "9,800",  "A", "성내2동 앵커",            "목요일 심야 귀가"]],
+    },
+    "금": {
+        "19~21": [["수성구 범어·만촌",   "8",  "7,600",  "A", "범어역~만촌역",          "금요일 수성구 콜 실적 최다"]],
+        "21~24": [["중구 동성로/삼덕동", "9",  "10,000", "S", "삼덕동 먹자골목",        "유흥 피크! 술집 01시 마감"]],
+        "00~02": [["중구 성내1·2동",     "9",  "11,500", "S", "성내2동 앵커",            "동성로 마감 귀가 폭증"]],
+    },
+    "토": {
+        "19~21": [["수성구 고산2동",     "8",  "9,200",  "S", "수성못 주변",             "주말 17~19시 호출 집중"]],
+        "21~24": [["중구 동성로/삼덕동", "9",  "8,800",  "S", "삼덕동~동성로",           "토요일 밤 유흥 최고 피크"]],
+        "00~02": [["중구 성내1동",       "9",  "14,400", "S", "성내1동~성내2동",         "토요일 막판 단가 14,433원 최고치"]],
+    },
+    "일": {
+        "19~21": [["수성구 고산2동",     "8",  "9,200",  "S", "수성못 주변",             "주말 호출 1위"]],
+        "21~24": [["중구 동성로",        "8",  "11,800", "S", "동성로 입구",             "일요일 밤 단가 11,811원 고효율"]],
+        "00~02": [["중구 성내1동",       "10", "12,400", "S", "성내1동",                 "주말 00~01시 호출 1위 구역"]],
+    },
+}
+
+def get_fish_slot(hour: int) -> str | None:
+    """현재 시각 → 어군 슬롯 반환"""
+    if 19 <= hour < 21: return "19~21"
+    if 21 <= hour <= 23: return "21~24"
+    if 0 <= hour < 2:   return "00~02"
+    return None
+
+def get_fish_report(custom_hour: int = None) -> str | None:
+    """어군 브리핑 텍스트 생성. custom_hour로 특정 시간대 조회 가능."""
+    now  = datetime.now(KST)
+    hour = custom_hour if custom_hour is not None else now.hour
+    day  = DOW_KOR[now.weekday()]
+    slot = get_fish_slot(hour)
+    if not slot:
+        return None
+    zones = FISH_DATA.get(day, {}).get(slot, [])
+    if not zones:
+        return f"🐟 {day}요일 {slot} 어군 데이터 없음\n마기에게 데이터 업데이트 요청하세요."
+    lines = [f"🐟 어군브리핑 — {day}요일 {slot}"]
+    for idx, z in enumerate(zones, 1):
+        grade_icon = {"S": "🔴", "A": "🟠", "B": "🟡", "C": "⚪"}.get(z[3], "⚪")
+        lines.append(f"\n#{idx} {z[0]} {grade_icon}{z[3]}등급")
+        lines.append(f"  점수 {z[1]}/10 | 예상 {z[2]}원")
+        lines.append(f"  📍 {z[4]}")
+        lines.append(f"  💡 {z[5]}")
+    return "\n".join(lines)
+
+def fish_scheduler(app):
+    """18:50 영업준비 브리핑 + 19~02시 매 정각 자동 브리핑"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 발송 대상: 등록된 모든 단말기
+    chat_ids = [x for x in [
+        os.getenv("ALLOWED_CHAT_ID", ""),
+        os.getenv("ALLOWED_CHAT_ID2", ""),
+    ] if x]
+
+    async def send_all(text: str):
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(chat_id=cid, text=text)
+            except Exception as e:
+                logger.error(f"어군 브리핑 발송 오류 ({cid}): {e}")
+
+    last_sent_hour = -1
+    sent_start_brief = False
+    last_reset_day = -1
+
+    while True:
+        now = datetime.now(KST)
+
+        # ── 매일 03시 플래그 리셋 (운행 종료 후)
+        if now.hour == 3 and now.day != last_reset_day:
+            sent_start_brief = False
+            last_sent_hour   = -1
+            last_reset_day   = now.day
+            logger.info("어군 스케줄러 일간 리셋")
+
+        # ── 18:50 영업 준비 브리핑
+        if now.hour == 18 and now.minute == 50 and not sent_start_brief:
+            report = get_fish_report(custom_hour=19) or "데이터 없음"
+            msg = f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"
+            loop.run_until_complete(send_all(msg))
+            sent_start_brief = True
+            logger.info("18:50 영업준비 브리핑 발송")
+
+        # ── 19:00 ~ 02:00 매 정각 브리핑
+        if now.minute == 0 and now.hour != last_sent_hour:
+            in_service = (19 <= now.hour <= 23) or (0 <= now.hour < 2)
+            if in_service:
+                report = get_fish_report()
+                if report:
+                    loop.run_until_complete(send_all(report))
+                    logger.info(f"어군 브리핑 발송: {now.hour}시")
+                last_sent_hour = now.hour
+
+        time.sleep(30)
+
 # ──────────────────────────────────────────────
 # 보험 스케줄러
 # ──────────────────────────────────────────────
@@ -1303,6 +1541,21 @@ def insurance_scheduler():
 def is_allowed(update: Update) -> bool:
     chat_id = str(update.effective_chat.id)
     return chat_id in ALLOWED_IDS
+
+
+async def cmd_fish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """현재 시간대 어군 브리핑 수동 조회"""
+    if not is_allowed(update):
+        return
+    report = get_fish_report()
+    if not report:
+        now = datetime.now(KST)
+        await update.message.reply_text(
+            f"🐟 현재 {now.hour}시는 브리핑 시간대가 아닙니다.\n"
+            f"운영시간: 19~21시 / 21~24시 / 00~02시"
+        )
+        return
+    await update.message.reply_text(report)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -1483,7 +1736,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ 배회분류 오류: {str(e)[:200]}")
         return
 
-    # 특정 날짜 조회
+    # 날짜 + 통계 키워드 조합
+    _stat_kws = ["총건수","건수","매출","순수익","지출","조회","상세"]
+    _date_pat = r"(\d{1,2})[-/](\d{1,2})|(\d{4})-(\d{1,2})-(\d{1,2})"
+    import re as _re
+    if _re.search(_date_pat, text) and any(kw in text for kw in _stat_kws):
+        if any(kw in text for kw in ["총건수","건수","매출","순수익","지출"]):
+            await handle_date_stat(update, text)
+        else:
+            await handle_date_query(update, text)
+        return
+
+    # 특정 날짜 조회 (조회 키워드만 있을 때)
     if "조회" in text:
         await handle_date_query(update, text)
         return
@@ -1539,9 +1803,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_download_month(update, _ym_match.group(1))
         return
 
-    # 휴무
-    if text == "휴무":
-        await handle_rest_day(update)
+    # 휴무 (오늘 또는 날짜 지정)
+    if "휴무" in text:
+        await handle_rest_day(update, text)
         return
 
     # 지출취소
@@ -1576,6 +1840,10 @@ def main():
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
 
+    # 어군탐지기 스케줄러 (18:50 + 매 정각 자동 브리핑)
+    threading.Thread(target=fish_scheduler, args=(app,), daemon=True).start()
+    logger.info("어군탐지기 스케줄러 시작")
+
     # Telegram application
     app = (
         Application.builder()
@@ -1599,6 +1867,7 @@ def main():
 
     # 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("fish", cmd_fish))    # 어군 브리핑 수동 조회
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
