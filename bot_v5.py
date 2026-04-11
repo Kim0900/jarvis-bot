@@ -2136,10 +2136,6 @@ def main():
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
 
-    # 어군탐지기 스케줄러 (18:50 + 매 정각 자동 브리핑)
-    threading.Thread(target=fish_scheduler, args=(app,), daemon=True).start()
-    logger.info("어군탐지기 스케줄러 시작")
-
     # Telegram application
     app = (
         Application.builder()
@@ -2160,6 +2156,10 @@ def main():
         logger.info("Webhook 삭제 완료 — 폴링 시작")
 
     app.post_init = post_init
+
+    # 어군탐지기 스케줄러 — app 생성 후 시작
+    threading.Thread(target=fish_scheduler, args=(app,), daemon=True).start()
+    logger.info("어군탐지기 스케줄러 시작")
 
     # 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
