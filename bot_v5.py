@@ -239,7 +239,13 @@ async def ocr_call_card(image_bytes: bytes) -> dict | None:
     prompt = (
         "이 콜카드 이미지에서 정보를 추출해서 JSON만 반환해줘.\n"
         '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"OO구 OO동","도착지":"OO구 OO동",'
-        '"요금":숫자,"카드사":"카드사명","콜유형":"카카오T 또는 배회"}\n'
+        '"요금":숫자,"카드사":"카드사명","콜유형":"카카오T 또는 배회","결제방식":"자동 또는 직접"}\n'
+        "⚠️ 결제방식 판별:\n"
+        "  - 요금 금액이 숫자로 명확히 표시 → 결제방식=\'자동\', 요금=해당 숫자\n"
+        "  - 요금 없음·0원·미표시 → 결제방식=\'직접\', 요금=0\n"
+        "⚠️ 도착지 주의:\n"
+        "  - 차량번호 패턴(예: 대구 32바 5763, XX가·나·바 NNNN)은 도착지가 아님 → null\n"
+        "  - 도착지는 반드시 \'OO구 OO동\' 형식 주소만 허용\n"
         "배차시각=승차 시각, 하차시각=하차 완료 시각. 없으면 null.\n"
         "JSON만 반환. 설명 금지."
     )
@@ -342,6 +348,7 @@ async def cross_check(date_str: str) -> str:
     matched_call_ids    = set()
     matched_receipt_ids = set()
     fee_mismatches      = []  # 금액 불일치 목록
+    direct_updated      = []  # 직접결제 요금 자동업데이트 목록
 
     for i, call in enumerate(calls):
         배차 = call.get("배차시각") or ""
@@ -366,9 +373,21 @@ async def cross_check(date_str: str) -> str:
         if best_j is not None:
             matched_call_ids.add(i)
             matched_receipt_ids.add(best_j)
-            # 금액 비교 → 불일치 기록
             rcpt_fee = receipts[best_j].get("요금") or 0
-            if call_fee > 0 and rcpt_fee > 0:
+
+            # 직접결제(요금=0) 콜카드 → 결제내역 요금으로 자동 업데이트
+            if call_fee == 0 and rcpt_fee > 0:
+                call_id = call.get("id")
+                if call_id:
+                    await sb_h("PATCH", f"raw_calls?id=eq.{call_id}",
+                               json={"요금": rcpt_fee, "비고": "직접결제(요금확인완료)"})
+                    direct_updated.append({
+                        "배차시각": 배차,
+                        "요금": rcpt_fee,
+                    })
+
+            # 금액 불일치 (둘 다 0이 아니고 차이 ≥500원)
+            elif call_fee > 0 and rcpt_fee > 0:
                 fee_diff = abs(call_fee - rcpt_fee)
                 if fee_diff >= FEE_DIFF_THRESHOLD:
                     fee_mismatches.append({
@@ -415,6 +434,13 @@ async def cross_check(date_str: str) -> str:
     lines_out = [f"📊 교차대조 결과 — {date_str}"]
     lines_out.append(f"콜카드 {len(calls)}건 / 결제내역 {len(receipts)}건 / 매칭 {len(matched_call_ids)}건")
     lines_out.append("")
+
+    # 직접결제 요금 자동업데이트 표시
+    if direct_updated:
+        lines_out.append(f"💳 직접결제 요금 자동확인 {len(direct_updated)}건:")
+        for d in direct_updated:
+            lines_out.append(f"  ✅ {d['배차시각']} → {fmt(d['요금'])} 업데이트")
+        lines_out.append("")
 
     if unmatched_calls:
         lines_out.append(f"🟠 콜카드에만 있음 {len(unmatched_calls)}건:")
@@ -532,12 +558,17 @@ async def process_call_card(update: Update, image_bytes: bytes):
     today = str(today_kst())
     dow = get_dow()
     배차시각 = data.get("배차시각")
-    요금 = data.get("요금", 0)
+    요금 = data.get("요금") or 0
+    결제방식 = data.get("결제방식", "자동")
 
     # 중복 체크 → 자동 삭제 후 재저장
     deleted = await delete_duplicate_call(today, 배차시각, 요금)
     if deleted:
         logger.info(f"중복 콜카드 자동 삭제 후 재저장: {today} {배차시각} {요금}")
+
+    # 직접결제: 요금 0원 → pending 상태로 저장
+    is_direct = (결제방식 == "직접") or (요금 == 0)
+    비고 = "직접결제(요금미확인)" if is_direct else data.get("카드사")
 
     payload = {
         "날짜": today,
@@ -548,15 +579,22 @@ async def process_call_card(update: Update, image_bytes: bytes):
         "도착지": data.get("도착지"),
         "요금": 요금,
         "콜유형": data.get("콜유형", "카카오T"),
-        "비고": data.get("카드사"),
+        "비고": 비고,
     }
     result = await sb_insert("raw_calls", payload)
     if result:
-        await update.message.reply_text(
-            f"✅ 콜 저장\n"
-            f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
-            f"{fmt(요금)} [{data.get('콜유형','카카오T')}]"
-        )
+        if is_direct:
+            await update.message.reply_text(
+                f"💳 직접결제 콜카드 저장 (요금 미확인)\n"
+                f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?') or '?'}\n"
+                f"⚠️ 결제내역 업로드 후 '대조 {today}' 입력해서 요금 확인하세요."
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ 콜 저장\n"
+                f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
+                f"{fmt(요금)} [{data.get('콜유형','카카오T')}]"
+            )
     else:
         await update.message.reply_text("❌ DB 저장 실패")
 
