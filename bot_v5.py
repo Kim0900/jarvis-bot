@@ -1375,6 +1375,155 @@ async def handle_date_query(update, date_str: str):
     await update.message.reply_text(msg)
 
 
+
+async def handle_call_edit(update, text: str):
+    """
+    콜카드 수동 수정 명령어.
+    형식:
+      콜수정 HH:MM 필드=값
+      콜수정 YYYY-MM-DD HH:MM 필드=값
+    예:
+      콜수정 19:18 요금=13100
+      콜수정 19:18 배차시각=22:46
+      콜수정 2026-03-20 19:18 도착지=수성구 만촌3동
+    지원 필드: 배차시각, 하차시각, 출발지, 도착지, 요금, 콜유형, 비고
+    """
+    import re
+
+    EDITABLE = {"배차시각","하차시각","출발지","도착지","요금","콜유형","비고"}
+
+    parts = text.strip().split(" ", 1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "형식: 콜수정 HH:MM 필드=값\n"
+            "날짜지정: 콜수정 YYYY-MM-DD HH:MM 필드=값\n"
+            "예) 콜수정 19:18 요금=13100\n"
+            "예) 콜수정 2026-03-20 19:18 배차시각=22:46"
+        )
+        return
+
+    rest = parts[1].strip()
+
+    # 날짜 포함 여부 판단
+    date_match = re.match(r'^(\d{4}-\d{1,2}-\d{1,2})\s+(\d{1,2}:\d{2})\s+(.+)$', rest)
+    time_only  = re.match(r'^(\d{1,2}:\d{2})\s+(.+)$', rest)
+
+    if date_match:
+        target_date  = date_match.group(1)
+        target_time  = date_match.group(2)
+        field_str    = date_match.group(3)
+    elif time_only:
+        target_date  = str(today_kst())
+        target_time  = time_only.group(1)
+        field_str    = time_only.group(2)
+    else:
+        await update.message.reply_text("❌ 형식 오류\n예) 콜수정 19:18 요금=13100")
+        return
+
+    # 필드=값 파싱
+    field_match = re.match(r'^(\S+?)=(.+)$', field_str.strip())
+    if not field_match:
+        await update.message.reply_text("❌ 필드=값 형식 오류\n예) 요금=13100")
+        return
+
+    field = field_match.group(1).strip()
+    value = field_match.group(2).strip()
+
+    if field not in EDITABLE:
+        await update.message.reply_text(
+            f"❌ '{field}' 는 수정 불가\n"
+            f"수정 가능: {', '.join(sorted(EDITABLE))}"
+        )
+        return
+
+    # 요금은 int 변환
+    if field == "요금":
+        try:
+            value = int(value.replace(",","").replace("원",""))
+        except ValueError:
+            await update.message.reply_text("❌ 요금은 숫자만 입력 (예: 13100)")
+            return
+
+    # DB에서 해당 건 찾기
+    rows = await sb_select("raw_calls", {
+        "날짜": f"eq.{target_date}",
+        "배차시각": f"eq.{target_time}",
+    })
+
+    if not rows:
+        await update.message.reply_text(
+            f"⚠️ {target_date} {target_time} 콜 없음\n"
+            f"날짜·시각을 확인해주세요."
+        )
+        return
+
+    if len(rows) > 1:
+        lines_out = [f"⚠️ {target_time} 콜이 {len(rows)}건 있습니다. 어느 건?"]
+        for r in rows:
+            lines_out.append(
+                f"  ID:{r['id']} {r.get('출발지','')}→{r.get('도착지','')} {fmt(r.get('요금') or 0)}"
+            )
+        lines_out.append("ID 지정: 콜수정ID [id] 필드=값")
+        await update.message.reply_text("\n".join(lines_out))
+        return
+
+    row = rows[0]
+    old_val = row.get(field)
+    row_id  = row["id"]
+
+    # PATCH
+    result = await sb_h("PATCH", f"raw_calls?id=eq.{row_id}", json={field: value})
+
+    if result is not None:
+        await update.message.reply_text(
+            f"✅ 콜 수정 완료\n"
+            f"날짜: {target_date} | 배차: {target_time}\n"
+            f"{field}: {old_val} → {value}"
+        )
+    else:
+        await update.message.reply_text("❌ 수정 실패")
+
+
+async def handle_call_edit_by_id(update, text: str):
+    """
+    ID 지정 수정: '콜수정ID [id] 필드=값'
+    동일 시각 콜이 여러 건일 때 사용
+    """
+    import re
+    EDITABLE = {"배차시각","하차시각","출발지","도착지","요금","콜유형","비고"}
+
+    m = re.match(r'^(\d+)\s+(\S+?)=(.+)$', text.strip())
+    if not m:
+        await update.message.reply_text("형식: 콜수정ID [id] 필드=값\n예) 콜수정ID 42 요금=13100")
+        return
+
+    row_id = int(m.group(1))
+    field  = m.group(2).strip()
+    value  = m.group(3).strip()
+
+    if field not in EDITABLE:
+        await update.message.reply_text(f"❌ '{field}' 수정 불가")
+        return
+
+    if field == "요금":
+        try:
+            value = int(value.replace(",","").replace("원",""))
+        except ValueError:
+            await update.message.reply_text("❌ 요금은 숫자만")
+            return
+
+    rows = await sb_select("raw_calls", {"id": f"eq.{row_id}"})
+    if not rows:
+        await update.message.reply_text(f"❌ ID {row_id} 없음")
+        return
+
+    old_val = rows[0].get(field)
+    await sb_h("PATCH", f"raw_calls?id=eq.{row_id}", json={field: value})
+    await update.message.reply_text(
+        f"✅ ID {row_id} 수정\n{field}: {old_val} → {value}"
+    )
+
+
 async def handle_db_check(update: Update):
     calls = await sb_select("raw_calls", {"order": "id.desc", "limit": "1"})
     total_calls = await sb_select("raw_calls", {})
@@ -2135,6 +2284,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ym_match = _re.match(r"^월간\s*(\d{4}-\d{2})$", text.strip())
     if _ym_match:
         await handle_download_month(update, _ym_match.group(1))
+        return
+
+    # 콜카드 수동 수정
+    if text.startswith("콜수정ID "):
+        await handle_call_edit_by_id(update, text[6:].strip())
+        return
+
+    if text.startswith("콜수정 "):
+        await handle_call_edit(update, text)
         return
 
     # 휴무 (오늘 또는 날짜 지정)
