@@ -1376,6 +1376,143 @@ async def handle_date_query(update, date_str: str):
 
 
 
+
+def parse_manual_full(text: str) -> dict | None:
+    """
+    수동 콜 전체 입력 파싱.
+    형식:
+      2026 03 01 23 05 수성못>대명1동 8500 카카오
+      26 03 01 23 05 수성못>대명1동 8500 배회
+      03012305 수성못>대명1동 8500 카카오
+      0301 2305 수성못>대명1동 8500 배회
+      2026-03-01 23:05 수성못>대명1동 8500 카카오
+    """
+    import re as _re
+    from datetime import date as _date
+
+    orig = text.strip()
+    today = _date.today()
+
+    # 콜유형
+    콜유형 = "배회" if "배회" in orig else "카카오T"
+    clean = _re.sub(r'배회|카카오T?', '', orig).strip()
+
+    # 경로 (출발>도착)
+    route_m = _re.search(r'([가-힣\w]+)\s*[>→]\s*([가-힣\w]+)', clean)
+    출발지 = 도착지 = None
+    if route_m:
+        출발지 = route_m.group(1).strip()
+        도착지 = route_m.group(2).strip()
+        clean = (clean[:route_m.start()] + ' ' + clean[route_m.end():]).strip()
+
+    # 날짜+시각 파싱 (패턴 순서대로 시도)
+    날짜 = None
+    배차시각 = None
+
+    # A: YYYY-MM-DD HH:MM 또는 YY-MM-DD HH:MM
+    m = _re.search(r'(\d{2,4})[.\-](\d{1,2})[.\-](\d{1,2})\s+(\d{1,2}):(\d{2})', clean)
+    if m:
+        g = m.groups(); y = int(g[0]); y = y+2000 if y<100 else y
+        try:
+            날짜 = _date(y,int(g[1]),int(g[2])); 배차시각 = f"{int(g[3]):02d}:{g[4]}"
+            clean = clean[:m.start()] + ' ' + clean[m.end():]
+        except ValueError: pass
+
+    # B: YYYY MM DD HH MM
+    if not 날짜:
+        m = _re.search(r'(\d{4})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{2})\b', clean)
+        if m:
+            g = m.groups()
+            try:
+                날짜 = _date(int(g[0]),int(g[1]),int(g[2])); 배차시각 = f"{int(g[3]):02d}:{g[4]}"
+                clean = clean[:m.start()] + ' ' + clean[m.end():]
+            except ValueError: pass
+
+    # C: YY MM DD HH MM
+    if not 날짜:
+        m = _re.search(r'\b(\d{2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{1,2})\s+(\d{2})\b', clean)
+        if m:
+            g = m.groups()
+            try:
+                날짜 = _date(int(g[0])+2000,int(g[1]),int(g[2])); 배차시각 = f"{int(g[3]):02d}:{g[4]}"
+                clean = clean[:m.start()] + ' ' + clean[m.end():]
+            except ValueError: pass
+
+    # D: MMDD HHMM
+    if not 날짜:
+        m = _re.search(r'\b(\d{4})\s+(\d{4})\b', clean)
+        if m:
+            a,b = m.group(1), m.group(2)
+            try:
+                날짜 = _date(today.year,int(a[:2]),int(a[2:])); 배차시각 = f"{int(b[:2]):02d}:{b[2:]}"
+                clean = clean[:m.start()] + ' ' + clean[m.end():]
+            except ValueError: pass
+
+    # E: MMDDHHMM (8자리)
+    if not 날짜:
+        m = _re.search(r'\b(\d{8})\b', clean)
+        if m:
+            n = m.group(1)
+            try:
+                날짜 = _date(today.year,int(n[0:2]),int(n[2:4])); 배차시각 = f"{int(n[4:6]):02d}:{n[6:]}"
+                clean = clean[:m.start()] + ' ' + clean[m.end():]
+            except ValueError: pass
+
+    if not 날짜 or not 배차시각:
+        return None
+
+    # 요금: 남은 clean의 4~6자리 숫자
+    fee_m = _re.search(r'(?<!\d)(\d{4,6})(?!\d)', clean)
+    if not fee_m:
+        return None
+    요금 = int(fee_m.group(1))
+
+    요일 = ["월","화","수","목","금","토","일"][날짜.weekday()]
+    return {"날짜":str(날짜),"요일":요일,"배차시각":배차시각,
+            "출발지":출발지,"도착지":도착지,"요금":요금,"콜유형":콜유형}
+
+
+async def handle_manual_full_call(update, text: str):
+    """수동 전체 입력 콜 저장"""
+    data = parse_manual_full(text)
+    if not data:
+        await update.message.reply_text(
+            "❌ 형식 오류\n\n"
+            "예시:\n"
+            "2026 03 01 23 05 수성못>대명1동 8500 카카오\n"
+            "26 03 01 23 05 수성못>대명1동 8500 배회\n"
+            "0301 2305 수성못>대명1동 8500 카카오\n"
+            "03012305 수성못>대명1동 8500 배회"
+        )
+        return
+
+    # 중복 체크 → 자동 삭제 후 재저장
+    deleted = await delete_duplicate_call(data["날짜"], data["배차시각"], data["요금"])
+    if deleted:
+        logger.info(f"수동입력 중복 삭제: {data['날짜']} {data['배차시각']}")
+
+    result = await sb_insert("raw_calls", {
+        "날짜":     data["날짜"],
+        "요일":     data["요일"],
+        "배차시각": data["배차시각"],
+        "출발지":   data["출발지"],
+        "도착지":   data["도착지"],
+        "요금":     data["요금"],
+        "콜유형":   data["콜유형"],
+        "비고":     "수동입력",
+    })
+
+    if result:
+        await update.message.reply_text(
+            f"✅ 수동입력 저장\n"
+            f"{data['날짜']}({data['요일']}) {data['배차시각']}\n"
+            f"{data.get('출발지','-')}→{data.get('도착지','-')}\n"
+            f"{data['요금']:,}원 [{data['콜유형']}]"
+        )
+    else:
+        await update.message.reply_text("❌ DB 저장 실패")
+
+
 async def handle_call_edit(update, text: str):
     """
     콜카드 수동 수정 명령어.
@@ -2284,6 +2421,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _ym_match = _re.match(r"^월간\s*(\d{4}-\d{2})$", text.strip())
     if _ym_match:
         await handle_download_month(update, _ym_match.group(1))
+        return
+
+    # 수동 전체 입력 (날짜+시각+경로+요금 형식)
+    import re as _re2
+    _has_route = bool(_re2.search(r'[가-힣\w]+[>→][가-힣\w]+', text))
+    _has_date_nums = bool(_re2.search(r'\d{2}\s+\d{1,2}\s+\d{1,2}\s+\d{1,2}\s+\d{2}|\d{4}[\-.]\d{1,2}[\-.]\d{1,2}|\d{8}|\d{4}\s+\d{4}', text))
+    if _has_route and _has_date_nums:
+        await handle_manual_full_call(update, text)
         return
 
     # 콜카드 수동 수정
