@@ -373,6 +373,7 @@ async def cross_check(date_str: str) -> str:
         if best_j is not None:
             matched_call_ids.add(i)
             matched_receipt_ids.add(best_j)
+            call_fee = call.get("요금") or 0
             rcpt_fee = receipts[best_j].get("요금") or 0
 
             # 직접결제(요금=0) 콜카드 → 결제내역 요금으로 자동 업데이트
@@ -2332,12 +2333,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_receipt_delete(update, text)
         return
 
-    # 교차대조
+    # 교차대조 — YYYY-MM-DD 또는 M-D 형식 지원
     if text.startswith("대조 "):
+        import re as _re3
+        from datetime import date as _date3
         date_str = text[3:].strip()
+        _md = _re3.match(r'^(\d{1,2})-(\d{1,2})$', date_str)
+        if _md:
+            try:
+                _d = _date3(_date3.today().year, int(_md.group(1)), int(_md.group(2)))
+                date_str = str(_d)
+            except ValueError:
+                await update.message.reply_text("❌ 잘못된 날짜입니다.")
+                return
         try:
             result = await cross_check(date_str)
-            # Telegram 4096자 제한 처리
             if len(result) > 4000:
                 result = result[:4000] + "\n...(생략)"
             await update.message.reply_text(result)
