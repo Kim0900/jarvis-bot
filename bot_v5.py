@@ -189,20 +189,26 @@ image_queue: asyncio.Queue = None  # main()에서 초기화
 # Claude API — 이미지 분류 + OCR
 # ──────────────────────────────────────────────
 async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) -> str:
+    """Claude API 비동기 호출 (asyncio.to_thread로 블로킹 방지)"""
     b64 = base64.standard_b64encode(image_bytes).decode()
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    msg = client.messages.create(
-        model=OCR_MODEL,
-        max_tokens=max_tokens,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": prompt},
-            ],
-        }],
-    )
-    return msg.content[0].text.strip()
+
+    def _sync_call():
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0)
+        msg = client.messages.create(
+            model=OCR_MODEL,
+            max_tokens=max_tokens,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+        return msg.content[0].text.strip()
+
+    # 동기 API를 별도 스레드에서 실행 → asyncio 이벤트 루프 블로킹 방지
+    return await asyncio.to_thread(_sync_call)
 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
@@ -2194,13 +2200,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📋 명령어\n\n"
-        "[입력]\n콜 금액 / 배회 금액 / 충전 금액\n"
+        "[이미지] 콜카드·충전영수증·결제내역 → 자동저장\n\n"
+        "[수동입력]\n"
+        "콜 금액 / 배회 금액 / 충전 금액\n"
         "타이어·오일·세차 금액 / 지출 항목 금액\n"
-        "지출취소 / 휴무\n\n"
-        "[조회]\n오늘 / 이번 주 / 이번 달 / 지출 확인 / DB 확인\n\n"
-        "[전략]\n전략 / 마기 업데이트 [시간대] [내용]\n\n"
-        "[다운로드]\n주간 다운로드 / 월간 다운로드 / 전체 다운로드\n\n"
-        "[교차대조]\n대조 YYYY-MM-DD / 배회분류 확정 YYYY-MM-DD"
+        "지출취소 / 휴무 / 4-7 휴무\n\n"
+        "[수동전체]\n"
+        "2026 03 01 23 05 출발>도착 요금 카카오\n"
+        "0301 2305 출발>도착 요금 배회\n\n"
+        "[콜수정]\n"
+        "콜수정 HH:MM 필드=값\n"
+        "콜수정 날짜 HH:MM 필드=값\n"
+        "콜수정ID [id] 필드=값\n\n"
+        "[조회]\n"
+        "오늘·이번 주·이번 달·지출 확인·DB 확인\n"
+        "3-7 조회·매출·순수익·총건수·지출\n\n"
+        "[교차대조]\n"
+        "대조 날짜 (예: 대조 3-7)\n"
+        "대조 확정 날짜 / 대조 금액확인 날짜\n\n"
+        "[결제삭제]\n"
+        "결제삭제 날짜 운행외/0원/전체/HH:MM\n\n"
+        "[전략] 전략 / 마기 업데이트 시간대 내용\n\n"
+        "[다운로드]\n"
+        "주간/월간/전체 다운로드 / 월간 2026-03\n\n"
+        "[어군] /fish"
     )
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
