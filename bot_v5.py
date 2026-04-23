@@ -243,17 +243,23 @@ async def classify_image(image_bytes: bytes) -> str:
 
 async def ocr_call_card(image_bytes: bytes) -> dict | None:
     prompt = (
-        "이 콜카드 이미지에서 정보를 추출해서 JSON만 반환해줘.\n"
-        '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"OO구 OO동","도착지":"OO구 OO동",'
+        "이 카카오T 콜카드(운행이력) 이미지에서 아래 JSON만 반환해줘.\n"
+        '{"날짜":"YYYY-MM-DD","배차시각":"HH:MM","하차시각":"HH:MM",'
+        '"출발지":"OO구 OO동","도착지":"OO구 OO동",'
         '"요금":숫자,"카드사":"카드사명","콜유형":"카카오T 또는 배회","결제방식":"자동 또는 직접"}\n'
-        "⚠️ 결제방식 판별:\n"
-        "  - 요금 금액이 숫자로 명확히 표시 → 결제방식=\'자동\', 요금=해당 숫자\n"
-        "  - 요금 없음·0원·미표시 → 결제방식=\'직접\', 요금=0\n"
-        "⚠️ 도착지 주의:\n"
-        "  - 차량번호 패턴(예: 대구 32바 5763, XX가·나·바 NNNN)은 도착지가 아님 → null\n"
-        "  - 도착지는 반드시 \'OO구 OO동\' 형식 주소만 허용\n"
-        "배차시각=승차 시각, 하차시각=하차 완료 시각. 없으면 null.\n"
-        "JSON만 반환. 설명 금지."
+        "⚠️ 날짜: 이미지 상단의 운행 날짜(예: 2026/03/07 → 2026-03-07). 없으면 null.\n"
+        "  단, 화면에 여러 날짜가 있으면 가장 최근 운행의 날짜만 추출.\n"
+        "⚠️ 요금 추출:\n"
+        "  - \'미터 요금\', \'총 요금\', \'결제 금액\', \'이용 요금\' 레이블 옆 숫자\n"
+        "  - 예: 미터요금 13,100원 → 요금=13100\n"
+        "  - 요금이 보이면 반드시 추출. 화면에 없을 때만 0으로 설정\n"
+        "⚠️ 결제방식:\n"
+        "  - 요금 숫자 보임 → 결제방식=\'자동\', 요금=해당숫자\n"
+        "  - 요금 전혀 없음 → 결제방식=\'직접\', 요금=0\n"
+        "⚠️ 도착지: 차량번호(예: 대구 32바 5763, XX가나바 NNNN) → null.\n"
+        "  도착지는 \'OO구 OO동\' 형식 주소만.\n"
+        "⚠️ 시각: 배차시각=승차시각, 하차시각=하차완료시각. 없으면 null.\n"
+        "JSON만 반환. 설명·마크다운 금지."
     )
     raw = await claude_vision(image_bytes, prompt, max_tokens=200)
     try:
@@ -562,8 +568,37 @@ async def process_call_card(update: Update, image_bytes: bytes):
         await update.message.reply_text("❌ 콜카드 인식 실패. 다시 올려주세요.")
         return
 
-    today = str(today_kst())
-    dow = get_dow()
+    # 날짜 결정 로직:
+    # - OCR 날짜가 과거(미래 아님)이면 → OCR 날짜 신뢰 (뒤늦게 올린 콜카드)
+    # - OCR 날짜가 미래이면 → 오늘 날짜 (오인식)
+    # - OCR 날짜 없으면 → 오늘 날짜
+    from datetime import date as _dc, timedelta as _td
+    _today_d = today_kst()
+    _today_str = str(_today_d)
+    _dow_map = ["월","화","수","목","금","토","일"]
+
+    ocr_date_raw = data.get("날짜")
+    today = _today_str
+    dow = _dow_map[_today_d.weekday()]
+    date_source = "오늘"  # 저장 메시지용
+
+    if ocr_date_raw:
+        try:
+            _ocr_d = _dc.fromisoformat(str(ocr_date_raw).strip())
+            if _ocr_d > _today_d:
+                # 미래 날짜 → 오인식 → 오늘 사용
+                today = _today_str
+                date_source = f"오늘(OCR미래날짜오류)"
+            else:
+                # 과거 또는 오늘 → OCR 날짜 신뢰
+                today = str(_ocr_d)
+                dow = _dow_map[_ocr_d.weekday()]
+                diff = (_today_d - _ocr_d).days
+                date_source = f"OCR({diff}일전)" if diff > 0 else "오늘"
+        except Exception:
+            today = _today_str
+            date_source = "오늘(OCR파싱오류)"
+
     배차시각 = data.get("배차시각")
     요금 = data.get("요금") or 0
     결제방식 = data.get("결제방식", "자동")
@@ -574,7 +609,11 @@ async def process_call_card(update: Update, image_bytes: bytes):
         logger.info(f"중복 콜카드 자동 삭제 후 재저장: {today} {배차시각} {요금}")
 
     # 직접결제: 요금 0원 → pending 상태로 저장
-    is_direct = (결제방식 == "직접") or (요금 == 0)
+    # 직접결제 판별:
+    # - 결제방식이 명시적으로 "직접"인 경우만 직접결제
+    # - 요금=0이어도 결제방식="자동"이면 OCR 오류일 수 있으므로 경고만 표시
+    is_direct = (결제방식 == "직접")
+    is_zero_fee = (요금 == 0) and not is_direct  # 요금=0 but 자동결제
     비고 = "직접결제(요금미확인)" if is_direct else data.get("카드사")
 
     payload = {
@@ -593,12 +632,20 @@ async def process_call_card(update: Update, image_bytes: bytes):
         if is_direct:
             await update.message.reply_text(
                 f"💳 직접결제 콜카드 저장 (요금 미확인)\n"
+                f"날짜: {today} ({dow}) [{date_source}]\n"
                 f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?') or '?'}\n"
                 f"⚠️ 결제내역 업로드 후 '대조 {today}' 입력해서 요금 확인하세요."
+            )
+        elif is_zero_fee:
+            await update.message.reply_text(
+                f"⚠️ 콜 저장 (요금 0원 — 확인 필요)\n"
+                f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
+                f"콜카드에 요금이 보이면 '콜수정 {배차시각} 요금=실제금액' 으로 수정하세요."
             )
         else:
             await update.message.reply_text(
                 f"✅ 콜 저장\n"
+                f"날짜: {today} ({dow}) [{date_source}]\n"
                 f"{배차시각} {data.get('출발지','?')}→{data.get('도착지','?')}\n"
                 f"{fmt(요금)} [{data.get('콜유형','카카오T')}]"
             )
@@ -2354,6 +2401,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # "결제삭제 YYYY-MM-DD 전체"   → 해당 날짜 전체 삭제
     if text.startswith("결제삭제 "):
         await handle_receipt_delete(update, text)
+        return
+
+    # 대조 확정 (배회후보 raw_calls 추가)
+    if text.startswith("대조 확정 "):
+        _ds = text[6:].strip()
+        try:
+            result = await confirm_cross_check(_ds)
+            await update.message.reply_text(result)
+        except Exception as e:
+            await update.message.reply_text(f"❌ 대조확정 오류: {str(e)[:200]}")
+        return
+
+    # 대조 금액확인 (InlineKeyboard 금액 선택)
+    if text.startswith("대조 금액확인 "):
+        _ds = text[8:].strip()
+        try:
+            await handle_fee_confirm_request(update, _ds)
+        except Exception as e:
+            await update.message.reply_text(f"❌ 금액확인 오류: {str(e)[:200]}")
         return
 
     # 교차대조 — YYYY-MM-DD 또는 M-D 형식 지원
