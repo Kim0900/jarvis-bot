@@ -241,6 +241,137 @@ async def classify_image(image_bytes: bytes) -> str:
             return keyword
     return "기타"
 
+
+# ══════════════════════════════════════════════
+# 세큐티 OCR + 저장 + 조회
+# ══════════════════════════════════════════════
+
+async def ocr_sekuti(image_bytes: bytes) -> dict | None:
+    """세큐티 리포트 이미지 OCR → 점수·등급 추출"""
+    prompt = (
+        "이 세큐티(SEKUTI) 기사 리포트 이미지에서 정보를 추출해서 JSON만 반환해줘.\n"
+        '{"종합점수":숫자,"상위퍼센트":숫자,"수락률":숫자,"실내공기":숫자,'
+        '"친절도":숫자,"안전운행":숫자,"등급":"마스터/다이아몬드/플래티넘/골드/실버 중 하나",'
+        '"기간":"주간 또는 월간","기준날짜":"YYYY-MM-DD"}\n'
+        "없는 항목은 null. 점수는 숫자만(원,% 제외).\n"
+        "JSON만 반환. 설명·마크다운 금지."
+    )
+    try:
+        raw = await claude_vision(image_bytes, prompt, max_tokens=300)
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        import json as _json
+        return _json.loads(raw)
+    except Exception as e:
+        logger.error(f"세큐티 OCR 오류: {e}")
+        return None
+
+
+async def process_sekuti(update, image_bytes: bytes):
+    """세큐티 이미지 처리: OCR → sekuti_weekly 저장 → 결과 표시"""
+    await update.message.reply_text("📊 세큐티 분석 중...")
+
+    data = await ocr_sekuti(image_bytes)
+    if not data:
+        await update.message.reply_text("❌ 세큐티 인식 실패. 다시 올려주세요.")
+        return
+
+    from datetime import date as _dc
+    기준날짜 = data.get("기준날짜")
+    if 기준날짜:
+        try:
+            _dc.fromisoformat(str(기준날짜))
+        except Exception:
+            기준날짜 = str(today_kst())
+    else:
+        기준날짜 = str(today_kst())
+
+    종합점수   = data.get("종합점수")
+    상위퍼센트 = data.get("상위퍼센트")
+    수락률     = data.get("수락률")
+    실내공기   = data.get("실내공기")
+    친절도     = data.get("친절도")
+    안전운행   = data.get("안전운행")
+    등급       = data.get("등급") or ""
+    기간       = data.get("기간") or "주간"
+
+    payload = {
+        "날짜":       기준날짜,
+        "종합점수":   종합점수,
+        "상위퍼센트": 상위퍼센트,
+        "수락률":     수락률,
+        "실내공기":   실내공기,
+        "친절도":     친절도,
+        "안전운행":   안전운행,
+        "등급":       등급,
+        "기간":       기간,
+    }
+    await sb_upsert("sekuti_weekly", payload, on_conflict="날짜,기간")
+
+    grade_icon = {
+        "마스터":"👑","다이아몬드":"💎","플래티넘":"🥈","골드":"🥇","실버":"🥉"
+    }.get(등급, "📊")
+
+    def score_bar(score):
+        if score is None: return "N/A"
+        s = int(score)
+        if s >= 95: return f"{s}점 🟢"
+        if s >= 90: return f"{s}점 🟡"
+        return f"{s}점 🔴"
+
+    master_check = []
+    if 종합점수 and 종합점수 >= 95:
+        master_check.append("✅ 종합점수 95↑")
+    else:
+        master_check.append(f"❌ 종합점수 {종합점수 or '?'} (95 필요)")
+    if 실내공기 and 실내공기 >= 93:
+        master_check.append("✅ 실내공기 93↑")
+    else:
+        master_check.append(f"❌ 실내공기 {실내공기 or '?'} (93 필요)")
+    if 수락률 and 수락률 >= 95:
+        master_check.append("✅ 수락률 95↑")
+    else:
+        master_check.append(f"❌ 수락률 {수락률 or '?'} (95 필요)")
+
+    msg_lines = [
+        f"{grade_icon} 세큐티 리포트 ({기간}) — {기준날짜}",
+        "",
+        f"종합점수: {score_bar(종합점수)}" + (f" (상위 {상위퍼센트}%)" if 상위퍼센트 else ""),
+        f"등급: {등급}",
+        "",
+        "[항목별]",
+        f"  수락률:   {score_bar(수락률)}",
+        f"  실내공기: {score_bar(실내공기)}",
+        f"  친절도:   {score_bar(친절도)}",
+        f"  안전운행: {score_bar(안전운행)}",
+        "",
+        "[마스터 전환 체크]",
+    ] + master_check
+
+    await update.message.reply_text("\n".join(msg_lines))
+
+
+async def handle_sekuti_query(update):
+    """세큐티 최근 기록 조회 — '세큐티 조회' 명령어"""
+    rows = await sb_select("sekuti_weekly", {"order": "날짜.desc", "limit": "5"})
+    if not rows:
+        await update.message.reply_text(
+            "📊 세큐티 기록 없음\n세큐티 리포트 이미지를 올려주세요."
+        )
+        return
+
+    grade_icon = {"마스터":"👑","다이아몬드":"💎","플래티넘":"🥈","골드":"🥇","실버":"🥉"}
+    lines_out = ["📊 세큐티 최근 기록\n"]
+    for r in rows:
+        icon = grade_icon.get(r.get("등급",""), "📊")
+        lines_out.append(
+            f"{icon} {r.get('날짜','')} ({r.get('기간','')})\n"
+            f"  종합 {r.get('종합점수','?')}점 · 상위 {r.get('상위퍼센트','?')}% · {r.get('등급','')}\n"
+            f"  수락{r.get('수락률','?')} 공기{r.get('실내공기','?')} "
+            f"친절{r.get('친절도','?')} 안전{r.get('안전운행','?')}"
+        )
+    await update.message.reply_text("\n".join(lines_out))
+
+
 async def ocr_call_card(image_bytes: bytes) -> dict | None:
     prompt = (
         "이 카카오T 콜카드(운행이력) 이미지에서 아래 JSON만 반환해줘.\n"
@@ -346,13 +477,12 @@ async def cross_check(date_str: str) -> str:
         except: return None
 
     def to_min_abs(time_str, date_str_local):
+        """날짜 기반 분 변환. mins<300 휴리스틱 제거 — 새벽 운행 오류 방지."""
         try:
             h, m = time_str.split(":")
             mins = int(h)*60+int(m)
             if date_str_local == next_date_str:
-                mins += 1440
-            elif mins < 300:
-                mins += 1440
+                mins += 1440  # 익일 날짜면 +1440만 적용
             return mins
         except: return None
 
@@ -738,7 +868,7 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
     elif image_type == "결제":
         await process_payment_history(update, image_bytes)
     elif image_type == "세큐티":
-        await update.message.reply_text("📊 세큐티 이미지 저장완료")
+        await process_sekuti(update, image_bytes)
     else:
         await update.message.reply_text(
             "❓ 인식할 수 없는 이미지입니다.\n콜카드·충전내역·결제내역을 올려주세요."
@@ -922,11 +1052,11 @@ async def handle_weekly(update: Update):
 
     calls = await sb_select(
         "raw_calls",
-        {"날짜": f"gte.{start_str}", "날짜": f"lte.{end_str}"}
+        {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"}
     )
     expenses = await sb_select(
         "expenses",
-        {"날짜": f"gte.{start_str}", "날짜": f"lte.{end_str}"}
+        {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"}
     )
     총건수 = len(calls)
     총매출 = sum(c.get("요금", 0) or 0 for c in calls)
@@ -1022,7 +1152,7 @@ async def handle_receipt_delete(update, text: str):
                     h, m = t.split(":")
                     mins = int(h) * 60 + int(m)
                     # 운행시간 외: 02:01~18:59
-                    if 121 <= mins <= 1139:
+                    if 121 <= mins <= 1019:
                         delete_ids.append(r["id"])
                 except Exception:
                     delete_ids.append(r["id"])
@@ -2464,6 +2594,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_date_stat(update, text)
         else:
             await handle_date_query(update, text)
+        return
+
+    # 세큐티 조회
+    if text in ("세큐티 조회", "세큐티조회"):
+        await handle_sekuti_query(update)
         return
 
     # 특정 날짜 조회 (조회 키워드만 있을 때)
