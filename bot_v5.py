@@ -2727,8 +2727,9 @@ def main():
         image_queue = asyncio.Queue()
         asyncio.create_task(process_image_queue_worker())
         # 기존 webhook 제거 + 이전 인스턴스 세션 정리 — Conflict 방지
+        await asyncio.sleep(2)  # 구 인스턴스 세션 해제 대기
         await application.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook 삭제 완료 — 폴링 시작")
+        logger.info("Webhook 삭제 완료 — 폴링 시작 준비")
 
     app.post_init = post_init
 
@@ -2747,10 +2748,24 @@ def main():
     from telegram.ext import CallbackQueryHandler
     app.add_handler(CallbackQueryHandler(handle_fee_callback, pattern=r"^fee:"))
 
+    # 전역 에러 핸들러 — Conflict/Network 오류 자동 복구
+    async def error_handler(update, context):
+        import telegram
+        err = context.error
+        if isinstance(err, telegram.error.Conflict):
+            logger.warning(f"Conflict 감지 (자동복구 대기): {err}")
+        elif isinstance(err, telegram.error.NetworkError):
+            logger.warning(f"네트워크 오류 (자동재시도): {err}")
+        elif isinstance(err, telegram.error.TimedOut):
+            pass  # 타임아웃은 정상 폴링 동작
+        else:
+            logger.error(f"봇 오류: {type(err).__name__}: {err}")
+    app.add_error_handler(error_handler)
+
     logger.info("자비스 v5 시작")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
     )
 
 if __name__ == "__main__":
