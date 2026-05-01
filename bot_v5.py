@@ -211,27 +211,50 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
     return await asyncio.to_thread(_sync_call)
 
 
-def resize_image_if_needed(image_bytes: bytes, max_size_kb: int = 1500) -> bytes:
-    """이미지가 너무 크면 리사이즈. Pillow 없으면 원본 반환."""
+def resize_image_if_needed(image_bytes: bytes) -> bytes:
+    """
+    Claude API 전송 전 이미지 최적화.
+    - 최대 너비 1000px (세로 비율 유지)
+    - JPEG quality 80
+    - Pillow 필수 (requirements.txt에 Pillow 추가 필요)
+    """
     try:
         from PIL import Image
         import io
-        size_kb = len(image_bytes) / 1024
-        if size_kb <= max_size_kb:
-            return image_bytes
+
         img = Image.open(io.BytesIO(image_bytes))
-        # 비율 유지하며 축소
-        ratio = (max_size_kb * 1024 / len(image_bytes)) ** 0.5
-        new_w = int(img.width * ratio)
-        new_h = int(img.height * ratio)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+        orig_w, orig_h = img.width, img.height
+        orig_kb = len(image_bytes) / 1024
+
+        # 최대 너비 1000px 초과 시 축소
+        MAX_WIDTH = 1000
+        if orig_w > MAX_WIDTH:
+            ratio = MAX_WIDTH / orig_w
+            new_w = MAX_WIDTH
+            new_h = int(orig_h * ratio)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        
+        # RGB 변환 (PNG RGBA 등 처리)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=80, optimize=True)
         result = buf.getvalue()
-        logger.info(f"이미지 리사이즈: {size_kb:.0f}KB → {len(result)/1024:.0f}KB")
+        result_kb = len(result) / 1024
+
+        logger.info(
+            f"이미지 최적화: {orig_w}x{orig_h} {orig_kb:.0f}KB"
+            f" → {img.width}x{img.height} {result_kb:.0f}KB"
+        )
         return result
-    except Exception:
-        return image_bytes  # Pillow 없거나 오류 시 원본 반환
+
+    except ImportError:
+        logger.error("Pillow 미설치 — requirements.txt에 Pillow 추가 필요")
+        return image_bytes
+    except Exception as e:
+        logger.error(f"이미지 리사이즈 오류: {e}")
+        return image_bytes
 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
@@ -895,7 +918,7 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
         image_bytes = bytes(image_bytes)
 
     # 큰 이미지 리사이즈 (OCR 정확도 유지하면서 API 부하 감소)
-    image_bytes = resize_image_if_needed(image_bytes, max_size_kb=1500)
+    image_bytes = resize_image_if_needed(image_bytes)  # API 전송 전 최적화
     image_type = await classify_image(image_bytes)
     logger.info(f"이미지 분류: {image_type}")
 
