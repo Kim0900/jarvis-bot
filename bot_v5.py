@@ -851,11 +851,14 @@ async def process_payment_history(update: Update, image_bytes: bytes):
         msg += f"\n교차대조: '대조 {dates[0]}' 입력"
     await update.message.reply_text(msg)
 
-async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_bytes = await file.download_as_bytearray()
-    image_bytes = bytes(image_bytes)
+async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYPE, image_bytes: bytes = None):
+    """이미지 처리. image_bytes가 있으면 파일 다운로드 생략 (파일 첨부 경우)."""
+    if image_bytes is None:
+        # 사진으로 전송된 경우 — 텔레그램 photo 객체에서 다운로드
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+        image_bytes = bytes(image_bytes)
 
     image_type = await classify_image(image_bytes)
     logger.info(f"이미지 분류: {image_type}")
@@ -891,9 +894,15 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def process_image_queue_worker():
     while True:
-        update, context = await image_queue.get()
+        item = await image_queue.get()
+        # item은 (update, context) 또는 (update, context, image_bytes)
+        if len(item) == 3:
+            update, context, image_bytes = item
+        else:
+            update, context = item
+            image_bytes = None
         try:
-            await process_single_image(update, context)
+            await process_single_image(update, context, image_bytes=image_bytes)
         except Exception as e:
             logger.error(f"이미지 처리 오류: {e}")
             try:
@@ -2431,13 +2440,52 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 이미지 처리 오류. 다시 시도해주세요.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    파일 첨부 처리.
+    - 이미지 파일 (jpg/jpeg/png/webp/gif/bmp) → 이미지 처리 파이프라인
+    - xlsx → 엑셀 이식
+    - 그 외 → 안내 메시지
+    """
     if not is_allowed(update):
         return
     doc = update.message.document
-    if doc and doc.file_name and doc.file_name.endswith(".xlsx"):
+    if not doc:
+        return
+
+    fname = (doc.file_name or "").lower()
+    mime  = (doc.mime_type or "").lower()
+
+    # ── 이미지 파일로 전송된 경우 (파일로 보내기) ──
+    IMAGE_EXTS  = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+    IMAGE_MIMES = ("image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp")
+
+    if any(fname.endswith(e) for e in IMAGE_EXTS) or any(mime.startswith(m) for m in IMAGE_MIMES):
+        # 파일 다운로드 후 이미지 큐에 추가
+        try:
+            file = await context.bot.get_file(doc.file_id)
+            image_bytes = await file.download_as_bytearray()
+            image_bytes = bytes(image_bytes)
+            if image_queue is None:
+                await update.message.reply_text("❌ 이미지 큐 초기화 중입니다. 잠시 후 다시 시도해주세요.")
+                return
+            await image_queue.put((update, context, image_bytes))
+            logger.info(f"파일 이미지 큐 추가: {fname} ({len(image_bytes):,}bytes)")
+        except Exception as e:
+            logger.error(f"파일 이미지 처리 오류: {e}")
+            await update.message.reply_text(f"❌ 파일 처리 오류: {str(e)[:100]}")
+        return
+
+    # ── 엑셀 이식 ──
+    if fname.endswith(".xlsx"):
         await handle_excel_import(update, context)
-    else:
-        await update.message.reply_text("⚠️ xlsx 파일만 이식 가능합니다.")
+        return
+
+    # ── 그 외 ──
+    await update.message.reply_text(
+        "⚠️ 지원하지 않는 파일 형식입니다.\n"
+        "이미지: jpg·png·webp 파일 또는 사진으로 전송\n"
+        "엑셀: xlsx 파일"
+    )
 
 
 async def _process_single_command(update, context, text: str) -> str | None:
