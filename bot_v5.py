@@ -193,7 +193,7 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
     b64 = base64.standard_b64encode(image_bytes).decode()
 
     def _sync_call():
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0)
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
         msg = client.messages.create(
             model=OCR_MODEL,
             max_tokens=max_tokens,
@@ -209,6 +209,29 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
 
     # 동기 API를 별도 스레드에서 실행 → asyncio 이벤트 루프 블로킹 방지
     return await asyncio.to_thread(_sync_call)
+
+
+def resize_image_if_needed(image_bytes: bytes, max_size_kb: int = 1500) -> bytes:
+    """이미지가 너무 크면 리사이즈. Pillow 없으면 원본 반환."""
+    try:
+        from PIL import Image
+        import io
+        size_kb = len(image_bytes) / 1024
+        if size_kb <= max_size_kb:
+            return image_bytes
+        img = Image.open(io.BytesIO(image_bytes))
+        # 비율 유지하며 축소
+        ratio = (max_size_kb * 1024 / len(image_bytes)) ** 0.5
+        new_w = int(img.width * ratio)
+        new_h = int(img.height * ratio)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        result = buf.getvalue()
+        logger.info(f"이미지 리사이즈: {size_kb:.0f}KB → {len(result)/1024:.0f}KB")
+        return result
+    except Exception:
+        return image_bytes  # Pillow 없거나 오류 시 원본 반환
 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
@@ -426,11 +449,22 @@ async def ocr_payment_history(image_bytes: bytes) -> list:
         "날짜를 확인할 수 없으면 null로 표기. 절대 오늘 날짜로 추정하지 말 것.\n"
         "JSON 배열만 반환. 설명 금지."
     )
-    raw = await claude_vision(image_bytes, prompt, max_tokens=800)
+    raw = await claude_vision(image_bytes, prompt, max_tokens=2000)
     try:
-        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```")
+        raw = raw.strip()
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*", "", raw)
+        raw = raw.strip()
+        arr_start = raw.find("[")
+        arr_end = raw.rfind("]")
+        if arr_start >= 0 and arr_end > arr_start:
+            raw = raw[arr_start:arr_end+1]
         result = json.loads(raw)
         return result if isinstance(result, list) else []
+    except Exception as e:
+        logger.error(f"결제내역 JSON 파싱 실패: {e} / raw: {raw[:200]}")
+        return []
+    # 구버전 호환
     except Exception:
         logger.error(f"결제내역 JSON 파싱 실패: {raw}")
         return []
@@ -860,6 +894,8 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
         image_bytes = await file.download_as_bytearray()
         image_bytes = bytes(image_bytes)
 
+    # 큰 이미지 리사이즈 (OCR 정확도 유지하면서 API 부하 감소)
+    image_bytes = resize_image_if_needed(image_bytes, max_size_kb=1500)
     image_type = await classify_image(image_bytes)
     logger.info(f"이미지 분류: {image_type}")
 
@@ -904,9 +940,13 @@ async def process_image_queue_worker():
         try:
             await process_single_image(update, context, image_bytes=image_bytes)
         except Exception as e:
-            logger.error(f"이미지 처리 오류: {e}")
+            logger.error(f"이미지 처리 오류: {type(e).__name__}: {e}", exc_info=True)
             try:
-                await update.message.reply_text("❌ 처리 오류. 다시 올려주세요.")
+                err_msg = str(e)[:80] if str(e) else type(e).__name__
+                await update.message.reply_text(
+                    f"❌ 처리 오류: {err_msg}\n"
+                    f"잠시 후 다시 올려주세요."
+                )
             except Exception:
                 pass
         finally:
