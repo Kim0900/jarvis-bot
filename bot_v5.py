@@ -213,27 +213,26 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
 async def classify_image(image_bytes: bytes) -> str:
     prompt = (
         "이 이미지가 아래 중 어느 종류인지 판단해서 해당 단어 하나만 답해줘.\n\n"
+        "【결제】← 최우선 확인\n"
+        "  카카오T 결제내역/수익관리 화면. 아래 중 하나라도 있으면 반드시 '결제':\n"
+        "  · 날짜+시각(YYYY-MM-DD HH:MM) 옆에 금액이 반복 나열된 목록\n"
+        "  · 'KB카드', '신한카드', '현대카드', 'BC카드', '카카오T포인트' 등 카드사명\n"
+        "  · '승인정상', '1승인', '거래일자' 텍스트\n"
+        "  · 세로로 5건 이상 금액 목록이 나열된 카카오T 앱 화면\n\n"
         "【충전】\n"
-        "  전기차 충전 앱 이용내역. 아래 특징 중 하나라도 있으면 반드시 '충전':\n"
-        "  · '충전완료' 또는 '충전량' 텍스트\n"
-        "  · kWh 단위\n"
-        "  · '충전소' 항목\n"
-        "  · '전기차 충전' 탭\n\n"
-        "【결제】\n"
-        "  카카오T 수익관리/결제내역 화면. 아래 특징이 있으면 '결제':\n"
-        "  · '거래일자' 컬럼 (YYYY-MM-DD HH:MM:SS 형식)\n"
-        "  · '카드사' 컬럼 (KB카드, 신한카드 등)\n"
-        "  · '1승인 정상' 텍스트\n\n"
+        "  전기차 충전 앱 이용내역. 아래 중 하나라도 있으면 '충전':\n"
+        "  · 'kWh', '충전량', '충전완료', '충전소' 텍스트\n"
+        "  · '전기차 충전' 탭 UI\n\n"
         "【콜카드】\n"
-        "  카카오T 택시 운행기록. '배차', '승차', '하차', 출발지·도착지 주소 있음.\n\n"
+        "  카카오T 택시 운행기록 1건. '배차', '승차', '하차' + 출발지·도착지 주소.\n\n"
         "【세큐티】\n"
-        "  세큐티 등급·점수 리포트.\n\n"
-        "【기타】\n"
-        "  위 4가지에 해당 없음.\n\n"
-        "⚠️ 주의: '결제 금액'이라는 텍스트만으로 '결제'로 판단하지 말 것.\n"
-        "   충전 앱에도 '결제 금액' 항목이 있음.\n"
-        "   kWh·충전량·충전소가 보이면 무조건 '충전'으로 답할 것.\n\n"
-        "반드시 콜카드·충전·결제·세큐티·기타 중 하나만 답해. 다른 말 금지."
+        "  세큐티 등급·점수 리포트. 종합점수, 수락률 등 항목.\n\n"
+        "【기타】위 4가지 해당 없음.\n\n"
+        "⚠️ 핵심 구분:\n"
+        "  충전: kWh 단위 있음\n"
+        "  결제: 카드사명 + 날짜+금액 목록\n"
+        "  콜카드: 운행 1건(배차·승차·하차)\n\n"
+        "반드시 결제·충전·콜카드·세큐티·기타 중 하나만 답해. 다른 말 금지."
     )
     result = await claude_vision(image_bytes, prompt, max_tokens=15)
     for keyword in ["콜카드", "충전", "결제", "세큐티"]:
@@ -870,9 +869,25 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
     elif image_type == "세큐티":
         await process_sekuti(update, image_bytes)
     else:
-        await update.message.reply_text(
-            "❓ 인식할 수 없는 이미지입니다.\n콜카드·충전내역·결제내역을 올려주세요."
-        )
+        # 분류 실패 → 결제내역으로 재시도 (결제내역이 가장 자주 오인식됨)
+        logger.info("분류 실패 → 결제내역 fallback 시도")
+        await update.message.reply_text("🔄 이미지 재분석 중...")
+        try:
+            receipts_raw = await ocr_payment_history(image_bytes)
+            if receipts_raw and len(receipts_raw) > 0:
+                await process_payment_history(update, image_bytes)
+            else:
+                await update.message.reply_text(
+                    "❓ 이미지 인식 실패\n"
+                    "💡 더 크게 캡처하거나 밝은 환경에서 다시 올려주세요.\n"
+                    "콜카드·충전내역·결제내역·세큐티만 처리 가능합니다."
+                )
+        except Exception as e:
+            logger.error(f"fallback OCR 오류: {e}")
+            await update.message.reply_text(
+                "❓ 이미지 인식 실패\n"
+                "💡 더 크게 캡처해서 다시 올려주세요."
+            )
 
 async def process_image_queue_worker():
     while True:
