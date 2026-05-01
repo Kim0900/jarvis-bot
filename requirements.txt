@@ -1,5 +1,7 @@
-python-telegram-bot>=20.0
-httpx
+python-telegram-bot==20.7
 anthropic
+httpx
 python-dotenv
 openpyxl
+supabase
+Pillow
