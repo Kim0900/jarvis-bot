@@ -3,6 +3,7 @@
 # 작성일: 2026-03-30
 
 import os
+import re
 import json
 import time
 import asyncio
