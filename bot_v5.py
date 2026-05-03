@@ -189,8 +189,37 @@ image_queue: asyncio.Queue = None  # main()에서 초기화
 # Claude API — 이미지 분류 + OCR
 # ──────────────────────────────────────────────
 async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) -> str:
-    """Claude API 비동기 호출 (asyncio.to_thread로 블로킹 방지)"""
-    b64 = base64.standard_b64encode(image_bytes).decode()
+    """Claude API 비동기 호출. 모든 이미지 포맷을 JPEG로 정규화 후 전송."""
+
+    def _prepare_image(raw: bytes) -> tuple[bytes, str]:
+        """이미지를 JPEG로 변환 + 최대 높이 3000px 리사이즈"""
+        try:
+            from PIL import Image as _Image
+            import io as _io
+            img = _Image.open(_io.BytesIO(raw))
+            # RGB 변환
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            # 최대 높이 3000px (세로 긴 이미지 처리)
+            MAX_H = 3000
+            if img.height > MAX_H:
+                ratio = MAX_H / img.height
+                img = img.resize((int(img.width * ratio), MAX_H), _Image.LANCZOS)
+                logger.info(f"이미지 높이 축소: {img.height}→{MAX_H}px")
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+        except Exception as e:
+            logger.warning(f"이미지 변환 실패({e}) → 원본 사용")
+            # 포맷 감지
+            if raw[:4] == b"RIFF" or raw[:4] == b"WEBP":
+                return raw, "image/webp"
+            elif raw[:8] == b"\x89PNG\r\n\x1a\n":
+                return raw, "image/png"
+            return raw, "image/jpeg"
+
+    img_data, media_type = _prepare_image(image_bytes)
+    b64 = base64.standard_b64encode(img_data).decode()
 
     def _sync_call():
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
@@ -200,14 +229,13 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
                     {"type": "text", "text": prompt},
                 ],
             }],
         )
         return msg.content[0].text.strip()
 
-    # 동기 API를 별도 스레드에서 실행 → asyncio 이벤트 루프 블로킹 방지
     return await asyncio.to_thread(_sync_call)
 
 
@@ -226,11 +254,14 @@ def resize_image_if_needed(image_bytes: bytes) -> bytes:
         orig_w, orig_h = img.width, img.height
         orig_kb = len(image_bytes) / 1024
 
-        # 최대 너비 1000px 초과 시 축소
+        # 최대 너비 1000px 또는 최대 높이 3000px 초과 시 축소
         MAX_WIDTH = 1000
-        if orig_w > MAX_WIDTH:
-            ratio = MAX_WIDTH / orig_w
-            new_w = MAX_WIDTH
+        MAX_HEIGHT = 3000
+        ratio_w = MAX_WIDTH / orig_w if orig_w > MAX_WIDTH else 1.0
+        ratio_h = MAX_HEIGHT / orig_h if orig_h > MAX_HEIGHT else 1.0
+        ratio = min(ratio_w, ratio_h)
+        if ratio < 1.0:
+            new_w = int(orig_w * ratio)
             new_h = int(orig_h * ratio)
             img = img.resize((new_w, new_h), Image.LANCZOS)
         
