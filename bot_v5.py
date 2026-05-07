@@ -304,6 +304,13 @@ async def classify_image(image_bytes: bytes) -> str:
         "  · '전기차 충전' 탭 UI\n\n"
         "【콜카드】\n"
         "  카카오T 택시 운행기록 1건. '배차', '승차', '하차' + 출발지·도착지 주소.\n\n"
+        "【일별운행이력】← 콜카드보다 먼저 확인\n"
+        "  카카오T '일별 운행 이력' 화면. 아래 특징이 있으면 반드시 '일별운행이력':\n"
+        "  · 상단에 'YYYY년 M월 D일(요일) N건' 형식\n"
+        "  · 여러 건의 운행이 세로로 나열\n"
+        "  · 각 건마다 'HH:MM - HH:MM [실시간]' 시간 범위\n"
+        "  · '직접결제' 텍스트 포함 가능\n"
+        "  · '실시간 운행 N건 / N원' 요약\n\n"
         "【세큐티】\n"
         "  세큐티 등급·점수 리포트. 종합점수, 수락률 등 항목.\n\n"
         "【기타】위 4가지 해당 없음.\n\n"
@@ -314,7 +321,7 @@ async def classify_image(image_bytes: bytes) -> str:
         "반드시 결제·충전·콜카드·세큐티·기타 중 하나만 답해. 다른 말 금지."
     )
     result = await claude_vision(image_bytes, prompt, max_tokens=15)
-    for keyword in ["콜카드", "충전", "결제", "세큐티"]:
+    for keyword in ["일별운행이력", "콜카드", "충전", "결제", "세큐티"]:
         if keyword in result:
             return keyword
     return "기타"
@@ -323,6 +330,139 @@ async def classify_image(image_bytes: bytes) -> str:
 # ══════════════════════════════════════════════
 # 세큐티 OCR + 저장 + 조회
 # ══════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════
+# 일별 운행이력 OCR + 저장
+# ══════════════════════════════════════════════
+
+async def ocr_daily_history(image_bytes: bytes) -> dict | None:
+    """
+    카카오T '일별 운행 이력' 화면 OCR.
+    반환: {날짜: "YYYY-MM-DD", 콜목록: [{배차시각, 하차시각, 출발지, 도착지, 요금, 결제방식}, ...]}
+    """
+    prompt = (
+        "이 카카오T '일별 운행 이력' 화면에서 정보를 추출해서 JSON만 반환해줘.\n"
+        '{"날짜":"YYYY-MM-DD","콜목록":['
+        '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동",'
+        '"도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
+        "⚠️ 날짜: 상단 'YYYY년 M월 D일' → YYYY-MM-DD 변환\n"
+        "⚠️ 배차시각: 각 콜의 앞 시각 (예: 02:58 - 03:11 에서 02:58)\n"
+        "⚠️ 하차시각: 각 콜의 뒤 시각 (예: 02:58 - 03:11 에서 03:11)\n"
+        "⚠️ 결제방식: '직접결제' 텍스트 있으면 '직접', 없으면 '자동'\n"
+        "⚠️ 요금: 파란색 숫자. 직접결제는 표시된 요금 그대로 추출\n"
+        "⚠️ 출발지/도착지: '대구 OO구 OO동' 형식. 구/동만 추출\n"
+        "JSON만 반환. 설명·마크다운 금지."
+    )
+    try:
+        raw = await claude_vision(image_bytes, prompt, max_tokens=2000)
+        raw = raw.strip()
+        import re as _re
+        raw = _re.sub(r"```json\s*", "", raw)
+        raw = _re.sub(r"```\s*", "", raw)
+        raw = raw.strip()
+        import json as _json
+        return _json.loads(raw)
+    except Exception as e:
+        logger.error(f"일별운행이력 OCR 오류: {e}")
+        return None
+
+
+async def process_daily_history(update, image_bytes: bytes):
+    """
+    일별 운행이력 이미지 처리:
+    OCR → 날짜 보정 → raw_calls 저장 → 결과 안내
+    """
+    from datetime import date as _dc, timedelta as _td
+
+    await update.message.reply_text("📋 일별 운행이력 분석 중...")
+
+    data = await ocr_daily_history(image_bytes)
+    if not data or not data.get("콜목록"):
+        await update.message.reply_text(
+            "❌ 일별 운행이력 인식 실패\n"
+            "💡 화면을 더 크게 캡처해서 다시 올려주세요."
+        )
+        return
+
+    # 화면 날짜 파싱
+    screen_date_str = data.get("날짜", "")
+    try:
+        screen_date = _dc.fromisoformat(screen_date_str)
+    except Exception:
+        screen_date = today_kst()
+        logger.warning(f"날짜 파싱 실패: {screen_date_str} → 오늘 사용")
+
+    DOW_MAP = ["월","화","수","목","금","토","일"]
+    saved = 0
+    updated = 0
+    dates_used = set()
+    result_lines = []
+
+    for call in data.get("콜목록", []):
+        배차 = call.get("배차시각", "")
+        하차 = call.get("하차시각", "")
+        출발 = call.get("출발지", "")
+        도착 = call.get("도착지", "")
+        요금 = call.get("요금", 0) or 0
+        결제방식 = call.get("결제방식", "자동")
+
+        # 날짜 보정: 배차 06시 이전 → 화면날짜 +1일 (새벽 운행)
+        try:
+            h = int(배차.split(":")[0])
+            save_date = screen_date + _td(days=1) if h < 6 else screen_date
+        except Exception:
+            save_date = screen_date
+
+        save_date_str = str(save_date)
+        dow = DOW_MAP[save_date.weekday()]
+        dates_used.add(save_date_str)
+
+        # 중복 삭제 후 재저장
+        deleted = await delete_duplicate_call(save_date_str, 배차, 요금)
+        if deleted:
+            updated += deleted
+
+        비고 = "직접결제(요금미확인)" if 결제방식 == "직접" else None
+
+        payload = {
+            "날짜":     save_date_str,
+            "요일":     dow,
+            "배차시각": 배차,
+            "하차시각": 하차,
+            "출발지":   출발,
+            "도착지":   도착,
+            "요금":     요금,
+            "콜유형":   "카카오T",
+            "비고":     비고,
+        }
+        result = await sb_insert("raw_calls", payload)
+        if result:
+            saved += 1
+            직접표시 = " [직접결제]" if 결제방식 == "직접" else ""
+            result_lines.append(
+                f"  {배차}~{하차} {출발}→{도착} {fmt(요금)}{직접표시}"
+            )
+
+    # 결과 메시지
+    dates_sorted = sorted(dates_used)
+    msg = [
+        f"✅ 일별 운행이력 저장 완료",
+        f"화면날짜: {screen_date_str} | 저장: {saved}건",
+        f"날짜 분포: {', '.join(dates_sorted)}",
+        "",
+    ]
+    msg.extend(result_lines[:10])  # 최대 10건 표시
+    if len(result_lines) > 10:
+        msg.append(f"  ... 외 {len(result_lines)-10}건")
+
+    msg.append("")
+    msg.append("💡 교차대조:")
+    for d in dates_sorted:
+        msg.append(f"  대조 {d}")
+
+    await update.message.reply_text("\n".join(msg))
+
 
 async def ocr_sekuti(image_bytes: bytes) -> dict | None:
     """세큐티 리포트 이미지 OCR → 점수·등급 추출"""
@@ -923,7 +1063,8 @@ async def process_payment_history(update: Update, image_bytes: bytes):
         # 중복 체크 → 자동 삭제 후 재저장
         deleted = await delete_duplicate_payment(날짜, 시각, 요금)
         if deleted:
-            logger.info(f"중복 결제내역 자동 삭제: {날짜} {시각} {요금}")
+            duplicated += deleted  # 실제 삭제 건수 반영
+            logger.info(f"중복 결제내역 자동 삭제 {deleted}건: {날짜} {시각} {요금}")
         payload = {
             "날짜": 날짜,
             "시각": 시각,
@@ -961,7 +1102,9 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
     image_type = await classify_image(image_bytes)
     logger.info(f"이미지 분류: {image_type}")
 
-    if image_type == "콜카드":
+    if image_type == "일별운행이력":
+        await process_daily_history(update, image_bytes)
+    elif image_type == "콜카드":
         await process_call_card(update, image_bytes)
     elif image_type == "충전":
         await process_charge_receipt(update, image_bytes)
@@ -2761,6 +2904,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_date_query(update, text)
         return
 
+    # 어군 브리핑 텍스트 명령
+    if text in ("어군", "어군조회", "어군 조회"):
+        report = get_fish_report()
+        if not report:
+            now = datetime.now(KST)
+            await update.message.reply_text(
+                f"🐟 현재 {now.hour}시는 브리핑 시간대가 아닙니다.\n"
+                f"운영시간: 19~21시 / 21~24시 / 00~02시"
+            )
+        else:
+            await update.message.reply_text(report)
+        return
+
     # 세큐티 조회
     if text in ("세큐티 조회", "세큐티조회"):
         await handle_sekuti_query(update)
@@ -2889,7 +3045,7 @@ def main():
 
     async def post_init(application):
         global image_queue
-        image_queue = asyncio.Queue()
+        image_queue = asyncio.Queue(maxsize=10)  # 최대 10개 대기
         asyncio.create_task(process_image_queue_worker())
         # 기존 webhook 제거 + 이전 인스턴스 세션 정리 — Conflict 방지
         await asyncio.sleep(2)  # 구 인스턴스 세션 해제 대기
