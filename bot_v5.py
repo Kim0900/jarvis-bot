@@ -464,6 +464,86 @@ async def process_daily_history(update, image_bytes: bytes):
     await update.message.reply_text("\n".join(msg))
 
 
+
+# ══════════════════════════════════════════════
+# 운행 일관성 모니터링 (Step E)
+# ══════════════════════════════════════════════
+
+async def save_operation_consistency(날짜: str, 시작시각: str, 종료시각: str,
+                                     총건수: int, 총매출: int):
+    """운행 일관성 데이터 저장 및 점수 산출"""
+    try:
+        h_start = int(시작시각.split(":")[0])
+        m_start = int(시작시각.split(":")[1])
+        # 목표 19:00 기준 격차 (분)
+        격차 = (h_start * 60 + m_start) - (19 * 60)
+        격차_abs = abs(격차)
+
+        # 일관성 점수 (100점 기준)
+        # 시작 시각 ±15분 = 100, ±30분 = 80, ±60분 = 60, 초과 = 40
+        if 격차_abs <= 15: start_score = 100
+        elif 격차_abs <= 30: start_score = 80
+        elif 격차_abs <= 60: start_score = 60
+        else: start_score = 40
+
+        일관성점수 = start_score
+
+        payload = {
+            "날짜":         날짜,
+            "시작시각":     시작시각,
+            "종료시각":     종료시각,
+            "시작격차_분":  격차,
+            "일관성점수":   일관성점수,
+            "총건수":       총건수,
+            "총매출":       총매출,
+        }
+        await sb_upsert("operation_consistency", payload, on_conflict="날짜")
+        return 일관성점수
+    except Exception as e:
+        logger.error(f"일관성 저장 오류: {e}")
+        return None
+
+
+async def report_operation_consistency(update, 날짜: str = None):
+    """운행 일관성 보고 — 오늘 + 최근 7일 평균"""
+    try:
+        target = 날짜 or str(today_kst())
+        rows = await sb_select("operation_consistency",
+                               {"order": "날짜.desc", "limit": "7"})
+        if not rows:
+            await update.message.reply_text("📊 운행 일관성 데이터 없음")
+            return
+
+        today_row = next((r for r in rows if r.get("날짜") == target), rows[0])
+        시작 = today_row.get("시작시각", "?")
+        종료 = today_row.get("종료시각", "?")
+        격차 = today_row.get("시작격차_분", 0)
+        점수 = today_row.get("일관성점수", 0)
+        건수 = today_row.get("총건수", 0)
+        매출 = today_row.get("총매출", 0)
+
+        # 7일 평균
+        starts = [r.get("시작격차_분", 0) for r in rows if r.get("시작격차_분") is not None]
+        avg_격차 = sum(starts) / len(starts) if starts else 0
+
+        # 점수 별
+        stars = "⭐" * (점수 // 25 + 1) if 점수 else "?"
+
+        lines = [
+            f"📊 운행 일관성 — {target}",
+            f"시작: {시작} (목표 19:00, 격차 {'+' if 격차>=0 else ''}{격차}분)",
+            f"종료: {종료}",
+            f"건수: {건수}건 | 매출: {매출:,}원" if 매출 else f"건수: {건수}건",
+            f"",
+            f"일관성 점수: {점수}/100 {stars}",
+            f"7일 시작 평균 격차: {avg_격차:+.0f}분",
+            f"★ 알고리즘 학습 신호: {'강함' if 점수 >= 80 else '보통' if 점수 >= 60 else '약함'}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"일관성 조회 오류: {e}")
+        await update.message.reply_text("❌ 일관성 조회 오류")
+
 async def ocr_sekuti(image_bytes: bytes) -> dict | None:
     """세큐티 리포트 이미지 OCR → 점수·등급 추출"""
     prompt = (
@@ -1306,9 +1386,27 @@ async def handle_rest_day(update: Update, text: str = "휴무"):
 async def handle_today_quick(update: Update):
     s = await today_summary()
     달성바 = "█" * (s["달성률"] // 10) + "░" * (10 - s["달성률"] // 10)
+    # 신사고 체계: 건수를 요일 분포 맥락으로 표현
+    from datetime import date as _date2
+    dow_kor = ["월","화","수","목","금","토","일"][_date2.today().weekday()]
+    DOW_EXPECTED = {
+        "월":(7,12),"화":(8,13),"수":(9,14),"목":(8,12),
+        "금":(10,15),"토":(11,16),"일":(10,15)
+    }
+    exp_min, exp_max = DOW_EXPECTED.get(dow_kor, (8,13))
+    건수 = s["건수"]
+    if 건수 == 0:
+        건수_평가 = ""
+    elif 건수 < exp_min:
+        건수_평가 = f" (기대 {exp_min}~{exp_max}건 하위)"
+    elif 건수 > exp_max:
+        건수_평가 = f" (기대 {exp_min}~{exp_max}건 상위)"
+    else:
+        건수_평가 = f" (기대 {exp_min}~{exp_max}건 정상)"
+
     await update.message.reply_text(
         f"📍 오늘 현황 ({now_kst().strftime('%m/%d %H:%M')})\n"
-        f"콜 {s['건수']}건 | 매출 {fmt(s['매출'])}\n"
+        f"콜 {건수}건{건수_평가} | 매출 {fmt(s['매출'])}\n"
         f"지출 {fmt(s['지출'])} | 순수익 {fmt(s['순수익'])}\n"
         f"목표 [{달성바}] {s['달성률']}%"
     )
@@ -2442,8 +2540,18 @@ def get_fish_slot(hour: int) -> str | None:
     if 0 <= hour < 2:   return "00~02"
     return None
 
+# 태그 이모지 매핑 (v2.2)
+FISH_TAG_EMOJI = {
+    "golden_time":    "⭐",
+    "long_distance":  "🚀",
+    "foreign_worker": "🌏",
+    "blue_ocean":     "🌊",
+    "avoid":          "⛔",
+    "oversupply":     "⛔",
+}
+
 def get_fish_report(custom_hour: int = None) -> str | None:
-    """어군 브리핑 텍스트 생성. custom_hour로 특정 시간대 조회 가능."""
+    """어군 브리핑. FISH_DATA 하드코딩 기반 (Supabase는 get_fish_report_db로 분리)."""
     now  = datetime.now(KST)
     hour = custom_hour if custom_hour is not None else now.hour
     day  = DOW_KOR[now.weekday()]
@@ -2452,7 +2560,7 @@ def get_fish_report(custom_hour: int = None) -> str | None:
         return None
     zones = FISH_DATA.get(day, {}).get(slot, [])
     if not zones:
-        return f"🐟 {day}요일 {slot} 어군 데이터 없음\n마기에게 데이터 업데이트 요청하세요."
+        return f"🐟 {day}요일 {slot} 어군 데이터 없음"
     lines = [f"🐟 어군브리핑 — {day}요일 {slot}"]
     for idx, z in enumerate(zones, 1):
         grade_icon = {"S": "🔴", "A": "🟠", "B": "🟡", "C": "⚪"}.get(z[3], "⚪")
@@ -2461,6 +2569,89 @@ def get_fish_report(custom_hour: int = None) -> str | None:
         lines.append(f"  📍 {z[4]}")
         lines.append(f"  💡 {z[5]}")
     return "\n".join(lines)
+
+
+async def get_fish_report_db(hour: int = None, tag_filter: str = None) -> str:
+    """
+    Supabase fish_finder 테이블 기반 어군 브리핑 (v2.2).
+    verified='avoid' 회피 구역 포함, pattern_tag 필터 지원.
+    Supabase 조회 실패 시 FISH_DATA 하드코딩으로 fallback.
+    """
+    now  = datetime.now(KST)
+    h    = hour if hour is not None else now.hour
+    day  = DOW_KOR[now.weekday()]
+    slot = get_fish_slot(h)
+
+    # 시간대 → DB time_band 변환
+    SLOT_MAP = {"19~21": "19-21", "21~24": "21-24", "00~02": "00-02"}
+    time_band = SLOT_MAP.get(slot, "") if slot else ""
+
+    try:
+        if not time_band:
+            return f"🐟 현재 {h}시는 브리핑 시간대가 아닙니다.\n운영시간: 19~21시 / 21~24시 / 00~02시"
+
+        # 핫존 조회 (회피 제외)
+        params = {"time_band": f"eq.{time_band}", "verified": "neq.avoid", "order": "rank_overall.asc", "limit": "5"}
+        if tag_filter:
+            params["pattern_tag"] = f"eq.{tag_filter}"
+        rows = await sb_select("fish_finder", params)
+
+        # 회피 구역 조회
+        avoid_params = {"time_band": f"eq.{time_band}", "verified": "eq.avoid"}
+        avoid_rows = await sb_select("fish_finder", avoid_params)
+
+        if not rows:
+            # Supabase 데이터 없으면 하드코딩 fallback
+            return get_fish_report(h) or f"🐟 {day}요일 {slot} 데이터 없음"
+
+        tag_filter_label = f" [{FISH_TAG_EMOJI.get(tag_filter,'')}{tag_filter}]" if tag_filter else ""
+        lines = [f"🐟 어군브리핑 — {day}요일 {slot}{tag_filter_label}"]
+        lines.append("─" * 20)
+
+        for idx, r in enumerate(rows[:5], 1):
+            tag        = r.get("pattern_tag", "") or ""
+            tag_emoji  = FISH_TAG_EMOJI.get(tag, "")
+            ver        = r.get("verified", "") or ""
+            ver_emoji  = "⭐" if ver == "best" else ""
+            note       = r.get("note", "") or ""
+            avg_fare   = r.get("avg_fare", 0) or 0
+            call_cnt   = r.get("call_count", 0) or 0
+            zone       = r.get("zone", "")
+            # v2.3 확률 데이터
+            sample     = r.get("sample_size")
+            stddev     = r.get("fare_stddev")
+            q1         = r.get("fare_q1")
+            q3         = r.get("fare_q3")
+            conf       = r.get("confidence_level") or ""
+            conf_stars = {"낮음":"⭐","중간":"⭐⭐","높음":"⭐⭐⭐","매우높음":"⭐⭐⭐⭐"}.get(conf, "")
+
+            line = f"  {idx}. {zone} {tag_emoji}{ver_emoji}\n"
+            if sample and sample >= 5 and q1 and q3:
+                # 확률 모델 데이터 있음 → v2.3 포맷
+                line += f"     단가 {avg_fare:,}원 (IQR {q1:,}~{q3:,})"
+                if stddev:
+                    line += f" ±{stddev:,}"
+                line += f"\n     신뢰도: {conf} {conf_stars} (n={sample})"
+            else:
+                # 데이터 부족 → 기본 포맷
+                line += f"     {call_cnt}건 / {avg_fare:,}원"
+            if note:
+                line += f"\n     💡 {note}"
+            lines.append(line)
+
+        if avoid_rows:
+            lines.append("")
+            lines.append("⛔ 회피 구역")
+            for r in avoid_rows:
+                zone = r.get("zone", "")
+                note = r.get("note", "") or ""
+                lines.append(f"  ✗ {zone}" + (f" — {note}" if note else ""))
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"fish_finder DB 조회 오류: {e}")
+        return get_fish_report(h) or f"🐟 데이터 조회 실패"
 
 def fish_scheduler(app):
     """18:50 영업준비 브리핑 + 19~02시 매 정각 자동 브리핑"""
@@ -2617,18 +2808,54 @@ def is_allowed(update: Update) -> bool:
 
 
 async def cmd_fish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """현재 시간대 어군 브리핑 수동 조회"""
+    """
+    어군 브리핑. /fish [시간] [태그]
+    예: /fish       → 현재 시간
+        /fish 19    → 19시 기준
+        /fish 21 foreign → 21시 외국인 패턴 필터
+    """
     if not is_allowed(update):
         return
-    report = get_fish_report()
-    if not report:
-        now = datetime.now(KST)
-        await update.message.reply_text(
-            f"🐟 현재 {now.hour}시는 브리핑 시간대가 아닙니다.\n"
-            f"운영시간: 19~21시 / 21~24시 / 00~02시"
-        )
-        return
+
+    args = context.args or []
+    hour = None
+    tag_filter = None
+
+    for arg in args:
+        if arg.isdigit():
+            hour = int(arg)
+        elif arg in ("foreign", "foreign_worker"):
+            tag_filter = "foreign_worker"
+        elif arg in ("long", "long_distance"):
+            tag_filter = "long_distance"
+        elif arg in ("golden", "golden_time"):
+            tag_filter = "golden_time"
+        elif arg in ("blue", "blue_ocean"):
+            tag_filter = "blue_ocean"
+
+    report = await get_fish_report_db(hour=hour, tag_filter=tag_filter)
     await update.message.reply_text(report)
+
+
+async def cmd_avoid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """회피 구역 조회 /avoid"""
+    if not is_allowed(update):
+        return
+    try:
+        rows = await sb_select("fish_finder", {"verified": "eq.avoid", "order": "time_band.asc"})
+        if not rows:
+            await update.message.reply_text("⛔ 등록된 회피 구역 없음\n(Supabase fish_finder 테이블 확인 필요)")
+            return
+        lines = ["⛔ 회피 구역 전체 목록\n"]
+        for r in rows:
+            zone = r.get("zone","")
+            band = r.get("time_band","")
+            note = r.get("note","") or ""
+            lines.append(f"  ✗ {zone} ({band})" + (f"\n    {note}" if note else ""))
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.error(f"회피구역 조회 오류: {e}")
+        await update.message.reply_text("❌ 조회 오류")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -2904,6 +3131,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_date_query(update, text)
         return
 
+    # 운행 일관성 조회
+    if text in ("일관성", "일관성 조회", "운행일관성"):
+        await report_operation_consistency(update)
+        return
+
     # 어군 브리핑 텍스트 명령
     if text in ("어군", "어군조회", "어군 조회"):
         report = get_fish_report()
@@ -3061,6 +3293,7 @@ def main():
     # 핸들러 등록
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("fish", cmd_fish))    # 어군 브리핑 수동 조회
+    app.add_handler(CommandHandler("avoid", cmd_avoid))  # 회피 구역 조회
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
