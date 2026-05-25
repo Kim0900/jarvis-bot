@@ -12,9 +12,9 @@ from datetime import datetime, timedelta, date, timezone
 app = Flask(__name__)
 
 # Supabase 및 Claude API 키는 환경 변수에서 로드
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY")
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
+CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY')
 
 KST = timezone(timedelta(hours=9))
 
@@ -52,15 +52,15 @@ def get_fish_report(hour: int) -> dict:
     if demand_data:
         # 가장 높은 콜 수 또는 평균 요금을 가진 지역 선택 (여기서는 첫 번째)
         data = demand_data[0]
-        top_location = data.get("zone", "미확인")
-        analysis_summary = data.get("note", "미확인")
+        top_location = data.get('zone', '미확인')
+        analysis_summary = data.get('note', '미확인')
         current_eta_advantage = data.get("eta_advantage", 0) # demand_map에서 직접 조회
 
     # daily_summary에서 official_var_score 조회
     score_data = sb_select("daily_summary", {"date": f"eq.{today.isoformat()}"})
-    if score_data and score_data[0].get("official_var_score"):
+    if score_data and score_data[0].get('official_var_score'):
         # official_var_score는 JSONB 타입이므로, 내부에서 var_6_eta_score를 추출
-        official_var_score = score_data[0]["official_var_score"].get("var_6_eta_score")
+        official_var_score = score_data[0]["official_var_score"].get('var_6_eta_score')
         if official_var_score != "미확인":
             try:
                 official_var_score = int(official_var_score)
@@ -109,7 +109,7 @@ def sb_get_setting(setting_name: str) -> str | None:
     # 현재는 user_id를 하드코딩 (인증 기능 부재)
     settings = sb_select("user_settings", {"setting_name": f"eq.{setting_name}"})
     if settings:
-        return settings[0].get("setting_value")
+        return settings[0].get('setting_value')
     return None
 
 def sb_set_setting(setting_name: str, setting_value: str) -> dict | None:
@@ -337,8 +337,8 @@ async def cross_check_receipts(date_str: str) -> dict:
     direct_updated      = []  # 직접결제 요금 자동업데이트 목록
 
     for i, call in enumerate(calls):
-        배차 = call.get("배차시각") or ""
-        하차 = call.get("하차시각")
+        배차 = call.get('배차시각') or ""
+        하차 = call.get('하차시각')
         if not 하차:
             try:
                 bh, bm = 배차.split(":")
@@ -350,7 +350,7 @@ async def cross_check_receipts(date_str: str) -> dict:
         for j, rcpt in enumerate(receipts):
             if j in matched_receipt_ids: continue
             rcpt_date = rcpt.get("날짜", date_str)
-            r_min = to_min_smart(배차, rcpt.get("시각","") or "", rcpt_date)
+            r_min = to_min_smart(배차, rcpt.get('시각', '') or "", rcpt_date)
             if r_min and c_min:
                 diff = abs(c_min - r_min)
                 if diff <= 20 and diff < best_diff:
@@ -359,12 +359,12 @@ async def cross_check_receipts(date_str: str) -> dict:
         if best_j is not None:
             matched_call_ids.add(i)
             matched_receipt_ids.add(best_j)
-            call_fee = call.get("요금") or 0
-            rcpt_fee = receipts[best_j].get("요금") or 0
+            call_fee = call.get('요금') or 0
+            rcpt_fee = receipts[best_j].get('요금') or 0
 
             # 직접결제(요금=0) 콜카드 → 결제내역 요금으로 자동 업데이트
             if call_fee == 0 and rcpt_fee > 0:
-                call_id = call.get("id")
+                call_id = call.get('id')
                 if call_id:
                     sb_h("PATCH", f"raw_calls?id=eq.{call_id}",
                                json={"요금": rcpt_fee, "비고": "직접결제(요금확인완료)"})
@@ -379,7 +379,7 @@ async def cross_check_receipts(date_str: str) -> dict:
                 FEE_DIFF_THRESHOLD = 500 # bot_v5.py에서 가져옴
                 if fee_diff >= FEE_DIFF_THRESHOLD:
                     fee_mismatches.append({
-                        "call_id": call.get("id"),
+                        "call_id": call.get('id'),
                         "배차시각": 배차,
                         "call_fee": call_fee,
                         "rcpt_fee": rcpt_fee,
@@ -392,8 +392,8 @@ async def cross_check_receipts(date_str: str) -> dict:
     # STEP 2: 콜카드 점유 시간대 계산 → 미매칭 결제내역 분류
     occupied = []
     for call in calls:
-        배차 = call.get("배차시각") or ""
-        하차 = call.get("하차시각") or ""
+        배차 = call.get('배차시각') or ""
+        하차 = call.get('하차시각') or ""
         if not 하차:
             try:
                 bh, bm = 배차.split(":")
@@ -408,8 +408,8 @@ async def cross_check_receipts(date_str: str) -> dict:
     baehoe_rcpt  = []
     missing_rcpt = []
     for r in unmatched_receipts:
-        r_date = r.get("날짜", date_str)
-        r_min  = to_min_abs(r.get("시각","") or "", r_date)
+        r_date = r.get('날짜', date_str)
+        r_min  = to_min_abs(r.get('시각',"") or "", r_date)
         if r_min is None:
             missing_rcpt.append(r)
             continue
@@ -427,27 +427,37 @@ async def cross_check_receipts(date_str: str) -> dict:
     if direct_updated:
         lines_out.append(f"💳 직접결제 요금 자동확인 {len(direct_updated)}건:")
         for d in direct_updated:
-            lines_out.append(f"  ✅ {d["배차시각"]} → {d["요금"]} 업데이트")
+            lines_out.append(f"  ✅ {d['배차시각']} → {d['요금']} 업데이트")
         lines_out.append("")
 
     if unmatched_calls:
         lines_out.append(f"🟠 콜카드에만 있음 {len(unmatched_calls)}건:")
         for c in unmatched_calls:
-            lines_out.append(f"  {c.get("배차시각", "-")} {c.get("출발지", "")}→{c.get("도착지", "")} {c.get("요금") or 0}")
+            배차시각 = c.get('배차시각', '-')
+            출발지 = c.get('출발지', '')
+            도착지 = c.get('도착지', '')
+            요금 = c.get('요금') or 0
+            lines_out.append(f"  {배차시각} {출발지}→{도착지} {요금}")
         lines_out.append("")
 
     if baehoe_rcpt:
         lines_out.append(f"🚶 배회영업 후보 (공백시간) {len(baehoe_rcpt)}건:")
         for r in baehoe_rcpt:
-            날짜표시 = f"({r.get("날짜", "")})" if r.get("날짜") != date_str else ""
-            lines_out.append(f"  {r.get("시각", "-")}{날짜표시} {r.get("요금") or 0}")
+            날짜 = r.get('날짜', '')
+            날짜표시 = f"({날짜})" if 날짜 != date_str else ""
+            시각 = r.get('시각', '-')
+            요금 = r.get('요금') or 0
+            lines_out.append(f"  {시각}{날짜표시} {요금}")
         lines_out.append("")
 
     if missing_rcpt:
         lines_out.append(f"🔴 누락 콜카드 후보 (운행중 시간) {len(missing_rcpt)}건:")
         for r in missing_rcpt:
-            날짜표시 = f"({r.get("날짜", "")})" if r.get("날짜") != date_str else ""
-            lines_out.append(f"  {r.get("시각", "-")}{날짜표시} {r.get("요금") or 0}")
+            날짜 = r.get('날짜', '')
+            날짜표시 = f"({날짜})" if 날짜 != date_str else ""
+            시각 = r.get('시각', '-')
+            요금 = r.get('요금') or 0
+            lines_out.append(f"  {시각}{날짜표시} {요금}")
         lines_out.append("")
 
     # 금액 불일치 표시
@@ -455,8 +465,8 @@ async def cross_check_receipts(date_str: str) -> dict:
         lines_out.append(f"💰 금액 불일치 {len(fee_mismatches)}건 (차이 ≥500원):")
         for fm in fee_mismatches:
             lines_out.append(
-                f"  {fm["배차시각"]} 콜카드:{fm["call_fee"]} vs "
-                f"결제:{fm["rcpt_fee"]} (차이 {fm["diff"]:,}원)"
+                f"  {fm_배차시각} 콜카드:{fm_call_fee} vs "
+                f"결제:{fm_rcpt_fee} (차이 {fm_diff:,}원)"
             )
         lines_out.append("  → \'대조 금액확인 YYYY-MM-DD\' 로 버튼 선택")
         lines_out.append("")
@@ -474,7 +484,7 @@ async def cross_check_receipts(date_str: str) -> dict:
 
     return {"status": "success", "message": "\n".join(lines_out), "baehoe_rcpt": baehoe_rcpt, "unmatched_calls": unmatched_calls}
 
-def process_daily_history(image_bytes): bytes):
+def process_daily_history(image_bytes: bytes):
     """
     일별 운행이력 이미지 처리:
     OCR → 날짜 보정 → raw_calls 저장 → 결과 안내
@@ -482,11 +492,11 @@ def process_daily_history(image_bytes): bytes):
     from datetime import date, timedelta
 
     data = ocr_daily_history(image_bytes)
-    if not data or not data.get("콜목록"):
+    if not data or not data.get('콜목록'):
         return {"status": "error", "message": "일별 운행이력 인식 실패"}
 
     # 화면 날짜 파싱
-    screen_date_str = data.get("날짜", "")
+    screen_date_str = data.get('날짜', '')
     try:
         screen_date = date.fromisoformat(screen_date_str)
     except Exception:
@@ -500,12 +510,12 @@ def process_daily_history(image_bytes): bytes):
     result_lines = []
 
     for call in data.get("콜목록", []):
-        배차 = call.get("배차시각", "")
-        하차 = call.get("하차시각", "")
-        출발 = call.get("출발지", "")
-        도착 = call.get("도착지", "")
+        배차 = call.get('배차시각', '')
+        하차 = call.get('하차시각', '')
+        출발 = call.get('출발지', '')
+        도착 = call.get('도착지', '')
         요금 = call.get("요금", 0) or 0
-        결제방식 = call.get("결제방식", "자동")
+        결제방식 = call.get('결제방식', '자동')
 
         # 날짜 보정: 자정 넘겨도 운행 시작일 귀속
         save_date = screen_date
