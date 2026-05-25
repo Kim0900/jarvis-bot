@@ -1,8 +1,6 @@
-python-telegram-bot==20.7
-anthropicpython-dotenv
-httpx
-python-dotenv
-openpyxl
-Pillow
-Flask
-requests
+Flask==2.3.3
+Pillow==10.0.0
+requests==2.31.0
+httpx==0.24.1
+anthropic==0.7.0
+gunicorn==21.2.0

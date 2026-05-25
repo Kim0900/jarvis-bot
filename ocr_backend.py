@@ -283,7 +283,7 @@ def delete_duplicate_call(date_str: str, 배차시각: str, 요금: int) -> int:
         return len(r)
     return 0
 
-async def cross_check_receipts(date_str: str) -> dict:
+def cross_check_receipts(date_str: str) -> dict:
     """
     콜카드와 결제내역을 교차 대조하여 배회 영업을 식별하고, 결과를 반환합니다.
     매칭: 콜카드 하차시각 ↔ 결제시각 ±20분 (자정넘김 처리)
