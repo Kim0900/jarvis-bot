@@ -71,29 +71,119 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Jarvis v5 OK")
 
     def do_POST(self):
-        """아틀라스 Webhook 수신"""
+        """API 엔드포인트 — OCR / 마기분석 / 아틀라스보고"""
+        import json as _j, re as _re
+        length = int(self.headers.get('Content-Length', 0))
+        raw_body = self.rfile.read(length)
+        try:
+            payload = _j.loads(raw_body.decode('utf-8')) if raw_body else {}
+        except Exception:
+            payload = {}
+
+        def send_json(code, data):
+            body = _j.dumps(data, ensure_ascii=False).encode('utf-8')
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+
+        if self.path == '/ocr_receipt':
+            try:
+                import anthropic as _ant
+                b64 = payload.get('image_b64', '')
+                mt  = payload.get('media_type', 'image/jpeg')
+                client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=400,
+                    messages=[{"role":"user","content":[
+                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                        {"type":"text","text":'이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}\n숫자만(원제외). JSON만 반환.'}
+                    ]}]
+                )
+                txt = _re.sub(r"```[a-z]*", "", msg.content[0].text.strip()).strip()
+                send_json(200, {"success": True, "data": _j.loads(txt)})
+            except Exception as e:
+                logger.error(f"OCR 오류: {e}")
+                send_json(400, {"success": False, "error": str(e)})
+            return
+
+        if self.path == '/ocr_history':
+            try:
+                import anthropic as _ant, re as _re, json as _j
+                b64 = payload.get('image_b64', '')
+                mt  = payload.get('media_type', 'image/jpeg')
+                client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+                # 1단계: 유형 분류
+                cls_msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=20,
+                    messages=[{"role":"user","content":[
+                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                        {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
+                    ]}]
+                )
+                is_daily = '일별' in cls_msg.content[0].text
+
+                if is_daily:
+                    prompt = (
+                        '이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
+                        '{"type":"daily_history","date":"YYYY-MM-DD","calls":['
+                        '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
+                        '날짜: 상단 YYYY년 M월 D일. 결제방식: 직접결제 있으면 직접, 없으면 자동. JSON만 반환.'
+                    )
+                else:
+                    prompt = (
+                        '이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
+                        '{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":['
+                        '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
+                        '날짜: 조회일/거래일. 취소건 제외. 숫자만(원제외). JSON만 반환.'
+                    )
+                ocr_msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=2000,
+                    messages=[{"role":"user","content":[
+                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                        {"type":"text","text":prompt}
+                    ]}]
+                )
+                txt = _re.sub(r"```[a-z]*","",ocr_msg.content[0].text.strip()).strip()
+                data = _j.loads(txt)
+                send_json(200, {"success":True,"data":data})
+            except Exception as e:
+                logger.error(f"OCR history 오류: {e}")
+                send_json(400, {"success":False,"error":str(e)})
+            return
+
+        if self.path == '/magi_analyze':
+            try:
+                import anthropic as _ant
+                client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
+                msg = client.messages.create(
+                    model=payload.get('model','claude-sonnet-4-20250514'),
+                    max_tokens=int(payload.get('max_tokens',1500)),
+                    system=payload.get('system_prompt','당신은 마기입니다.'),
+                    messages=[{"role":"user","content":payload.get('user_message','')}]
+                )
+                send_json(200, {"success": True, "result": msg.content[0].text})
+            except Exception as e:
+                logger.error(f"마기분석 오류: {e}")
+                send_json(400, {"success": False, "error": str(e)})
+            return
+
         if self.path == '/atlas-report':
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length)
-                data = json.loads(body.decode('utf-8'))
                 import threading
                 threading.Thread(
-                    target=lambda: asyncio.run(save_atlas_report(data)),
+                    target=lambda: asyncio.run(save_atlas_report(payload)),
                     daemon=True
                 ).start()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"status":"ok"}')
-                logger.info(f"아틀라스 보고 수신: {data.get('title','?')}")
+                send_json(200, {"status": "ok"})
+                logger.info(f"아틀라스 보고 수신: {payload.get('title','?')}")
             except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(f'{{"error":"{e}"}}'.encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+                send_json(400, {"error": str(e)})
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def log_message(self, *args):
         pass
