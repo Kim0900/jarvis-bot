@@ -108,6 +108,12 @@ class HealthHandler(BaseHTTPRequestHandler):
                 send_json(400, {"success": False, "error": str(e)})
             return
 
+        if self.path == '/gpx_parse':
+            # GPX는 앱(브라우저 DOMParser)에서 직접 파싱 — 봇 불필요
+            # 이 엔드포인트는 예비용(서버사이드 파싱 필요 시 확장)
+            send_json(200, {"status":"ok","message":"GPX는 앱 내 파싱 완료"})
+            return
+
         if self.path == '/ocr_history':
             try:
                 import anthropic as _ant, re as _re, json as _j
