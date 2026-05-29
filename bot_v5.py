@@ -65,8 +65,21 @@ logger = logging.getLogger(__name__)
 # Health Check 서버
 # ──────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
+    def _cors_headers(self):
+        """모든 응답에 CORS 허용 헤더 추가"""
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey')
+
+    def do_OPTIONS(self):
+        """CORS preflight 요청 처리"""
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(b"Jarvis v5 OK")
 
@@ -85,6 +98,8 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey')
             self.end_headers()
             self.wfile.write(body)
 
