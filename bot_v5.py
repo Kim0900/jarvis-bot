@@ -3025,100 +3025,134 @@ def get_fish_report(custom_hour: int = None) -> str | None:
     return "\n".join(lines)
 
 
-async def get_fish_report_db(hour: int = None, tag_filter: str = None) -> str:
-    """
-    Supabase fish_finder 테이블 기반 어군 브리핑 (v2.2).
-    verified='avoid' 회피 구역 포함, pattern_tag 필터 지원.
-    Supabase 조회 실패 시 FISH_DATA 하드코딩으로 fallback.
-    """
-    now  = datetime.now(KST)
-    h    = hour if hour is not None else now.hour
-    day  = DOW_KOR[now.weekday()]
-    slot = get_fish_slot(h)
+async def get_fish_report_db(hour=None, tag_filter=None):
+    """어군 브리핑 v2 - 카카오/배회 분리 (앱 동일 포맷)"""
+    now = datetime.now(KST)
+    h   = hour if hour is not None else now.hour
+    day = DOW_KOR[now.weekday()]
 
-    # 시간대 → DB time_band 변환
-    SLOT_MAP = {"19~21": "19-21", "21~24": "21-24", "00~02": "00-02"}
-    time_band = SLOT_MAP.get(slot, "") if slot else ""
+    HOUR_DATA = {
+        18: {"kakao": 8,  "baehoe": 1,  "b_pct": 11},
+        19: {"kakao": 48, "baehoe": 3,  "b_pct": 6},
+        20: {"kakao": 46, "baehoe": 4,  "b_pct": 8},
+        21: {"kakao": 50, "baehoe": 1,  "b_pct": 2},
+        22: {"kakao": 51, "baehoe": 9,  "b_pct": 15},
+        23: {"kakao": 52, "baehoe": 8,  "b_pct": 13},
+        0:  {"kakao": 45, "baehoe": 9,  "b_pct": 17},
+        1:  {"kakao": 17, "baehoe": 9,  "b_pct": 35},
+        2:  {"kakao": 11, "baehoe": 4,  "b_pct": 27},
+        3:  {"kakao": 6,  "baehoe": 2,  "b_pct": 25},
+        4:  {"kakao": 2,  "baehoe": 2,  "b_pct": 50},
+    }
+    hd    = HOUR_DATA.get(h, {"kakao": 5, "baehoe": 2, "b_pct": 15})
+    k_pct = 100 - hd["b_pct"]
+    k_int = round(60 / (hd["kakao"] / 8)) if hd["kakao"] > 0 else 99
+    b_per = round(hd["baehoe"] / 8 * 10) / 10
+
+    def stars(n):
+        if n >= 5: return "★★★"
+        if n >= 3: return "★★"
+        return "★"
+
+    anchor_night = "중구 성내·삼덕·동인 / 동구 신암"
+    anchor_late  = "북구 침산↔복현·노원동"
+    anchor_dawn  = "북구 노원동 / 중구 동인동"
+
+    if 0 <= h <= 2:
+        anchor = anchor_night + " / " + anchor_late
+    elif h >= 3:
+        anchor = anchor_dawn
+    else:
+        anchor = anchor_night
+
+    if 19 <= h <= 21:
+        decision   = "카카오 우선 대기"
+        rec_detail = "배회 " + str(hd["b_pct"]) + "% 미만 — 콜 대기 합리적\n수락률 100% 유지"
+    elif 22 <= h <= 23:
+        decision   = "카카오 우선 + 배회 수용"
+        rec_detail = "배회 " + str(hd["b_pct"]) + "% — 앵커 위치면 적극 수용\n" + anchor.split("/")[0].strip()
+    elif 0 <= h <= 2:
+        decision   = "★ 배회 적극 수용 (황금시간)"
+        rec_detail = "배회 " + str(hd["b_pct"]) + "% — 자정후 황금구간\n핵심 동선: " + anchor
+    elif 3 <= h <= 4:
+        decision   = "마감 단계"
+        rec_detail = "02시 종료 검토" if day in ["화", "목"] else "끝까지 사수"
+    else:
+        decision   = "운행 준비 / 대기"
+        rec_detail = "19시 이후 카카오 골든타임 준비"
+
+    est_h = round((9000 * k_pct / 100 + 10500 * hd["b_pct"] / 100) * (hd["kakao"] + hd["baehoe"]) / 8)
+
+    db_zones = []
+    try:
+        slot_map = {19:"19-21",20:"19-21",21:"21-24",22:"21-24",23:"21-24",0:"00-02",1:"00-02",2:"00-02"}
+        tb = slot_map.get(h)
+        if tb:
+            params = {"time_band": "eq." + tb, "verified": "neq.avoid",
+                      "order": "rank_overall.asc", "limit": "3"}
+            if tag_filter:
+                params["pattern_tag"] = "eq." + tag_filter
+            rows = await sb_select("fish_finder", params)
+            if rows:
+                for r in rows:
+                    zone = r.get("zone", "")
+                    avg  = r.get("avg_fare", 0) or 0
+                    db_zones.append(zone + ("(" + str(int(avg)) + "원)" if avg else ""))
+    except Exception:
+        pass
+
+    lines = [
+        "🐟 어군 브리핑 v2 — " + str(h).zfill(2) + "시 " + day + "요일",
+        chr(0x2501) * 22,
+        "",
+        "🟢 카카오 콜 어군",
+        "  콜 간격: 약 " + str(k_int) + "분 (" + stars(hd["kakao"]) + ")",
+        "  평균 단가: 9,000원대",
+        "  비중: " + str(k_pct) + "%  (" + str(hd["kakao"]) + "건/8h 기준)",
+    ]
+    if db_zones:
+        lines.append("  DB 핫존: " + " / ".join(db_zones))
+
+    lines += [
+        "",
+        "🟠 배회 어군",
+        "  만남 확률: 시간당 " + str(b_per) + "건 (" + stars(hd["baehoe"]) + ", " + str(hd["b_pct"]) + "%)",
+        "  평균 단가: 10,500원 (수수료 0%)",
+        "  핵심 동선: " + anchor,
+        "",
+        "💡 종합 권고",
+        "  " + decision,
+    ]
+    for dl in rec_detail.split("\n"):
+        lines.append("  " + dl)
+    lines += [
+        "  예상 시간당: " + str(est_h) + "원대",
+        "",
+        chr(0x2500) + " 시간대별 배회 비중 " + chr(0x2500),
+    ]
+
+    BAR_HOURS = [19, 20, 21, 22, 23, 0, 1, 2, 3]
+    bar = ""
+    for bh in BAR_HOURS:
+        bd = HOUR_DATA.get(bh, {"b_pct": 10})
+        p  = bd["b_pct"]
+        mk = "●" if bh == h else ("◆" if p >= 25 else ("◇" if p >= 15 else "·"))
+        bar += str(bh).zfill(2) + mk + " "
+    lines.append(bar.strip())
+    lines.append("(● 현재  ◆ 배회25%↑  ◇ 배회15%↑)")
 
     try:
-        if not time_band:
-            return f"🐟 현재 {h}시는 브리핑 시간대가 아닙니다.\n운영시간: 19~21시 / 21~24시 / 00~02시"
-
-        # 핫존 조회 (회피 제외)
-        params = {"time_band": f"eq.{time_band}", "verified": "neq.avoid", "order": "rank_overall.asc", "limit": "5"}
-        if tag_filter:
-            params["pattern_tag"] = f"eq.{tag_filter}"
-        rows = await sb_select("fish_finder", params)
-
-        # 회피 구역 조회
-        avoid_params = {"time_band": f"eq.{time_band}", "verified": "eq.avoid"}
-        avoid_rows = await sb_select("fish_finder", avoid_params)
-
-        if not rows:
-            # Supabase 데이터 없으면 하드코딩 fallback
-            return get_fish_report(h) or f"🐟 {day}요일 {slot} 데이터 없음"
-
-        tag_filter_label = f" [{FISH_TAG_EMOJI.get(tag_filter,'')}{tag_filter}]" if tag_filter else ""
-        lines = [f"🐟 어군브리핑 — {day}요일 {slot}{tag_filter_label}"]
-        lines.append("─" * 20)
-
-        for idx, r in enumerate(rows[:5], 1):
-            tag        = r.get("pattern_tag", "") or ""
-            tag_emoji  = FISH_TAG_EMOJI.get(tag, "")
-            ver        = r.get("verified", "") or ""
-            ver_emoji  = "⭐" if ver == "best" else ""
-            note       = r.get("note", "") or ""
-            avg_fare   = r.get("avg_fare", 0) or 0
-            call_cnt   = r.get("call_count", 0) or 0
-            zone       = r.get("zone", "")
-            # v2.3 확률 데이터
-            sample     = r.get("sample_size")
-            stddev     = r.get("fare_stddev")
-            q1         = r.get("fare_q1")
-            q3         = r.get("fare_q3")
-            conf       = r.get("confidence_level") or ""
-            conf_stars = {"낮음":"⭐","중간":"⭐⭐","높음":"⭐⭐⭐","매우높음":"⭐⭐⭐⭐"}.get(conf, "")
-
-            line = f"  {idx}. {zone} {tag_emoji}{ver_emoji}\n"
-            if sample and sample >= 5 and q1 and q3:
-                # v3.0 포맷 — 확률 모델 데이터 있음
-                line += f"     단가 {avg_fare:,}원 (IQR {q1:,}~{q3:,})"
-                if stddev:
-                    line += f" ±{stddev:,}"
-                line += f"\n     신뢰도: {conf} {conf_stars} (n={sample})"
-            else:
-                line += f"     {call_cnt}건 / {avg_fare:,}원"
-            if note:
-                line += f"\n     💡 {note}"
-            # v3.0 공식 변수 평가 추가
-            eta = r.get("eta_advantage")
-            dsr = r.get("demand_supply_ratio")
-            wg  = r.get("weekday_grade") or ""
-            if eta or dsr or wg:
-                line += f"\n     [공식변수]"
-                if dsr:
-                    dsr_lbl = "높음★★★" if dsr >= 2.0 else "중간★★" if dsr >= 1.0 else "낮음★"
-                    line += f" 수요공급:{dsr_lbl}"
-                if eta:
-                    eta_lbl = "도심핵심★★★" if eta >= 0.8 else "양호★★" if eta >= 0.5 else "보통★"
-                    line += f" ETA:{eta_lbl}"
-                if wg:
-                    line += f" 요일:{wg}등급"
-            lines.append(line)
-
-        if avoid_rows:
-            lines.append("")
-            lines.append("⛔ 회피 구역")
-            for r in avoid_rows:
-                zone = r.get("zone", "")
+        avoid = await sb_select("fish_finder", {"verified": "eq.avoid"})
+        if avoid:
+            lines += ["", "⛔ 회피 구역"]
+            for r in avoid[:3]:
                 note = r.get("note", "") or ""
-                lines.append(f"  ✗ {zone}" + (f" — {note}" if note else ""))
+                lines.append("  ✗ " + r.get("zone", "") + (" — " + note if note else ""))
+    except Exception:
+        pass
 
-        return "\n".join(lines)
+    return "\n".join(lines)
 
-    except Exception as e:
-        logger.error(f"fish_finder DB 조회 오류: {e}")
-        return get_fish_report(h) or f"🐟 데이터 조회 실패"
 
 def fish_scheduler(app):
     """18:50 영업준비 브리핑 + 19~02시 매 정각 자동 브리핑"""
