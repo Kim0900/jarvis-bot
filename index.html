@@ -1,0 +1,66 @@
+-- ════════════════════════════════════════════════════════
+-- 캐스퍼 명령서 #004 이행 SQL
+-- 작성: 캐스퍼 | 2026-07-04
+-- 실행 위치: Supabase 대시보드 → SQL Editor → 전체 붙여넣기 → Run
+-- ════════════════════════════════════════════════════════
+
+
+-- ────────────────────────────────────────────────────────
+-- 1. raw_calls: 건수 컬럼 추가 (명령서 #004 §1② 필수 선행 작업)
+-- ────────────────────────────────────────────────────────
+-- 목적: 누적산출/분석 탭이 "행 개수"가 아닌 "실제 콜 건수"를 합산하도록
+--       코드가 이미 수정됨. 이 컬럼이 있어야 신규 저장분부터 정확히 기록됨.
+-- 기본값 1 = 수동입력 1건당 1행 = 1건이 자연스럽게 맞음.
+-- 기존 저장분(이 컬럼 도입 전)은 비고 텍스트에서 앱이 자동으로 역추출하므로
+-- 별도 백필(backfill) 작업 불필요.
+
+ALTER TABLE raw_calls
+  ADD COLUMN IF NOT EXISTS 건수 INTEGER DEFAULT 1;
+
+
+-- ────────────────────────────────────────────────────────
+-- 2. bot_briefings: 이지스 연동용 신규 테이블 (경로 1)
+-- ────────────────────────────────────────────────────────
+-- ⚠ 캐스퍼 발견 사항: 명령서 #003이 지칭한 "atlas_reports"는 이미
+--   존재하는 테이블이며, 아틀라스(Perplexity) → 앱(Claude 분석) 파이프라인
+--   전용으로 이미 쓰이고 있음 (status: pending→analyzed/error).
+--   봇(bot_v5.py) 브리핑을 여기 같이 넣으면, 앱이 자동으로 이걸 다시
+--   "마기 분석" 대상으로 착각해서 불필요한 Claude API 호출이 발생하고
+--   이지스가 감지해야 할 상태값과도 충돌함.
+--   → 별도 테이블 bot_briefings로 분리 설계함. 마기 재확인 요청.
+
+CREATE TABLE IF NOT EXISTS bot_briefings (
+  id            BIGSERIAL PRIMARY KEY,
+  briefing_type TEXT NOT NULL,           -- 예: 'daily_close'(마감리포트), 'fish'(어군브리핑) 등
+  content       TEXT NOT NULL,           -- 브리핑 본문 (텍스트 그대로)
+  run_date      DATE NOT NULL DEFAULT CURRENT_DATE,
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending → archived / error (이지스가 갱신)
+  archived_at   TIMESTAMPTZ,             -- 이지스가 GitHub+Drive 저장 완료 후 기록
+  error_msg     TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 이지스가 폴링할 때 쓸 인덱스 (status='pending' 조회 최적화)
+CREATE INDEX IF NOT EXISTS idx_bot_briefings_status ON bot_briefings(status);
+
+
+-- ────────────────────────────────────────────────────────
+-- 3. daily_summary: 신규 필드 (캐스퍼 명령서 #003 §3, #002 통합)
+-- ────────────────────────────────────────────────────────
+
+ALTER TABLE daily_summary
+  ADD COLUMN IF NOT EXISTS work_start_time   TIME,
+  ADD COLUMN IF NOT EXISTS work_end_time     TIME,
+  ADD COLUMN IF NOT EXISTS work_hours        NUMERIC(4,2),
+  ADD COLUMN IF NOT EXISTS kpi_7day_avg        NUMERIC(5,2),  -- 7일 이동평균 완료건수
+  ADD COLUMN IF NOT EXISTS kpi_avg_fare        INTEGER,        -- 카카오T 평균단가(평일)
+  ADD COLUMN IF NOT EXISTS kpi_longdist_rate   NUMERIC(4,1),   -- 장거리(15,000원↑) 비율(%)
+  ADD COLUMN IF NOT EXISTS kpi_hourly_revenue  INTEGER;        -- 시간당 매출
+
+
+-- ────────────────────────────────────────────────────────
+-- 실행 후 확인용 (선택)
+-- ────────────────────────────────────────────────────────
+-- SELECT column_name FROM information_schema.columns WHERE table_name='raw_calls' AND column_name='건수';
+-- SELECT column_name FROM information_schema.columns WHERE table_name='daily_summary' ORDER BY ordinal_position;
+-- SELECT * FROM bot_briefings LIMIT 1;
