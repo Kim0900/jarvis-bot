@@ -1,0 +1,2605 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>JARVIS 매출관리</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;700&family=Bebas+Neue&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#07090f;--bg2:#0e1118;--bg3:#141720;
+  --bd:#1e2230;--bd2:#252a38;
+  --gold:#f5c518;--blue:#3b82f6;--green:#22c55e;--red:#ef4444;--purple:#a78bfa;
+  --tx:#e8ecf0;--mu:#5a6070;--sub:#8892a0;
+  --r14:14px;--r8:8px;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--tx);font-family:'IBM Plex Sans KR',sans-serif}
+input,select,textarea,button{font-family:inherit}
+#app{display:flex;flex-direction:column;height:100vh;max-width:480px;margin:0 auto}
+#hdr{padding:14px 16px 10px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0;position:sticky;top:0;z-index:50}
+#body{flex:1;overflow-y:auto;padding:14px 14px 86px}
+#nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:480px;background:var(--bg2);border-top:1px solid var(--bd);display:flex;z-index:100;padding-bottom:env(safe-area-inset-bottom,0px)}
+
+/* ── 공통 ── */
+.page{display:none}.page.on{display:block}
+.card{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r14);padding:14px;margin-bottom:12px}
+.inp{width:100%;background:var(--bg);border:1px solid var(--bd2);border-radius:var(--r8);padding:11px 13px;color:var(--tx);font-size:14px;outline:none;-webkit-appearance:none}
+.inp:focus{border-color:#3a4060}
+select.inp{padding:10px 13px}
+.btn-gold{width:100%;padding:14px;border:none;border-radius:var(--r14);background:var(--gold);color:#000;font-size:15px;font-weight:700;cursor:pointer;letter-spacing:.2px}
+.btn-blue{width:100%;padding:14px;border:none;border-radius:var(--r14);background:var(--blue);color:#fff;font-size:15px;font-weight:700;cursor:pointer}
+.btn-ghost{width:100%;padding:12px;border:1px solid var(--bd2);border-radius:var(--r14);background:transparent;color:var(--sub);font-size:14px;cursor:pointer}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.lbl{font-size:11px;color:var(--mu);margin-bottom:5px}
+.ttl{font-size:16px;font-weight:700;margin-bottom:14px}
+.mb10{margin-bottom:10px}.mb14{margin-bottom:14px}
+
+/* ── 헤더 ── */
+.hd{display:flex;align-items:center;gap:10px}
+.hd-name{font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:1px;color:var(--gold)}
+.hd-sub{font-size:11px;color:var(--mu);margin-top:1px}
+.hd-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.dot-sb{width:8px;height:8px;border-radius:50%;background:var(--green)}
+.dot-sb.off{background:var(--red)}
+
+/* ── 네비 ── */
+.nb{flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;padding:9px 0 11px;border:none;background:none;color:var(--mu);cursor:pointer;font-size:9px;font-weight:500;letter-spacing:.3px;transition:color .15s}
+.nb .ico{font-size:18px;line-height:1;margin-bottom:2px}
+.nb.on{color:var(--gold)}
+
+/* ── 홈 ── */
+.hero{background:linear-gradient(135deg,#0d1a2e 0%,#07090f 100%);border:1px solid #1a2840;border-radius:var(--r14);padding:18px;margin-bottom:12px}
+.h-lbl{font-size:11px;color:var(--mu);margin-bottom:3px}
+.h-amt{font-family:'Bebas Neue',sans-serif;font-size:44px;letter-spacing:1px;line-height:1;color:var(--gold)}
+.prog{background:#111827;border-radius:6px;height:8px;margin:10px 0 4px;overflow:hidden}
+.prog-f{height:100%;border-radius:6px;transition:width .8s cubic-bezier(.4,0,.2,1)}
+.h-meta{display:flex;justify-content:space-between;font-size:11px;color:var(--mu)}
+.sv{font-size:20px;font-weight:700;margin-top:4px}
+.up{color:var(--green);font-size:12px;font-weight:600}
+.dn{color:var(--red);font-size:12px;font-weight:600}
+.nm{color:var(--mu);font-size:11px}
+
+/* ── 입력 ── */
+.wx-row{display:flex;gap:6px}
+.wb{flex:1;padding:8px 2px;border:1px solid var(--bd2);border-radius:var(--r8);background:var(--bg);color:var(--mu);font-size:11px;cursor:pointer;text-align:center;transition:all .15s}
+.wb.on{border-color:var(--gold);background:#1e1600;color:var(--gold)}
+.sl-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.sl-tag{width:68px;font-size:11px;font-weight:500;flex-shrink:0}
+.tot-row{display:flex;justify-content:space-between;align-items:center;padding-top:10px;border-top:1px solid var(--bd)}
+
+/* ── OCR ── */
+.drop{border:2px dashed var(--gold);border-radius:var(--r14);min-height:160px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:#0a0d15;width:100%;cursor:pointer;transition:background .15s}
+.drop:active{background:#111520}
+#ocr-prev{width:100%;border-radius:var(--r14);max-height:200px;object-fit:contain;background:var(--bg3);display:none;margin-top:10px}
+.spin-w{display:none;text-align:center;padding:20px}.spin-w.on{display:block}
+@keyframes sp{to{transform:rotate(360deg)}}
+.spin{width:34px;height:34px;border:3px solid var(--bd2);border-top-color:var(--gold);border-radius:50%;animation:sp .7s linear infinite;margin:0 auto}
+.ocr-ok{background:#071a0e;border:1px solid var(--green);border-radius:var(--r14);padding:14px;margin-top:12px;display:none}.ocr-ok.on{display:block}
+.ocr-r{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #0d2318;font-size:13px}.ocr-r:last-child{border-bottom:none}
+.ocr-k{color:var(--mu)}.ocr-v{font-weight:600}
+.ocr-err{background:#1a0505;border:1px solid var(--red);border-radius:var(--r8);padding:12px;margin-top:10px;font-size:13px;color:var(--red);display:none;line-height:1.5}.ocr-err.on{display:block}
+
+/* ── 기록 ── */
+.rc{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r14);padding:14px;margin-bottom:10px}
+.rc-d{font-size:12px;color:var(--mu);margin-bottom:2px}
+.rc-a{font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold)}
+.rc-dt{font-size:11px;color:var(--mu);margin-top:3px;line-height:1.7}
+.rc-btns{display:flex;gap:6px;margin-top:10px}
+.rce{flex:1;padding:7px;border-radius:var(--r8);font-size:12px;cursor:pointer;background:var(--bg3);border:1px solid var(--bd2);color:var(--tx)}
+.rcx{flex:1;padding:7px;border-radius:var(--r8);font-size:12px;cursor:pointer;background:var(--bg3);border:1px solid #3a0808;color:var(--red)}
+
+/* ── 분석 ── */
+.b-lbl{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px}
+.b-bg{background:var(--bg3);border-radius:4px;height:6px}.b-f{height:100%;border-radius:4px}
+/* 공제 */
+.ded-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--bd)}
+.ded-row:last-child{border-bottom:none}
+.ded-lbl{font-size:13px;color:var(--sub)}
+.ded-val{font-size:13px;font-weight:600;color:var(--red)}
+.net-card{background:linear-gradient(135deg,#0a1a0a,#07090f);border:1px solid #1a3a1a;border-radius:var(--r14);padding:16px;margin-top:12px}
+.net-lbl{font-size:11px;color:var(--mu)}
+.net-amt{font-family:'Bebas Neue',sans-serif;font-size:36px;color:var(--green);letter-spacing:1px;line-height:1}
+.ded-toggle{font-size:12px;color:var(--blue);cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+
+/* ── 설정 ── */
+.sr{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-bottom:1px solid var(--bd)}.sr:last-child{border-bottom:none}
+
+/* ── 로딩 오버레이 ── */
+#loading{position:fixed;inset:0;background:rgba(7,9,15,.85);z-index:9000;display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+#loading.on{display:flex}
+
+/* ── 토스트 ── */
+#toast{position:fixed;top:76px;left:50%;transform:translateX(-50%);padding:10px 22px;border-radius:30px;font-size:13px;font-weight:600;z-index:9999;display:none;white-space:nowrap;max-width:90vw;text-align:center}
+
+/* ── 모달 ── */
+.mb{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:8000;display:none;align-items:center;justify-content:center}.mb.on{display:flex}
+.md{background:var(--bg2);border:1px solid var(--bd2);border-radius:18px;padding:22px;width:min(300px,88vw);text-align:center}
+.md-msg{font-size:15px;margin-bottom:20px;line-height:1.5}
+.md-btns{display:flex;gap:10px}
+.md-no{flex:1;padding:12px;border:1px solid var(--bd2);border-radius:10px;background:transparent;color:var(--mu);cursor:pointer;font-size:14px}
+.md-ok{flex:1;padding:12px;border:none;border-radius:10px;background:var(--red);color:#fff;cursor:pointer;font-size:14px;font-weight:700}
+
+/* ── 설정 미완료 배너 ── */
+.setup-banner{background:#1a0a00;border:1px solid var(--gold);border-radius:var(--r14);padding:16px;margin-bottom:14px;display:none}.setup-banner.on{display:block}
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- 헤더 -->
+<div id="hdr">
+  <div class="hd">
+    <span style="font-size:24px">🚕</span>
+    <div>
+      <div class="hd-name">JARVIS 매출관리</div>
+      <div class="hd-sub" id="hd-sub">초기화 중...</div>
+    </div>
+    <div class="hd-right">
+      <div class="dot-sb off" id="sb-dot" title="Supabase 연결 상태"></div>
+      <span style="font-size:10px;color:var(--mu)" id="sb-lbl">미연결</span>
+    </div>
+  </div>
+</div>
+
+<!-- 본문 -->
+<div id="body">
+
+  <!-- 홈 -->
+  <div id="pg-home" class="page on">
+    <div class="setup-banner" id="setup-banner">
+      <div style="font-size:14px;font-weight:700;color:var(--gold);margin-bottom:6px">⚙️ Supabase 연결 필요</div>
+      <div style="font-size:12px;color:var(--sub);margin-bottom:10px">설정 탭에서 URL과 KEY를 입력하면 여러 기기 동기화가 됩니다.</div>
+      <button class="btn-ghost" style="padding:8px" onclick="goPage('set')">설정하러 가기 →</button>
+    </div>
+    <!-- 효율지표 요약 (GPX 있을 때) -->
+    <div id="home-eff" style="display:none;background:linear-gradient(135deg,#0a1a0a,#07090f);border:1px solid #1a3a1a;border-radius:var(--r14);padding:14px;margin-bottom:12px">
+      <div style="font-size:11px;color:var(--mu);margin-bottom:4px">⚡ 구속시간당 매출 (대표지표)</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:36px;color:var(--green);letter-spacing:1px" id="h-eff-main">-</div>
+      <div style="font-size:12px;color:var(--mu);margin-top:4px" id="h-eff-sub"></div>
+    </div>
+    <div class="hero">
+      <div class="h-lbl">오늘 매출</div>
+      <div class="h-amt"><span id="h-today">-</span><span style="font-size:18px">원</span></div>
+      <div class="prog"><div class="prog-f" id="h-tbar" style="background:var(--gold);width:0%"></div></div>
+      <div class="h-meta"><span>목표 <span id="h-dg">0</span>원</span><span id="h-tr" style="font-weight:700;color:var(--gold)">0%</span></div>
+      <div style="margin-top:6px;font-size:12px;color:var(--mu)" id="h-td"></div>
+    </div>
+    <div class="card">
+      <div class="h-lbl">이번달 (<span id="h-md">0</span>일)</div>
+      <div style="font-size:26px;font-weight:800;margin-top:2px"><span id="h-month">-</span>원</div>
+      <div class="prog"><div class="prog-f" id="h-mbar" style="background:var(--blue);width:0%"></div></div>
+      <div class="h-meta"><span>목표 <span id="h-mg">0</span>원</span><span id="h-mr" style="font-weight:700;color:var(--blue)">0%</span></div>
+      <div style="margin-top:8px;font-size:12px;color:var(--mu);border-top:1px solid var(--bd2);padding-top:8px" id="h-cum">-</div>
+      </div>
+
+    <div class="g2 mb14">
+      <div class="card" style="margin-bottom:0"><div class="lbl">이번주</div><div class="sv" id="h-week">-원</div><div style="font-size:11px;color:var(--mu);margin-top:2px"><span id="h-wd">0</span>일 운행</div></div>
+      <div class="card" style="margin-bottom:0"><div class="lbl">전주 대비</div><div style="margin-top:6px" id="h-wdiff"></div><div style="font-size:11px;color:var(--mu);margin-top:2px">전주 <span id="h-lw">-</span>원</div></div>
+    </div>
+    <!-- 오늘 실순수익 -->
+    <div class="net-card" id="net-card">
+      <div class="net-lbl">오늘 실순수익 (매출 - 공제)</div>
+      <div class="net-amt"><span id="h-net">-</span><span style="font-size:16px">원</span></div>
+      <div style="margin-top:8px" id="ded-detail-toggle">
+        <span class="ded-toggle" onclick="toggleDedDetail()">공제 내역 보기 ▾</span>
+      </div>
+      <div id="ded-detail" style="display:none;margin-top:10px">
+        <div class="ded-row"><span class="ded-lbl">🛡️ 보험료</span><span class="ded-val" id="dd-ins">-</span></div>
+        <div class="ded-row"><span class="ded-lbl">🏦 대출 일할</span><span class="ded-val" id="dd-loan">-</span></div>
+        <div class="ded-row"><span class="ded-lbl">⚡ 충전비</span><span class="ded-val" id="dd-chg">-</span></div>
+        <div class="ded-row"><span class="ded-lbl">🚗 감가상각 일할</span><span class="ded-val" id="dd-dep">-</span></div>
+        <div class="ded-row"><span class="ded-lbl">📱 기타 고정비 일할</span><span class="ded-val" id="dd-etc">-</span></div>
+        <div class="ded-row" style="border-top:1px solid var(--bd2);margin-top:4px;padding-top:10px"><span class="ded-lbl" style="font-weight:700;color:var(--tx)">총 공제</span><span class="ded-val" style="font-size:15px" id="dd-total">-</span></div>
+      </div>
+    </div>
+    <!-- 마기 분석 피드 -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 8px">
+      <span style="font-size:14px;font-weight:700">🤖 마기 분석 피드</span>
+      <span id="atlas-badge" style="background:var(--gold);color:#000;border-radius:12px;padding:2px 8px;font-size:11px;font-weight:700;display:none">0</span>
+    </div>
+    <div id="magi-analysis-container">
+      <div style="text-align:center;color:var(--mu);padding:20px;font-size:13px">
+        아틀라스 보고 대기 중...<br>
+        <span style="font-size:11px">Supabase 연결 후 자동 수신됩니다</span>
+      </div>
+    </div>
+
+    <!-- 어군 브리핑 v2 -->
+    <div class="card" style="margin-top:4px" id="fish-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span style="font-size:14px;font-weight:700">🐟 어군 브리핑</span>
+        <span id="fish-time" style="font-size:11px;color:var(--mu)"></span>
+      </div>
+
+      <!-- 카카오 어군 -->
+      <div style="background:#0d1a0d;border:1px solid #1a3a1a;border-radius:10px;padding:12px;margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:#22c55e;margin-bottom:6px">🟢 카카오 콜 어군</div>
+        <div id="fish-kakao" style="font-size:12px;color:var(--sub);line-height:1.8">-</div>
+      </div>
+
+      <!-- 배회 어군 -->
+      <div id="fish-baehoe-card" style="background:#1a0f00;border:1px solid #3a2000;border-radius:10px;padding:12px;margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:#f97316;margin-bottom:6px">🟠 배회 어군</div>
+        <div id="fish-baehoe" style="font-size:12px;color:var(--sub);line-height:1.8">-</div>
+      </div>
+
+      <!-- 종합 권고 -->
+      <div id="fish-rec-card" style="background:#0d0d1a;border:1px solid #1a1a3a;border-radius:10px;padding:12px;margin-bottom:10px">
+        <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:6px">💡 종합 권고</div>
+        <div id="fish-rec" style="font-size:12px;color:var(--sub);line-height:1.8">-</div>
+      </div>
+
+      <!-- 시간대별 배회 확률 바 -->
+      <div id="fish-hour-bar" style="margin-bottom:10px"></div>
+
+      <button class="btn-ghost" style="padding:10px;font-size:13px" onclick="getFishReport()">🔄 브리핑 새로고침</button>
+    </div>
+    <button class="btn-gold" style="margin-top:12px" onclick="goPage('input');resetForm()">✏️ 매출 입력하기</button>
+  </div>
+
+  <!-- 영수증 OCR -->
+  <div id="pg-receipt" class="page">
+    <div class="ttl">📸 영수증 자동 입력</div>
+    <label for="ocr-inp">
+      <div class="drop" id="drop">
+        <div style="font-size:40px">📷</div>
+        <div style="font-size:17px;font-weight:700;color:var(--gold)">사진을 탭해서 올려주세요</div>
+        <div style="font-size:12px;color:var(--mu)">매출집계 영수증 사진</div>
+      </div>
+    </label>
+    <input type="file" id="ocr-inp" accept="image/*" style="display:none">
+    <img id="ocr-prev" alt="미리보기">
+    <div class="spin-w" id="ocr-spin"><div class="spin"></div><div style="font-size:13px;color:var(--mu);margin-top:10px">AI가 영수증을 읽는 중...</div></div>
+    <div class="ocr-err" id="ocr-err"></div>
+    <div class="ocr-ok" id="ocr-ok">
+      <div style="font-size:12px;font-weight:700;color:var(--green);margin-bottom:10px">✅ 자동 추출 완료 — 확인 후 저장</div>
+      <div id="ocr-rows"></div>
+      <button class="btn-gold" style="margin-top:14px" onclick="saveOcr()">저장하기</button>
+      <button class="btn-ghost" style="margin-top:10px" onclick="cancelOcr()">취소</button>
+    </div>
+    <div class="card ocr-guide" style="margin-top:12px">
+      <div class="ttl">💡 영수증 OCR 가이드</div>
+      <ul style="font-size:13px;color:var(--sub);line-height:1.6;padding-left:18px">
+        <li>배달/택시 앱 매출 정산 내역 캡쳐본을 올려주세요.</li>
+        <li>매출액, 수수료, 운행 건수가 정확히 보이도록 잘라주세요.</li>
+        <li>현재는 카카오T 정산 내역만 지원합니다.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- GPX 업로드 -->
+  <div id="pg-gpx" class="page">
+    <div class="ttl">📡 GPX 분석</div>
+
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">GPX 파일 업로드</div>
+      <div style="font-size:12px;color:var(--sub);margin-bottom:10px">
+        외부 GPS 앱에서 저장한 .gpx 파일 → 구속시간·거리·배회구역 자동 계산
+      </div>
+      <label for="gpx-file-inp" style="display:block">
+        <div class="drop" id="gpx-drop" style="min-height:90px;gap:6px">
+          <div style="font-size:28px">📂</div>
+          <div style="font-size:14px;font-weight:700;color:var(--gold)">.gpx 파일 올리기</div>
+          <div style="font-size:11px;color:var(--mu)">운행 종료 후 1회 업로드</div>
+        </div>
+      </label>
+      <input type="file" id="gpx-file-inp" accept=".gpx,application/gpx+xml,text/xml" style="display:none">
+      <div class="spin-w" id="gpx-spin"><div class="spin"></div><div style="font-size:12px;color:var(--mu);margin-top:8px">GPX 분석 중...</div></div>
+      <div id="gpx-err" style="display:none;background:#1a0505;border:1px solid var(--red);border-radius:8px;padding:10px;margin-top:8px;font-size:12px;color:var(--red)"></div>
+    </div>
+
+    <!-- GPX 분석 결과 -->
+    <div id="gpx-result" style="display:none">
+      <div class="card" style="border-left:3px solid var(--gold);margin-bottom:12px" id="gpx-summary-card">
+        <div style="font-size:13px;font-weight:700;color:var(--gold);margin-bottom:10px">📊 GPX 분석 결과</div>
+        <div id="gpx-summary-rows" style="font-size:13px;line-height:2.2;color:var(--sub)"></div>
+      </div>
+      <div class="card" style="margin-bottom:12px">
+        <div style="font-size:13px;font-weight:700;margin-bottom:8px">🚕 배회 구역 복원</div>
+        <div id="gpx-baehoe-rows" style="font-size:12px;color:var(--sub);line-height:1.8"></div>
+      </div>
+      <button class="btn-gold" onclick="applyGpxResult()">DB 저장 + 효율지표 계산</button>
+      <button class="btn-ghost" style="margin-top:8px" onclick="resetGpx()">다시 올리기</button>
+    </div>
+
+    <!-- 효율지표 -->
+    <div id="eff-card" style="display:none;margin-top:14px">
+      <div class="card" style="border-left:3px solid var(--green)">
+        <div style="font-size:13px;font-weight:700;color:var(--green);margin-bottom:10px">⚡ 효율지표</div>
+        <div id="eff-rows" style="font-size:14px;line-height:2.4"></div>
+      </div>
+    </div>
+
+    <!-- 룰체크 결과 -->
+    <div id="rule-card" style="display:none;margin-top:12px">
+      <div class="card" style="border-left:3px solid var(--gold)">
+        <div style="font-size:13px;font-weight:700;color:var(--gold);margin-bottom:10px">🔍 룰체크 [2단]</div>
+        <div id="rule-rows" style="font-size:12px;color:var(--sub);line-height:1.8"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 입력 -->
+  <div id="pg-input" class="page">
+    <div class="ttl" id="form-ttl">✏️ 매출 입력</div>
+    <div class="mb14"><div class="lbl">날짜</div><input type="date" id="f-date" class="inp"></div>
+    <div class="mb14"><div class="lbl">날씨</div><div class="wx-row"><button class="wb on" onclick="setWx(this,'☀️')">☀️ 맑음</button><button class="wb" onclick="setWx(this,'⛅')">⛅ 흐림</button><button class="wb" onclick="setWx(this,'🌧️')">🌧️ 비</button><button class="wb" onclick="setWx(this,'❄️')">❄️ 눈</button></div></div>
+    <div class="mb14"><div class="lbl">운행시간</div><div style="display:flex;gap:8px;align-items:center"><input type="time" id="f-st" class="inp" style="flex:1"><span style="color:var(--mu)">~</span><input type="time" id="f-et" class="inp" style="flex:1"></div></div>
+    <div class="lbl mb10">매출 구분</div>
+    <div class="card">
+      <div class="sl-row"><span class="sl-tag" style="color:var(--gold)">🟡 카카오T</span><input type="number" id="f-kk" class="inp" placeholder="0" oninput="calcT()" style="flex:1;text-align:right"><span style="font-size:12px;color:var(--mu);margin-left:4px">원</span></div>
+      <div class="sl-row"><span class="sl-tag" style="color:var(--blue)">💳 카드</span><input type="number" id="f-cd" class="inp" placeholder="0" oninput="calcT()" style="flex:1;text-align:right"><span style="font-size:12px;color:var(--mu);margin-left:4px">원</span></div>
+      <div class="sl-row"><span class="sl-tag" style="color:var(--green)">💵 현금</span><input type="number" id="f-cs" class="inp" placeholder="0" oninput="calcT()" style="flex:1;text-align:right"><span style="font-size:12px;color:var(--mu);margin-left:4px">원</span></div>
+      <div class="sl-row" style="margin-bottom:0"><span class="sl-tag" style="color:var(--purple)">📌 기타</span><input type="number" id="f-ot" class="inp" placeholder="0" oninput="calcT()" style="flex:1;text-align:right"><span style="font-size:12px;color:var(--mu);margin-left:4px">원</span></div>
+      <div class="tot-row"><span style="font-size:13px;color:var(--mu)">합계</span><span style="font-size:22px;font-weight:800;color:var(--gold)"><span id="f-tot">0</span>원</span></div>
+    </div>
+    <div class="mb14"><div class="lbl">⚡ 충전비</div><div style="display:flex;gap:8px"><input type="number" id="f-fuel" class="inp" placeholder="0" style="flex:1"><span style="font-size:12px;color:var(--mu);align-self:center">원</span></div></div>
+    <div style="margin-bottom:20px"><div class="lbl">📝 메모</div><textarea id="f-memo" class="inp" style="height:60px;resize:none" placeholder="특이사항..."></textarea></div>
+    <div style="display:flex;gap:10px"><button class="btn-ghost" style="flex:1" onclick="goPage('home');resetForm()">취소</button><button class="btn-gold" style="flex:2" id="f-savebtn" onclick="saveRec()">저장하기</button></div>
+  </div>
+
+  <!-- 일별 이력 업로드 + 조회 -->
+  <div id="pg-history" class="page">
+    <div class="ttl">📅 일별 운행 이력</div>
+
+    <!-- 이미지 업로드 섹션 -->
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:8px">📸 이력 이미지 업로드</div>
+      <div style="font-size:12px;color:var(--sub);margin-bottom:10px">
+        카카오T 앱 → 일별 운행이력 / 세큐티 결제내역 화면 캡처
+      </div>
+      <label for="hist-img-inp" style="display:block">
+        <div class="drop" id="hist-drop" style="min-height:100px;gap:6px">
+          <div style="font-size:28px">📷</div>
+          <div style="font-size:14px;font-weight:700;color:var(--gold)">사진 올리기</div>
+          <div style="font-size:11px;color:var(--mu)">일별운행이력 또는 결제내역 화면</div>
+        </div>
+      </label>
+      <input type="file" id="hist-img-inp" accept="image/*" multiple style="display:none">
+      <img id="hist-img-preview" style="display:none;width:100%;border-radius:10px;margin-top:8px;max-height:180px;object-fit:contain">
+      <div class="spin-w" id="hist-spin"><div class="spin"></div><div style="font-size:12px;color:var(--mu);margin-top:8px">OCR 처리 중...</div></div>
+      <div id="hist-ocr-result" style="display:none;margin-top:10px">
+        <div style="font-size:12px;font-weight:700;color:var(--green);margin-bottom:8px">✅ 인식 완료 — 저장하시겠어요?</div>
+        <div id="hist-ocr-rows" style="font-size:12px;color:var(--sub);line-height:1.8;margin-bottom:10px"></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-ghost" style="flex:1;padding:10px;font-size:13px" onclick="resetHistOcr()">취소</button>
+          <button class="btn-gold" style="flex:2;padding:10px;font-size:13px" onclick="saveHistOcr()">DB 저장 + 교차대조</button>
+        </div>
+      </div>
+      <div id="hist-ocr-err" style="display:none;background:#1a0505;border:1px solid var(--red);border-radius:8px;padding:10px;margin-top:8px;font-size:12px;color:var(--red)"></div>
+    </div>
+
+    <!-- 교차대조 결과 -->
+    <div id="cross-result-container"></div>
+
+    <!-- 기록 조회 -->
+    <div class="card">
+      <div class="lbl" style="margin-bottom:6px">조회 월</div>
+      <select class="inp" id="hist-mo" onchange="renderHist()"></select>
+    </div>
+    <div id="hist-list"></div>
+  </div>
+
+  <!-- 분석 -->
+  <div id="pg-anal" class="page">
+    <div class="ttl">📊 매출 분석</div>
+
+    <!-- 월 선택 -->
+    <div style="margin-bottom:12px">
+      <select class="inp" id="anal-mo" onchange="renderAnal()"></select>
+    </div>
+
+    <!-- 요약 카드 4개 -->
+    <div class="g2" style="margin-bottom:12px">
+      <div class="card" style="margin-bottom:0">
+        <div class="lbl">총 매출</div>
+        <div style="font-family:'Bebas Neue',sans-serif;font-size:24px;color:var(--gold);margin-top:4px" id="an-total">-</div>
+      </div>
+      <div class="card" style="margin-bottom:0">
+        <div class="lbl">운행일 / 총 콜</div>
+        <div style="font-size:18px;font-weight:700;margin-top:4px" id="an-days">-</div>
+      </div>
+      <div class="card" style="margin-bottom:0">
+        <div class="lbl">일 평균 매출</div>
+        <div style="font-size:18px;font-weight:700;color:var(--green);margin-top:4px" id="an-avg">-</div>
+      </div>
+      <div class="card" style="margin-bottom:0">
+        <div class="lbl">건당 단가</div>
+        <div style="font-size:18px;font-weight:700;color:var(--blue);margin-top:4px" id="an-per">-</div>
+      </div>
+    </div>
+
+    <!-- 효율지표 (GPX 있을 때) -->
+    <div id="an-eff-card" style="display:none;background:linear-gradient(135deg,#0a1a0a,#07090f);border:1px solid #1a3a1a;border-radius:var(--r14);padding:14px;margin-bottom:12px">
+      <div style="font-size:11px;color:var(--mu);margin-bottom:6px">⚡ 효율지표 (GPX 기반)</div>
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px" id="an-eff-rows"></div>
+    </div>
+
+    <!-- 요일별 분석 -->
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">📅 요일별 실적</div>
+      <div id="an-dow-bars"></div>
+    </div>
+
+    <!-- 시간대별 분석 -->
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">🕐 시간대별 콜 분포</div>
+      <div id="an-hour-bars"></div>
+    </div>
+
+    <!-- 콜유형 비율 -->
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">🚕 콜유형 비율</div>
+      <div id="an-type-rows"></div>
+    </div>
+
+    <!-- 일별 매출 리스트 -->
+    <div class="card">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">📋 일별 매출</div>
+      <div id="an-daily-list"></div>
+    </div>
+  </div>
+
+  <!-- 설정 -->
+  <div id="pg-set" class="page">
+    <div class="ttl">⚙️ 설정</div>
+    <div class="card">
+      <div class="lbl">Supabase URL</div>
+      <input type="text" class="inp mb10" id="sb-url" placeholder="https://your-project.supabase.co">
+      <div class="lbl">Supabase Anon Key</div>
+      <input type="text" class="inp mb10" id="sb-key" placeholder="eyJ..." autocomplete="off">
+      <div id="sb-test-result" style="display:none;padding:8px 10px;border-radius:8px;font-size:12px;margin-bottom:8px;background:#0d1a0d"></div>
+      <button class="btn-blue" onclick="saveSettings()">Supabase 설정 저장</button>
+      <button class="btn-ghost" style="margin-top:10px" onclick="clearLocalData()">로컬 데이터 삭제</button>
+    </div>
+    <div class="card">
+      <div class="lbl">백엔드 서버 URL</div>
+      <input type="text" class="inp mb10" id="server-url" placeholder="https://your-backend.onrender.com">
+      <button class="btn-blue" onclick="saveServerUrl()">백엔드 서버 URL 저장</button>
+    </div>
+    <div class="card">
+      <div class="ttl">목표 설정</div>
+      <div class="lbl">일 목표 매출</div>
+      <input type="number" class="inp mb10" id="goal-daily" placeholder="150000">
+      <div class="lbl">월 목표 매출</div>
+      <input type="number" class="inp mb10" id="goal-monthly" placeholder="4500000">
+      <button class="btn-blue" onclick="saveGoals()">목표 저장</button>
+    </div>
+    <div class="card">
+      <div class="ttl">공제 항목 설정</div>
+      <div class="lbl">보험료 일할</div>
+      <input type="number" class="inp mb10" id="ded-ins" placeholder="7945">
+      <div class="lbl">대출 일할</div>
+      <input type="number" class="inp mb10" id="ded-loan" placeholder="0">
+      <div class="lbl">충전비 일할</div>
+      <input type="number" class="inp mb10" id="ded-chg" placeholder="0">
+      <div class="lbl">감가상각 일할</div>
+      <input type="number" class="inp mb10" id="ded-dep" placeholder="0">
+      <div class="lbl">기타 고정비 일할</div>
+      <input type="number" class="inp mb10" id="ded-etc" placeholder="0">
+      <button class="btn-blue" onclick="saveDed()">공제 항목 저장</button>
+    </div>
+    <div class="card" style="border-left:3px solid var(--gold)">
+      <div style="font-size:13px;font-weight:700;margin-bottom:4px">🤖 Claude API 키 (폴백용)</div>
+      <div style="font-size:12px;color:var(--sub);line-height:1.6;margin-bottom:10px">
+        봇 서버 미연결 시 직접 OCR에 사용됩니다.<br>
+        봇 서버 연결 시엔 서버 키 우선 사용됩니다.
+      </div>
+      <input type="password" id="claude-key-inp" class="inp mb10" placeholder="sk-ant-...">
+      <button class="btn-ghost" style="padding:10px;font-size:13px" onclick="saveClaudeKeyLocal()">저장</button>
+      <div id="claude-key-status" style="font-size:11px;color:var(--mu);margin-top:6px"></div>
+    </div>
+
+    <!-- 파이프라인 상태 -->
+    <div class="card">
+      <div style="font-size:13px;font-weight:700;margin-bottom:4px">📡 실시간 파이프라인</div>
+      <div style="font-size:12px;color:var(--sub);margin-bottom:12px">아틀라스 보고 자동 수신 · 마기 분석 · 화면 표시</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--bd)">
+        <span style="font-size:13px">폴링 상태</span>
+        <span id="pipeline-status" style="font-size:12px;color:var(--green)">대기</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--bd)">
+        <span style="font-size:13px">맥락 버전</span>
+        <span id="ctx-version" style="font-size:12px;color:var(--gold)">미로드</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">
+        <span style="font-size:13px">미처리 보고</span>
+        <span id="pending-count" style="font-size:12px;color:var(--mu)">-</span>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn-ghost" style="flex:1;padding:10px;font-size:12px" onclick="checkPipelineStatus()">상태 확인</button>
+        <button class="btn-blue" style="flex:1;padding:10px;font-size:13px" onclick="testPipeline()">테스트 보고 전송</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- 네비게이션 -->
+<div id="nav">
+  <button class="nb on" data-pg="home" onclick="goPage('home')"><span class="ico">🏠</span>홈</button>
+  <button class="nb" data-pg="receipt" onclick="goPage('receipt')"><span class="ico">🧾</span>영수증</button>
+  <button class="nb" data-pg="history" onclick="goPage('history')"><span class="ico">📅</span>일별 이력</button>
+  <button class="nb" data-pg="gpx" onclick="goPage('gpx')"><span class="ico">📡</span>GPX</button>
+  <button class="nb" data-pg="input" onclick="goPage('input');resetForm()"><span class="ico">✏️</span>입력</button>
+  <button class="nb" data-pg="anal" onclick="goPage('anal')"><span class="ico">📈</span>분석</button>
+  <button class="nb" data-pg="set" onclick="goPage('set')"><span class="ico">⚙️</span>설정</button>
+</div>
+
+<!-- 로딩 오버레이 -->
+<div id="loading">
+  <div class="spin"></div>
+  <div style="color:var(--tx);font-size:14px">로딩 중...</div>
+</div>
+
+<!-- 토스트 메시지 -->
+<div id="toast"></div>
+
+<!-- 모달 -->
+<div id="modal" class="mb">
+  <div class="md">
+    <div class="md-msg" id="modal-msg"></div>
+    <div class="md-btns">
+      <button class="md-no" onclick="closeModal()">취소</button>
+      <button class="md-ok" onclick="confirmModal()">확인</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ════════════════════════════════════════
+  //  상수 / 유틸
+  // ════════════════════════════════════════
+  const KG='jv-goals', KSB='jv-sb', KLO='jv-local', KD='jv-ded', KCX='jv-ctx-ver';
+  const localDate = (d=new Date()) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth()+1).padStart(2,'0');
+    const day = String(d.getDate()).padStart(2,'0');
+    return `${y}-${m}-${day}`;
+  };
+  const localMonth = (d=new Date()) => localDate(d).slice(0,7);
+  const td = () => localDate();
+  const fmt = n => n==null ? '-' : Number(n).toLocaleString('ko-KR');
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const sv = (id,v) => { const e=document.getElementById(id); if(e) e.value=v; };
+  const st = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=v; };
+  const gv = id => { const e=document.getElementById(id); return e?e.value:''; };
+  const lsave = (k,v) => { try{ localStorage.setItem(k,JSON.stringify(v)); }catch{} };
+  const lload = k => { try{ const r=localStorage.getItem(k); return r?JSON.parse(r):null; }catch{ return null; } };
+  const ssave = (k,v) => { try{ sessionStorage.setItem(k,JSON.stringify(v)); }catch{} };
+  const sload = k => { try{ const r=sessionStorage.getItem(k); return r?JSON.parse(r):null; }catch{ return null; } };
+  const normalizeUrl = url => String(url||'').trim().replace(/\/+$/,'');
+
+  let goals = {daily:150000, monthly:4500000};
+  let magiContext = null;
+  let claudeKey = '';       // 브라우저에는 실제 API 키를 보관하지 않는다.
+  let pipelineTimer = null;    // Polling 타이머
+  let ded = {ins:7945, loan:0, chg:0, dep:0, etc:0};  // 공제 항목
+  let sbUrl='', sbKey='';
+  let serverUrl = ''; // 백엔드 서버 URL (설정에서 입력)
+  let editId=null, wxSel='☀️', modalCb=null, ocrData=null;
+  let localRecords=[]; // Supabase 미연결 시 폴백
+
+  // ════════════════════════════════════════
+  //  Supabase API
+  // ════════════════════════════════════════
+  async function sbReq(method, path, body=null, params={}){
+    if(!sbUrl||!sbKey) return null;
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([k,v]) => {
+      (Array.isArray(v) ? v : [v]).forEach(val => query.append(k, val));
+    });
+    const qStr = query.toString() ? '?'+query.toString() : '';
+    const url = `${sbUrl}/rest/v1/${path}${qStr}`;
+    const headers = {
+      'apikey': sbKey,
+      'Authorization': 'Bearer '+sbKey,
+      'Content-Type': 'application/json',
+    };
+    // POST/PATCH는 Prefer 헤더 추가
+    if(method === 'POST') headers['Prefer'] = 'return=representation';
+    if(method === 'PATCH' || method === 'DELETE') headers['Prefer'] = 'return=minimal';
+    const res = await fetch(url, { method, headers, body: body?JSON.stringify(body):null });
+    if(!res.ok){
+      const errText = await res.text();
+      let errMsg = errText;
+      try { errMsg = JSON.parse(errText).message || errText; } catch{}
+      throw new Error(`Supabase ${method} ${path}: ${errMsg}`);
+    }
+    const text = await res.text();
+    return text ? JSON.parse(text) : [];
+  }
+
+  async function sbSelect(table, params={}){ return await sbReq('GET', table, null, params) || []; }
+  async function sbInsert(table, data){ return await sbReq('POST', table, data); }
+  async function sbUpdate(table, id, data){ return await sbReq('PATCH', `${table}?id=eq.${id}`, data); }
+  async function sbDelete(table, id){ return await sbReq('DELETE', `${table}?id=eq.${id}`); }
+
+  // ════════════════════════════════════════
+  //  백엔드 서버 API
+  // ════════════════════════════════════════
+  async function backendReq(path, method='GET', body=null) {
+    if (!serverUrl) {
+      toast('백엔드 서버 URL이 설정되지 않았습니다.', 'warn');
+      return null;
+    }
+    const url = `${serverUrl}${path}`;
+    try {
+      const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : null });
+      if (!res.ok) {
+        const e = await res.text();
+        throw new Error(e);
+      }
+      const text = await res.text();
+      return text ? JSON.parse(text) : null;
+    } catch (e) {
+      console.error('백엔드 오류:', e.message);
+      toast(`백엔드 오류: ${e.message}`, 'err');
+      return null;
+    }
+  }
+
+  async function sbGetGoals() { return await backendReq('/get_goals'); }
+  async function sbSetGoals(daily, monthly) { return await backendReq('/set_goals', 'POST', { daily, monthly }); }
+
+  async function sbGetDeductions() { return await backendReq('/get_deductions'); }
+  async function sbSetDeductions(ins, loan, chg, dep, etc) { return await backendReq('/set_deductions', 'POST', { ins, loan, chg, dep, etc }); }
+
+  async function sbGetClaudeKey() { return await backendReq('/get_claude_key'); }
+  async function sbSetClaudeKey(key) { return await backendReq('/set_claude_key', 'POST', { key }); }
+
+  async function sbGetServerUrl() { return normalizeUrl(lload('jv-server-url') || ''); }
+  async function sbSetServerUrl(url) {
+    serverUrl = normalizeUrl(url);
+    lsave('jv-server-url', serverUrl);
+    return { success:true, url:serverUrl };
+  }
+
+  // ════════════════════════════════════════
+  //  연결 상태 표시
+  // ════════════════════════════════════════
+  function setSbStatus(connected){
+    const dot = document.getElementById('sb-dot');
+    const lbl = document.getElementById('sb-lbl');
+    if(connected){
+      dot.classList.remove('off'); lbl.textContent='연결됨';
+    } else {
+      dot.classList.add('off'); lbl.textContent='미연결';
+    }
+    const banner = document.getElementById('setup-banner');
+    if(banner) banner.classList.toggle('on', !connected && !sbUrl);
+  }
+
+  // ════════════════════════════════════════
+  //  페이지 전환
+  // ════════════════════════════════════════
+  function goPage(pg){
+    document.querySelectorAll('.page').forEach(e=>e.classList.remove('on'));
+    document.querySelectorAll('.nb').forEach(b=>b.classList.toggle('on',b.dataset.pg===pg));
+    const p = document.getElementById('pg-'+pg);
+    if(p) p.classList.add('on');
+    if(pg==='history') renderHist();
+    if(pg==='anal')    renderAnal();
+    if(pg==='home')    renderHome();
+    if(pg==='set')     renderSetPage();
+  }
+
+  // ════════════════════════════════════════
+  //  토스트 / 모달 / 로딩
+  // ════════════════════════════════════════
+  let toastT;
+  function toast(msg, type='ok'){
+    const e = document.getElementById('toast');
+    e.textContent=msg;
+    e.style.background = type==='err'?'#7f1d1d':type==='warn'?'#78350f':'#052e16';
+    e.style.color = type==='err'?'#fca5a5':type==='warn'?'#fcd34d':'#86efac';
+    e.style.display='block';
+    clearTimeout(toastT);
+    toastT = setTimeout(()=>e.style.display='none', 2600);
+  }
+  function openModal(msg,cb){ document.getElementById('modal-msg').textContent=msg; document.getElementById('modal').classList.add('on'); modalCb=cb; }
+  function confirmModal(){ document.getElementById('modal').classList.remove('on'); if(modalCb) modalCb(); }
+  function closeModal(){ document.getElementById('modal').classList.remove('on'); modalCb=null; }
+  function showLoading(on){ document.getElementById('loading').classList.toggle('on',on); }
+
+  // ════════════════════════════════════════
+  //  주 시작 / diff 뱃지
+  // ════════════════════════════════════════
+  function wkStart(ds){
+    const d=new Date(ds), day=d.getDay(), diff=d.getDate()-day+(day===0?-6:1);
+    d.setDate(diff);
+    return localDate(d);
+  }
+  function db(diff){
+    if(diff===null||diff===undefined) return '<span class="nm">-</span>';
+    return `<span class="${diff>=0?'up':'dn'}">${diff>=0?'▲ ':'▼ '}${fmt(Math.abs(diff))}원</span>`;
+  }
+  const sumFare = rows => (rows||[]).reduce((s,r)=>s+(Number(r.요금)||0),0);
+  const endOfMonth = mo => localDate(new Date(Number(mo.slice(0,4)), Number(mo.slice(5,7)), 0));
+
+  // ════════════════════════════════════════
+  //  홈 렌더
+  // ════════════════════════════════════════
+  async function renderHome(){
+    showLoading(true);
+    try {
+      const today = td(), mo = today.slice(0,7);
+      const monthStart = mo+'-01', monthEnd = endOfMonth(mo);
+      const wk0 = wkStart(today);
+      const wkEndDate = new Date(wk0); wkEndDate.setDate(wkEndDate.getDate()+6);
+      const wkEnd = localDate(wkEndDate);
+      const lastWeekDate = new Date(); lastWeekDate.setDate(lastWeekDate.getDate()-7);
+      const lwd = localDate(lastWeekDate);
+      const lwStart = wkStart(lwd);
+      const lwEndDate = new Date(lwStart); lwEndDate.setDate(lwEndDate.getDate()+6);
+      const lwEnd = localDate(lwEndDate);
+
+      // 오늘 매출
+      let todayRecs=[], monthRecs=[], weekRecs=[], lastWeekRecs=[];
+      if(sbUrl && sbKey){
+        [todayRecs, monthRecs, weekRecs, lastWeekRecs] = await Promise.all([
+          sbSelect('raw_calls', {'날짜':'eq.'+today, 'order':'배차시각.asc'}),
+          sbSelect('raw_calls', {'날짜':['gte.'+monthStart, 'lte.'+monthEnd], 'order':'날짜.asc'}),
+          sbSelect('raw_calls', {'날짜':['gte.'+wk0, 'lte.'+wkEnd], 'order':'날짜.asc'}),
+          sbSelect('raw_calls', {'날짜':['gte.'+lwStart, 'lte.'+lwEnd], 'order':'날짜.asc'})
+        ]);
+      } else {
+        const all = lload(KLO)||[];
+        todayRecs    = all.filter(r=>r.날짜===today);
+        monthRecs    = all.filter(r=>r.날짜&&r.날짜.startsWith(mo));
+        weekRecs     = all.filter(r=>r.날짜>=wk0 && r.날짜<=wkEnd);
+        lastWeekRecs = all.filter(r=>r.날짜>=lwStart && r.날짜<=lwEnd);
+      }
+
+      const todayTotal = sumFare(todayRecs);
+      const monthTotal = sumFare(monthRecs);
+      const weekTotal  = sumFare(weekRecs);
+      const lwTotal    = sumFare(lastWeekRecs);
+
+      const tRate = goals.daily  ? Math.round(todayTotal/goals.daily*100)  : 0;
+      const mRate = goals.monthly? Math.round(monthTotal/goals.monthly*100): 0;
+
+      st('h-today', fmt(todayTotal));
+      st('h-dg', fmt(goals.daily));
+      st('h-tr', tRate+'%');
+      document.getElementById('h-tr').style.color = tRate>=100?'var(--green)':'var(--gold)';
+      document.getElementById('h-tbar').style.width = Math.min(100,tRate)+'%';
+
+      st('h-month', fmt(monthTotal));
+      st('h-md', monthRecs.length);
+      st('h-mg', fmt(goals.monthly));
+      st('h-mr', mRate+'%');
+      document.getElementById('h-mr').style.color = mRate>=100?'var(--green)':'var(--blue)';
+      document.getElementById('h-mbar').style.width = Math.min(100,mRate)+'%';
+
+      // 월간 누적산출 (아르고스 #019 승인 사양) — raw_calls 기준 집계, daily_summary 미의존
+      {
+        const CUM_TARGET = 200;
+        const cumCount = monthRecs.length;
+        const cumPct = CUM_TARGET ? Math.round(cumCount/CUM_TARGET*100) : 0;
+        const workDays = new Set(monthRecs.map(r=>r.날짜).filter(Boolean)).size;
+        const runRate = workDays ? (cumCount/workDays).toFixed(1) : '0.0';
+        const moLabel = Number(mo.slice(5,7));
+        st('h-cum', `${moLabel}월 누적: ${cumCount}건 / 목표 ${CUM_TARGET}건 (${cumPct}%) | 영업일 ${workDays}일 | run-rate ${runRate}건/일`);
+      }
+
+      st('h-week', fmt(weekTotal)+'원');
+      st('h-wd', weekRecs.length);
+      st('h-lw', fmt(lwTotal));
+      document.getElementById('h-wdiff').innerHTML = lwTotal ? db(weekTotal-lwTotal) : '<span class="nm">비교 없음</span>';
+
+      const todayStr = today + ' · ' + (todayRecs.length||0)+'건';
+      document.getElementById('hd-sub').textContent = todayStr;
+
+    // 오늘 효율지표 로드
+    if(sbUrl && sbKey) {
+      const summary = await sbSelect('daily_summary', {'날짜':'eq.'+today});
+      if(summary && summary[0] && summary[0].구속시간당_매출) {
+        updateHomeEff({
+          구속시간당_매출: summary[0].구속시간당_매출,
+          구속시간_h: summary[0].구속시간_h,
+          주행거리_km: summary[0].총주행거리_km,
+          공차율: summary[0].공차율
+        });
+      }
+    }
+
+      // 충전비: expenses 테이블에서 오늘 충전비 조회
+      let todayCharge = 0;
+      if(sbUrl && sbKey){
+        const exps = await sbSelect('expenses',{'날짜':'eq.'+today,'카테고리':'eq.전기차충전'});
+        todayCharge = exps.reduce((s,e)=>s+(e.금액||0),0);
+      }
+      updateNetCard(todayTotal, todayCharge);
+
+    } catch(e) {
+      toast('데이터 로딩 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  // ════════════════════════════════════════
+  //  입력 폼
+  // ════════════════════════════════════════
+  function setWx(btn, val){
+    wxSel=val;
+    document.querySelectorAll('.wb').forEach(b=>b.classList.toggle('on',b===btn));
+  }
+  function calcT(){
+    const t = ['f-kk','f-cd','f-cs','f-ot'].reduce((s,id)=>{
+      const e=document.getElementById(id); return s+(e?Number(e.value)||0:0);
+    },0);
+    st('f-tot', fmt(t));
+  }
+  function resetForm(){
+    editId=null;
+    sv('f-date',td()); sv('f-st','18:30'); sv('f-et','00:30');
+    ['f-kk','f-cd','f-cs','f-ot','f-fuel','f-memo'].forEach(id=>sv(id,''));
+    st('f-tot','0'); st('form-ttl','✏️ 매출 입력'); st('f-savebtn','저장하기');
+    wxSel='☀️';
+    document.querySelectorAll('.wb').forEach((b,i)=>b.classList.toggle('on',i===0));
+  }
+
+  async function saveRec(){
+    const date=gv('f-date');
+    if(!date){ toast('날짜를 입력해주세요','err'); return; }
+    const kk=Number(gv('f-kk'))||0, cd=Number(gv('f-cd'))||0;
+    const cs=Number(gv('f-cs'))||0, ot=Number(gv('f-ot'))||0;
+    const total=kk+cd+cs+ot;
+    if(!total){ toast('매출을 하나 이상 입력해주세요','err'); return; }
+
+    const dow = ['일','월','화','수','목','금','토'][new Date(date).getDay()];
+    const recBase = {
+      날짜:date, 요일:dow,
+      배차시각: gv('f-st')||'00:00',
+      요금: total,
+      콜유형: kk>0 ? '카카오T' : '배회',
+      비고: [kk?`카카오${fmt(kk)}`:'', cd?`카드${fmt(cd)}`:'' , cs?`현금${fmt(cs)}`:'' , ot?`기타${fmt(ot)}`:'' , gv('f-memo')].filter(Boolean).join(' / ')
+    };
+    const rec = {
+      ...recBase,
+      카카오매출: kk,
+      카드매출: cd,
+      현금매출: cs,
+      기타매출: ot,
+      메모: gv('f-memo')
+    };
+
+    showLoading(true);
+    try {
+      if(sbUrl && sbKey){
+        if(editId){
+          try { await sbUpdate('raw_calls', editId, rec); }
+          catch(e) {
+            if(String(e.message).includes('column') || String(e.message).includes('카카오매출')) await sbUpdate('raw_calls', editId, recBase);
+            else throw e;
+          }
+          toast('수정 완료!');
+        } else {
+          let inserted;
+          try { inserted = await sbInsert('raw_calls', rec); }
+          catch(e) {
+            if(String(e.message).includes('column') || String(e.message).includes('카카오매출')) inserted = await sbInsert('raw_calls', recBase);
+            else throw e;
+          }
+          if(inserted === null) throw new Error('저장 실패 — Supabase 응답 없음');
+          toast('저장 완료! 🚕');
+        }
+      } else {
+        // 로컬 폴백
+        let all = lload(KLO)||[];
+        if(editId){ all=all.map(r=>r.id===editId?{...rec,id:editId}:r); }
+        else { all.push({...rec,id:Date.now()}); }
+        lsave(KLO,all);
+        toast(editId?'수정 완료!':'저장 완료! 🚕 (로컬 저장)', 'warn');
+      }
+      editId=null; resetForm(); goPage('home');
+    } catch(e) {
+      toast('저장 오류: '+e.message,'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  // ════════════════════════════════════════
+  //  기록
+  // ════════════════════════════════════════
+  async function renderHist(){
+    const mo=gv('hist-mo');
+    const el=document.getElementById('hist-list');
+    el.innerHTML='<div style="text-align:center;color:var(--mu);padding:20px">불러오는 중...</div>';
+    showLoading(true);
+    try {
+      let recs=[];
+      if(sbUrl && sbKey){
+        recs = await sbSelect('raw_calls',{
+          '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
+          'order':'날짜.desc,배차시각.desc'
+        });
+      } else {
+        recs = (lload(KLO)||[]).filter(r=>r.날짜&&r.날짜.startsWith(mo));
+        recs.sort((a,b)=>b.날짜.localeCompare(a.날짜));
+      }
+      if(!recs.length){ el.innerHTML='<div style="text-align:center;color:var(--mu);padding:40px">기록 없음</div>'; return; }
+      el.innerHTML = recs.map(r=>`
+        <div class="rc">
+          <div class="rc-d">${esc(r.날짜)} ${esc(r.요일)} ${esc(r.배차시각)} ${esc(r.콜유형)}</div>
+          <div class="rc-a">${fmt(r.요금)}원</div>
+          <div class="rc-dt">${esc(r.비고)}</div>
+          <div class="rc-btns">
+            <button class="rce" onclick="editRec(${r.id||0})">수정</button>
+            <button class="rcx" onclick="delRec(${r.id||0})">삭제</button>
+          </div>
+        </div>`).join('');
+    } catch(e){ el.innerHTML='<div style="color:var(--red);padding:20px">오류: '+e.message+'</div>'; }
+    finally { showLoading(false); }
+  }
+
+  async function editRec(id){
+    editId=id;
+    let rec = null;
+    showLoading(true);
+    try {
+      if(sbUrl && sbKey){
+        const rows = await sbSelect('raw_calls', {'id':'eq.'+id});
+        rec = rows && rows[0] ? rows[0] : null;
+      } else {
+        rec = (lload(KLO)||[]).find(r=>r.id===id);
+      }
+    } catch(e) {
+      toast('기록 조회 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+
+    if(rec){
+      goPage('input');
+      requestAnimationFrame(()=>{
+        sv('f-date', rec.날짜||'');
+        // 배차시각: 'HH:MM' 형식 (콜론 구분)
+        const timeParts = (rec.배차시각||'18:30').split(':');
+        sv('f-st', timeParts.length >= 2 ? timeParts[0]+':'+timeParts[1] : '18:30');
+        sv('f-et', '00:30');
+        let kk=Number(rec.카카오매출)||0, cd=Number(rec.카드매출)||0, cs=Number(rec.현금매출)||0, ot=Number(rec.기타매출)||0, memo=rec.메모||'';
+        if(!kk && !cd && !cs && !ot && !memo) {
+          const memoParts = (rec.비고||'').split(' / ');
+          memoParts.forEach(p=>{
+            if(p.startsWith('카카오')) kk = Number(p.replace('카카오','').replace('원','').replace(/,/g,''))||0;
+            else if(p.startsWith('카드')) cd = Number(p.replace('카드','').replace('원','').replace(/,/g,''))||0;
+            else if(p.startsWith('현금')) cs = Number(p.replace('현금','').replace('원','').replace(/,/g,''))||0;
+            else if(p.startsWith('기타')) ot = Number(p.replace('기타','').replace('원','').replace(/,/g,''))||0;
+            else if(p.trim()) memo = p;
+          });
+        }
+        // 매출 구분 복원 안 되면 전체 요금으로 대입
+        if(!kk && !cd && !cs && !ot && rec.요금) {
+          rec.콜유형 === '카카오T' ? sv('f-kk', rec.요금) : sv('f-kk', rec.요금);
+        } else {
+          sv('f-kk', kk||''); sv('f-cd', cd||''); sv('f-cs', cs||''); sv('f-ot', ot||'');
+        }
+        sv('f-memo', memo);
+        calcT();
+        st('form-ttl', '📝 매출 수정');
+        st('f-savebtn', '수정하기');
+      });
+    } else {
+      toast('기록을 찾을 수 없습니다.', 'err');
+    }
+  }
+
+  function delRec(id){
+    openModal('정말 삭제하시겠습니까?', async ()=>{
+      showLoading(true);
+      try {
+        if(sbUrl && sbKey){
+          await sbDelete('raw_calls', id);
+          toast('삭제 완료!');
+        } else {
+          let all = lload(KLO)||[];
+          all = all.filter(r=>r.id!==id);
+          lsave(KLO,all);
+          toast('삭제 완료! (로컬 저장)', 'warn');
+        }
+        renderHist();
+      } catch(e) {
+        toast('삭제 오류: '+e.message, 'err');
+      } finally {
+        showLoading(false);
+      }
+    });
+  }
+
+  // ════════════════════════════════════════
+  //  분석 렌더
+  // ════════════════════════════════════════
+  let monthlyChart, dailyChart, hourlyChart;
+
+  async function renderAnal(){
+    showLoading(true);
+    try {
+      const mo = gv('anal-mo');
+      let recs = [];
+      if(sbUrl && sbKey){
+        recs = await sbSelect('raw_calls',{
+          '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
+          'order':'날짜.asc,배차시각.asc'
+        }) || [];
+      } else {
+        recs = (lload(KLO)||[]).filter(r=>r.날짜&&r.날짜.startsWith(mo));
+      }
+
+      const total   = recs.reduce((s,r)=>s+(r.요금||0),0);
+      const days    = new Set(recs.map(r=>r.날짜)).size;
+      const avg     = days ? Math.round(total/days) : 0;
+      const perCall = recs.length ? Math.round(total/recs.length) : 0;
+
+      // 요약
+      const el = id => document.getElementById(id);
+      if(el('an-total')) el('an-total').textContent = fmt(total)+'원';
+      if(el('an-days'))  el('an-days').textContent  = days+'일 / '+recs.length+'건';
+      if(el('an-avg'))   el('an-avg').textContent   = fmt(avg)+'원';
+      if(el('an-per'))   el('an-per').textContent   = fmt(perCall)+'원';
+
+      // 효율지표 (daily_summary)
+      if(sbUrl && sbKey){
+        const summaries = await sbSelect('daily_summary',{'날짜':['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],'order':'날짜.asc'}) || [];
+        if(summaries.length){
+          const avgEff = Math.round(summaries.reduce((s,r)=>s+(r.구속시간당_매출||0),0)/summaries.length);
+          const avgCha = Math.round(summaries.reduce((s,r)=>s+(r.공차율||0),0)/summaries.length*10)/10;
+          const avgH   = Math.round(summaries.reduce((s,r)=>s+(r.구속시간_h||0),0)/summaries.length*10)/10;
+          if(el('an-eff-card')) el('an-eff-card').style.display='block';
+          if(el('an-eff-rows')) el('an-eff-rows').innerHTML = [
+            ['구속시간당 매출', fmt(avgEff)+'원/h', 'var(--green)'],
+            ['평균 공차율', avgCha+'%', 'var(--mu)'],
+            ['평균 구속시간', avgH+'h', 'var(--blue)'],
+          ].map(([l,v,c])=>`<div style="text-align:center"><div style="font-size:10px;color:var(--mu)">${l}</div><div style="font-size:16px;font-weight:700;color:${c}">${v}</div></div>`).join('');
+        }
+      }
+
+      // ── 요일별 실적 ──
+      const DOW_LABEL = ['일','월','화','수','목','금','토'];
+      const DOW_COLOR = ['#f5c518','#3b82f6','#3b82f6','#3b82f6','#3b82f6','#22c55e','#22c55e'];
+      const dowData = Array(7).fill(null).map(()=>({total:0,count:0}));
+      recs.forEach(r=>{
+        const d = new Date(r.날짜+'T12:00:00').getDay();
+        dowData[d].total += r.요금||0;
+        dowData[d].count++;
+      });
+      const dowMax = Math.max(...dowData.map(d=>d.count>0?Math.round(d.total/d.count):0),1);
+      const dowEl = el('an-dow-bars');
+      if(dowEl) dowEl.innerHTML = DOW_LABEL.map((lbl,i)=>{
+        const avg2 = dowData[i].count>0?Math.round(dowData[i].total/dowData[i].count):0;
+        const pct  = Math.round(avg2/dowMax*100);
+        const color = DOW_COLOR[i];
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <span style="width:20px;font-size:12px;font-weight:700;color:${color};text-align:center">${lbl}</span>
+          <div style="flex:1;background:var(--bg3);border-radius:4px;height:22px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:${color};border-radius:4px;min-width:${pct>0?4:0}px;transition:width .6s ease"></div>
+          </div>
+          <span style="width:80px;font-size:12px;font-weight:600;text-align:right">${avg2?fmt(avg2)+'원':'-'}</span>
+          <span style="width:24px;font-size:10px;color:var(--mu);text-align:right">${dowData[i].count}건</span>
+        </div>`;
+      }).join('');
+
+      // ── 시간대별 콜 분포 ──
+      const hourData = Array(24).fill(0);
+      recs.forEach(r=>{
+        const h = parseInt((r.배차시각||'').split(':')[0]);
+        if(h>=0&&h<24) hourData[h]++;
+      });
+      const hourMax = Math.max(...hourData,1);
+      const hourEl = el('an-hour-bars');
+      const HOUR_GROUPS = [
+        {label:'새벽 00~06', range:[0,1,2,3,4,5], color:'#a78bfa'},
+        {label:'오전 06~12', range:[6,7,8,9,10,11], color:'#3b82f6'},
+        {label:'오후 12~18', range:[12,13,14,15,16,17], color:'#22c55e'},
+        {label:'저녁 18~24', range:[18,19,20,21,22,23], color:'#f5c518'},
+      ];
+      if(hourEl) hourEl.innerHTML = HOUR_GROUPS.map(g=>{
+        const cnt = g.range.reduce((s,h)=>s+hourData[h],0);
+        const topH = g.range.reduce((best,h)=>hourData[h]>hourData[best]?h:best, g.range[0]);
+        const pct  = Math.round(cnt/recs.length*100)||0;
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span style="width:90px;font-size:11px;color:${g.color};font-weight:600">${g.label}</span>
+          <div style="flex:1;background:var(--bg3);border-radius:4px;height:22px;overflow:hidden">
+            <div style="width:${pct}%;height:100%;background:${g.color};border-radius:4px;transition:width .6s ease"></div>
+          </div>
+          <span style="width:50px;font-size:12px;font-weight:700;text-align:right">${cnt}건</span>
+          <span style="width:32px;font-size:10px;color:var(--mu);text-align:right">${pct}%</span>
+        </div>`;
+      }).join('');
+
+      // ── 콜유형 비율 ──
+      const typeMap = {};
+      recs.forEach(r=>{ const t=r.콜유형||'미분류'; typeMap[t]=(typeMap[t]||0)+(r.요금||0); });
+      const typeTotal = Object.values(typeMap).reduce((a,b)=>a+b,1);
+      const TYPE_COLOR = {'카카오T':'var(--gold)','배회':'var(--blue)','미분류':'var(--mu)'};
+      const typeEl = el('an-type-rows');
+      if(typeEl) typeEl.innerHTML = Object.entries(typeMap).sort((a,b)=>b[1]-a[1]).map(([t,v])=>{
+        const pct = Math.round(v/typeTotal*100);
+        const color = TYPE_COLOR[t]||'var(--sub)';
+        return `<div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+            <span style="color:${color};font-weight:600">${esc(t)}</span>
+            <span>${fmt(v)}원 (${pct}%)</span>
+          </div>
+          <div style="background:var(--bg3);border-radius:4px;height:8px">
+            <div style="width:${pct}%;height:100%;background:${color};border-radius:4px;transition:width .6s ease"></div>
+          </div>
+        </div>`;
+      }).join('');
+
+      // ── 일별 매출 리스트 ──
+      const byDay = {};
+      recs.forEach(r=>{ byDay[r.날짜]=(byDay[r.날짜]||{total:0,cnt:0}); byDay[r.날짜].total+=r.요금||0; byDay[r.날짜].cnt++; });
+      const dailyEl = el('an-daily-list');
+      if(dailyEl){
+        const sorted = Object.entries(byDay).sort((a,b)=>b[0].localeCompare(a[0]));
+        if(!sorted.length){ dailyEl.innerHTML='<div style="text-align:center;color:var(--mu);padding:20px">데이터 없음</div>'; }
+        else dailyEl.innerHTML = sorted.map(([date,d])=>{
+          const dow = DOW_LABEL[new Date(date+'T12:00:00').getDay()];
+          const bar = Math.round(d.total/Math.max(...sorted.map(x=>x[1].total))*100);
+          return `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd)">
+            <span style="font-size:12px;color:var(--mu);width:70px">${esc(date.slice(5))} (${esc(dow)})</span>
+            <div style="flex:1;background:var(--bg3);border-radius:3px;height:16px;overflow:hidden">
+              <div style="width:${bar}%;height:100%;background:var(--gold);border-radius:3px"></div>
+            </div>
+            <span style="font-size:13px;font-weight:700;width:75px;text-align:right">${fmt(d.total)}원</span>
+            <span style="font-size:10px;color:var(--mu);width:20px;text-align:right">${d.cnt}건</span>
+          </div>`;
+        }).join('');
+      }
+
+    } catch(e){
+      console.error('분석 오류:', e);
+      toast('분석 오류: '+e.message, 'err');
+    } finally { showLoading(false); }
+  }
+
+
+  function renderChart(canvasId, type, labels, data, title){
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    const chartConfig = {
+      type: type,
+      data: {
+        labels: labels,
+        datasets: [{
+          label: title,
+          data: data,
+          backgroundColor: type === 'bar' ? 'rgba(59, 130, 246, 0.6)' : 'rgba(59, 130, 246, 0.2)' ,
+          borderColor: 'rgba(59, 130, 246, 1)' ,
+          borderWidth: 1,
+          fill: type === 'line'
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          title: { display: true, text: title, color: 'var(--tx)' }
+        },
+        scales: {
+          x: { ticks: { color: 'var(--sub)' }, grid: { color: 'var(--bd)' } },
+          y: { ticks: { color: 'var(--sub)' }, grid: { color: 'var(--bd)' } }
+        }
+      }
+    };
+
+    if (window[canvasId+'Chart']) {
+      window[canvasId+'Chart'].destroy();
+    }
+    window[canvasId+'Chart'] = new Chart(ctx, chartConfig);
+  }
+
+  // ════════════════════════════════════════
+  //  설정 페이지 렌더
+  // ════════════════════════════════════════
+  async function renderSetPage(){
+    checkPipelineStatus();
+    const ckEl = document.getElementById('claude-key-inp');
+    if(ckEl) ckEl.value='';
+    const ckStatus = document.getElementById('claude-key-status');
+    if(ckStatus) ckStatus.textContent = serverUrl ? 'API 키는 백엔드 서버에만 저장됩니다.' : '백엔드 서버 URL을 먼저 설정해주세요.';
+    // 저장된 설정값 복원
+    const sbConf = sload(KSB);
+    if(sbConf){
+      const urlEl = document.getElementById('sb-url');
+      const keyEl = document.getElementById('sb-key');
+      if(urlEl) urlEl.value = sbConf.url||'';
+      if(keyEl) keyEl.value = sbConf.key||'';
+    }
+    const svEl = document.getElementById('server-url');
+    if(svEl && serverUrl) svEl.value = serverUrl;
+    // 목표 설정 복원
+    const gdEl = document.getElementById('goal-daily');
+    const gmEl = document.getElementById('goal-monthly');
+    if(gdEl) gdEl.value = goals.daily||150000;
+    if(gmEl) gmEl.value = goals.monthly||4500000;
+    sv('sb-url', sbUrl);
+    sv('sb-key', sbKey);
+    sv('server-url', serverUrl);
+    sv('goal-daily', goals.daily);
+    sv('goal-monthly', goals.monthly);
+    sv('ded-ins', ded.ins);
+    sv('ded-loan', ded.loan);
+    sv('ded-chg', ded.chg);
+    sv('ded-dep', ded.dep);
+    sv('ded-etc', ded.etc);
+  }
+
+  // ════════════════════════════════════════
+  //  설정 저장
+  // ════════════════════════════════════════
+  async function saveSettings(){
+    const newSbUrl = normalizeUrl(gv('sb-url'));
+    const newSbKey = gv('sb-key');
+    if(!newSbUrl || !newSbKey){ toast('Supabase URL과 Key를 모두 입력해주세요.','err'); return; }
+    sbUrl = newSbUrl;
+    sbKey = newSbKey;
+    lsave(KSB, {url:sbUrl, key:sbKey});
+    await initSupabase();
+    toast('Supabase 설정 저장 완료!');
+    goPage('home');
+  }
+
+  async function saveServerUrl(){
+    const newServerUrl = normalizeUrl(gv('server-url'));
+    if(!newServerUrl){ toast('백엔드 서버 URL을 입력해주세요.','err'); return; }
+    await sbSetServerUrl(newServerUrl);
+    toast('백엔드 서버 URL 저장 완료!');
+    goPage('home');
+  }
+
+  function saveGoals(){
+    goals.daily = Number(gv('goal-daily'))||0;
+    goals.monthly = Number(gv('goal-monthly'))||0;
+    lsave(KG,goals);
+    toast('목표 저장 완료!');
+    goPage('home');
+  }
+
+  async function saveDed(){
+    ded = {
+      ins: Number(gv('ded-ins'))||0,
+      loan: Number(gv('ded-loan'))||0,
+      chg:  Number(gv('ded-chg')) ||0,
+      dep:  Number(gv('ded-dep')) ||0,
+      etc:  Number(gv('ded-etc')) ||0,
+    };
+    lsave(KD,ded);
+    toast('공제 항목 저장 완료!');
+    updateNetCard();
+    goPage('home');
+  }
+
+  async function saveSbConfig(){
+    const url = normalizeUrl(document.getElementById('sb-url').value);
+    const key = document.getElementById('sb-key').value.trim();
+    if(!url||!key){ toast('URL과 KEY를 모두 입력해주세요','err'); return; }
+    const res = document.getElementById('sb-test-result');
+
+    // ── 1. URL 형식 검증 ──
+    if(!url.startsWith('https://') || !url.includes('supabase.co')){
+      toast('Supabase URL 형식 오류 (https://xxx.supabase.co)', 'err');
+      return;
+    }
+    if(!key.startsWith('sb_publishable_') && !key.startsWith('eyJ')){
+      toast('Supabase Key 형식 오류 (sb_publishable_ 또는 eyJ로 시작)', 'err');
+      return;
+    }
+
+    // ── 2. 저장 ──
+    sbUrl=url; sbKey=key;
+    lsave(KSB,{url,key});
+    setSbStatus(true);
+    toast('Supabase 설정 저장 완료!');
+
+    // ── 2. 연결 테스트 (비동기, 결과만 표시) ──
+    if(res){ res.style.display='block'; res.textContent='연결 확인 중...'; res.style.color='var(--mu)'; }
+    try {
+      const r = await fetch(url+'/rest/v1/raw_calls?limit=1',{
+        headers:{'apikey':key,'Authorization':'Bearer '+key}
+      });
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      if(res){ res.textContent='✅ 연결 확인됨'; res.style.color='var(--green)'; }
+      toast('Supabase 연결 확인! ✅');
+      await loadMagiContext();
+      startPipeline();
+      renderHome();
+    } catch(e){
+      // 연결 테스트 실패해도 설정은 저장된 상태
+      if(res){ res.textContent='⚠️ 저장됨 (연결 미확인: '+e.message+')'; res.style.color='var(--gold)'; }
+    }
+  }
+
+  function clearLocalData(){
+    openModal('로컬 데이터를 모두 삭제하시겠습니까? Supabase에 연결되어 있지 않다면 데이터가 유실됩니다.', ()=>{
+      localStorage.clear();
+      location.reload();
+    });
+  }
+
+  // ════════════════════════════════════════
+  //  OCR
+  // ════════════════════════════════════════
+  document.getElementById('ocr-inp').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const pr = new FileReader();
+    pr.onload = ev => { document.getElementById('ocr-prev').src = ev.target.result; document.getElementById('ocr-prev').style.display='block'; };
+    pr.readAsDataURL(file);
+    document.getElementById('ocr-spin').classList.add('on');
+    document.getElementById('ocr-err').classList.remove('on');
+    document.getElementById('ocr-ok').classList.remove('on');
+    try {
+            // 백엔드 경유 OCR (API 키 서버에만 보관)
+      const b64 = await new Promise((res,rej)=>{ const r2=new FileReader(); r2.onload=()=>res(r2.result.split(',')[1]); r2.onerror=()=>rej(new Error('파일 읽기 실패')); r2.readAsDataURL(file); });
+      let ocrData_raw = null;
+      // 1순위: 봇 서버 경유 (serverUrl 있을 때만)
+      if(serverUrl){
+        try {
+          const ocrResp = await backendReq('/ocr_receipt', 'POST', {
+            image_b64: b64, media_type: file.type||'image/jpeg'
+          });
+          if(ocrResp && ocrResp.success) ocrData_raw = ocrResp.data;
+        } catch(e){ /* 서버 실패 → 폴백으로 */ }
+      }
+      if(!ocrData_raw) throw new Error('OCR 실패: 백엔드 서버 URL을 설정하고 서버 OCR 상태를 확인해주세요');
+      ocrData = ocrData_raw;
+      const ocrIssues = validateOcrData(ocrData);
+      // 수수료: 영수증 표시값 그대로 사용 (카카오가 직접 계산한 값)
+      // 영수증에 없는 경우만 총매출 × 3.02% 추정
+      const ocr_commission = ocrData.commission || 0;
+      const ocr_total_fee  = ocr_commission > 0
+        ? ocr_commission
+        : Math.round((ocrData.total_sales||0) * 0.0302);
+      const ocr_net = (ocrData.total_sales||0) - ocr_total_fee;
+      const fee_note = ocr_commission > 0 ? '영수증 표시값' : '총매출×3.02% 추정';
+
+      // 운행시간: start_time ~ end_time (같으면 '-')
+      const ocr_time = (ocrData.start_time && ocrData.end_time && ocrData.start_time !== ocrData.end_time)
+        ? ocrData.start_time + ' ~ ' + ocrData.end_time
+        : (ocrData.start_time || '-');
+
+      document.getElementById('ocr-rows').innerHTML =
+        '<div class="ocr-r"><span class="ocr-k">날짜</span><span class="ocr-v">'+esc(ocrData.date||'-')+'</span></div>'+
+        '<div class="ocr-r"><span class="ocr-k">총 매출</span><span class="ocr-v">'+fmt(ocrData.total_sales)+'원</span></div>'+
+        '<div class="ocr-r"><span class="ocr-k">수수료 ('+fee_note+')</span><span class="ocr-v" style="color:var(--red)">-'+fmt(ocr_total_fee)+'원</span></div>'+
+        '<div class="ocr-r"><span class="ocr-k">실수령액</span><span class="ocr-v" style="color:var(--green);font-weight:700">'+fmt(ocr_net)+'원</span></div>'+
+        '<div class="ocr-r"><span class="ocr-k">운행 건수</span><span class="ocr-v">'+(ocrData.trip_count||0)+'건</span></div>'+
+        '<div class="ocr-r"><span class="ocr-k">운행 시간</span><span class="ocr-v">'+esc(ocr_time)+'</span></div>'+
+        (ocrIssues.length ? '<div class="ocr-r"><span class="ocr-k">검증 경고</span><span class="ocr-v" style="color:var(--red)">'+esc(ocrIssues.join(' / '))+'</span></div>' : '');
+      document.getElementById('ocr-ok').classList.add('on');
+    } catch(error){
+      document.getElementById('ocr-err').textContent = 'OCR 오류: '+error.message;
+      document.getElementById('ocr-err').classList.add('on');
+    } finally {
+      document.getElementById('ocr-spin').classList.remove('on');
+    }
+  });
+
+  function validateOcrData(data){
+    const issues = [];
+    const amount = Number(data?.total_sales)||0;
+    const trips = Number(data?.trip_count)||0;
+    if(!data?.date || !/^\d{4}-\d{2}-\d{2}$/.test(data.date)) issues.push('날짜 형식이 올바르지 않습니다.');
+    if(amount <= 0) issues.push('총 매출이 0원 이하입니다.');
+    if(amount > 1000000) issues.push('총 매출이 비정상적으로 큽니다.');
+    if(trips < 0 || trips > 80) issues.push('운행 건수가 비정상 범위입니다.');
+    if(data?.start_time && data?.end_time && data.start_time === data.end_time) issues.push('운행 시작/종료 시간이 같습니다.');
+    return issues;
+  }
+
+  async function findDuplicateOcrRecord(data){
+    const date = data?.date;
+    const amount = Number(data?.total_sales)||0;
+    if(!date || !amount) return false;
+    if(sbUrl && sbKey){
+      const rows = await sbSelect('raw_calls', {'날짜':'eq.'+date, '요금':'eq.'+amount, 'limit':'1'});
+      return !!(rows && rows.length);
+    }
+    return (lload(KLO)||[]).some(r=>r.날짜===date && Number(r.요금)===amount);
+  }
+
+  async function saveOcr() {
+    if (!ocrData) { toast('추출된 OCR 데이터가 없습니다.', 'err'); return; }
+    const issues = validateOcrData(ocrData);
+    if(issues.length){ toast('OCR 검증 실패: '+issues[0], 'err'); return; }
+    if(await findDuplicateOcrRecord(ocrData)){ toast('이미 저장된 OCR 기록으로 보입니다.', 'err'); return; }
+
+    const rec = {
+      날짜: ocrData.date,
+      요일: ['일','월','화','수','목','금','토'][new Date(ocrData.date).getDay()],
+      배차시각: '00:00', // OCR 데이터에 없으므로 기본값
+      요금: ocrData.total_sales,
+      콜유형: '카카오T',
+      비고: `OCR 추출: 매출 ${fmt(ocrData.total_sales)}원, 수수료 ${fmt(ocrData.commission)}원, 건수 ${ocrData.trip_count}건`
+    };
+
+    showLoading(true);
+    try {
+      if(sbUrl && sbKey){
+        const ins = await sbInsert('raw_calls', rec);
+        if(ins === null) throw new Error('저장 실패 — Supabase 응답 없음');
+        toast('OCR 데이터 저장 완료!');
+      } else {
+        let all = lload(KLO)||[];
+        all.push({...rec,id:Date.now()});
+        lsave(KLO,all);
+        toast('OCR 데이터 저장 완료! (로컬 저장)', 'warn');
+      }
+      // daily_summary 효율지표 업데이트
+      if(sbUrl && sbKey && rec.날짜){
+        const dayRecs = await sbSelect('raw_calls',{'날짜':'eq.'+rec.날짜}) || [];
+        const dayTotal = dayRecs.reduce((s,r)=>s+(r.요금||0),0);
+        const dayCount = dayRecs.length;
+        await sbReq('POST','daily_summary',{
+          날짜: rec.날짜,
+          총매출: dayTotal,
+          총콜수: dayCount,
+          건당단가: dayCount ? Math.round(dayTotal/dayCount) : 0
+        }, {}, {'Prefer':'resolution=merge-duplicates,return=minimal'});
+      }
+      cancelOcr();
+      goPage('home');
+    } catch(e) {
+      toast('OCR 데이터 저장 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  function cancelOcr() {
+    document.getElementById('ocr-inp').value = '';
+    document.getElementById('ocr-prev').style.display = 'none';
+    document.getElementById('ocr-spin').classList.remove('on');
+    document.getElementById('ocr-err').classList.remove('on');
+    document.getElementById('ocr-ok').classList.remove('on');
+    ocrData = null;
+  }
+
+  // ════════════════════════════════════════
+  //  어군 브리핑
+  // ════════════════════════════════════════
+  async function getFishReport() {
+    showLoading(true);
+    try {
+      const now = new Date();
+      const h   = now.getHours();
+      const dow = ['일','월','화','수','목','금','토'][now.getDay()];
+
+      // 시간대별 실측 데이터 (5월 후반 기준)
+      const HOUR_DATA = {
+        18:{kakao:8,  baehoe:1,  bPct:11},
+        19:{kakao:48, baehoe:3,  bPct:6},
+        20:{kakao:46, baehoe:4,  bPct:8},
+        21:{kakao:50, baehoe:1,  bPct:2},
+        22:{kakao:51, baehoe:9,  bPct:15},
+        23:{kakao:52, baehoe:8,  bPct:13},
+        0: {kakao:45, baehoe:9,  bPct:17},
+        1: {kakao:17, baehoe:9,  bPct:35},
+        2: {kakao:11, baehoe:4,  bPct:27},
+        3: {kakao:6,  baehoe:2,  bPct:25},
+        4: {kakao:2,  baehoe:2,  bPct:50},
+      };
+
+      const hd = HOUR_DATA[h] || {kakao:5, baehoe:2, bPct:15};
+      const totalH = (hd.kakao + hd.baehoe) || 1;
+      const kPct   = 100 - hd.bPct;
+
+      // 신뢰도 계산
+      const stars = n => n >= 5 ? '★★★' : n >= 3 ? '★★' : '★';
+      const kStars = stars(hd.kakao);
+      const bStars = stars(hd.baehoe);
+
+      // 카카오 콜 간격 추정 (8시간 기준)
+      const kInterval = hd.kakao > 0 ? Math.round(60 / (hd.kakao / 8)) : 99;
+
+      // 배회 앵커 (시간대 기반)
+      const BAEHOE_ANCHOR = {
+        night: ['중구 성내·삼덕·동인', '동구 신암2·4동'],
+        late:  ['북구 침산↔복현 왕복', '북구 노원동'],
+        dawn:  ['북구 노원동', '중구 동인동'],
+      };
+      const anchor = h >= 22 && h <= 23 ? BAEHOE_ANCHOR.night
+                   : h >= 0  && h <= 2  ? [...BAEHOE_ANCHOR.night, ...BAEHOE_ANCHOR.late]
+                   : h >= 3  ? BAEHOE_ANCHOR.dawn
+                   : BAEHOE_ANCHOR.night;
+
+      // 의사결정 트리
+      let decision = '', recDetail = '';
+      if(h >= 19 && h <= 21){
+        decision = '카카오 우선 대기';
+        recDetail = `배회 ${hd.bPct}% 미만 — 콜 대기가 합리적\n수락률 100% 유지`;
+      } else if(h >= 22 && h <= 23){
+        decision = '카카오 우선 + 배회도 수용';
+        recDetail = `배회 ${hd.bPct}% — 앵커 위치면 적극 수용\n${anchor.slice(0,2).join(' / ')}`;
+      } else if((h >= 0 && h <= 2) || h === 24){
+        decision = '★ 배회 적극 수용 (황금시간)';
+        recDetail = `배회 ${hd.bPct}% — 자정후 황금구간\n핵심 동선: ${anchor.slice(0,3).join(' → ')}`;
+      } else if(h >= 3 && h <= 4){
+        const endRec = (dow === '화' || dow === '목') ? '02시 종료 검토 (자정후 약한 요일)' : '끝까지 사수 (자정후 강한 요일)';
+        decision = `마감 단계`;
+        recDetail = endRec;
+      } else {
+        decision = '운행 준비 / 대기';
+        recDetail = '19시 이후 카카오 골든타임 준비';
+      }
+
+      // 예상 시간당 매출
+      const kAvg = 9000, bAvg = 10500;
+      const estHourly = Math.round((kAvg * (kPct/100) + bAvg * (hd.bPct/100)) * (totalH/8));
+
+      // Supabase에서 실제 fish_finder 데이터 추가 로드
+      let dbRows = [];
+      if(sbUrl && sbKey){
+        try {
+          dbRows = await sbSelect('fish_finder', {
+            'order':'call_probability.desc', 'limit':'3'
+          }) || [];
+        } catch(e){}
+      }
+
+      // ── 화면 업데이트 ──
+      const el = id => document.getElementById(id);
+
+      // 시각 표시
+      if(el('fish-time')) el('fish-time').textContent =
+        `${String(h).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')} ${dow}요일`;
+
+      // 카카오 어군
+      if(el('fish-kakao')) el('fish-kakao').innerHTML =
+        `예상 콜 간격: 약 <b style="color:#22c55e">${kInterval}분</b> (${kStars})<br>` +
+        `평균 단가: <b>9,000원대</b><br>` +
+        `비중: <b>${kPct}%</b> (${hd.kakao}건/8h 기준)` +
+        (dbRows[0] ? `<br>DB 핫존: ${dbRows[0].동명||dbRows[0].zone||''}` : '');
+
+      // 배회 어군
+      const bCard = el('fish-baehoe-card');
+      if(bCard){
+        bCard.style.borderColor = hd.bPct >= 25 ? '#f97316' : hd.bPct >= 15 ? '#a05000' : '#3a2000';
+        bCard.style.background  = hd.bPct >= 25 ? '#200e00' : '#1a0f00';
+      }
+      if(el('fish-baehoe')) el('fish-baehoe').innerHTML =
+        `예상 만남 확률: 시간당 <b style="color:#f97316">${Math.round(hd.baehoe/8*10)/10}건</b> (${bStars}, ${hd.bPct}%)<br>` +
+        `평균 단가: <b>10,500원</b> (수수료 0%)<br>` +
+        `핵심 동선: <b>${anchor.slice(0,2).join(' → ')}</b>`;
+
+      // 종합 권고
+      if(el('fish-rec')) el('fish-rec').innerHTML =
+        `<b style="color:var(--gold)">${decision}</b><br>${recDetail}<br>` +
+        `예상 시간당 매출: <b style="color:var(--green)">${estHourly.toLocaleString()}원대</b>`;
+
+      // 시간대별 배회 확률 미니바
+      const barEl = el('fish-hour-bar');
+      if(barEl){
+        const hours = [19,20,21,22,23,0,1,2,3];
+        barEl.innerHTML = '<div style="font-size:10px;color:var(--mu);margin-bottom:4px">시간대별 배회 비중</div>' +
+          '<div style="display:flex;gap:2px;align-items:flex-end;height:32px">' +
+          hours.map(hh => {
+            const d = HOUR_DATA[hh] || {bPct:10};
+            const isNow = hh === h;
+            const barH = Math.round(d.bPct / 50 * 28);
+            const color = d.bPct >= 25 ? '#f97316' : d.bPct >= 15 ? '#f59e0b' : '#4b5563';
+            return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px">
+              <div style="width:100%;height:${barH}px;background:${color};border-radius:2px${isNow?';outline:1px solid white':''}"></div>
+              <span style="font-size:8px;color:${isNow?'white':'var(--mu)'}">${hh}</span>
+            </div>`;
+          }).join('') + '</div>';
+      }
+
+      toast('어군 브리핑 업데이트 완료');
+    } catch(e){
+      toast('어군 브리핑 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  
+  // ════════════════════════════════════════
+  //  초기화
+  // ════════════════════════════════════════
+  async function initSupabase() {
+    const sbConfig = sload(KSB);
+    if (sbConfig && sbConfig.url && sbConfig.key) {
+      sbUrl = sbConfig.url;
+      sbKey = sbConfig.key;
+      try {
+        const rows = await sbSelect('raw_calls', {'limit':'1'});
+        if (rows === null) throw new Error('연결 실패');
+        setSbStatus(true);
+      } catch (e) {
+        console.error('Supabase 연결 오류:', e.message);
+        toast('Supabase 연결 오류: '+e.message, 'err');
+        setSbStatus(false);
+      }
+    } else {
+      setSbStatus(false);
+    }
+  }
+
+  function updateNetCard(todayTotal = 0, todayCharge = 0) {
+    const totalDeduction = ded.ins + ded.loan + ded.chg + ded.dep + ded.etc;
+    const netProfit = todayTotal - totalDeduction - todayCharge;
+
+    st('h-net', fmt(netProfit));
+    st('dd-ins', fmt(ded.ins) + '원');
+    st('dd-loan', fmt(ded.loan) + '원');
+    st('dd-chg', fmt(ded.chg) + '원');
+    st('dd-dep', fmt(ded.dep) + '원');
+    st('dd-etc', fmt(ded.etc) + '원');
+    st('dd-total', fmt(totalDeduction + todayCharge) + '원');
+  }
+
+  function toggleDedDetail() {
+    const dedDetail = document.getElementById('ded-detail');
+    const dedToggle = document.querySelector('.ded-toggle');
+    if (dedDetail.style.display === 'none') {
+      dedDetail.style.display = 'block';
+      dedToggle.textContent = '공제 내역 숨기기 ▲';
+    } else {
+      dedDetail.style.display = 'none';
+      dedToggle.textContent = '공제 내역 보기 ▾';
+    }
+  }
+
+
+  // ════════════════════════════════════════
+  //  [1순위] GPX 파싱 + 구속시간/거리 + 배회구역 복원
+  //  [2순위] 구속시간당 매출 · 공차 계산
+  //  [3순위] 룰체크 [2단]
+  // ════════════════════════════════════════
+
+  let gpxData = null;      // GPX 분석 결과
+
+  // ── Haversine 거리 (km) ──
+  function haversine(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const dLat = (lat2-lat1)*Math.PI/180;
+    const dLon = (lon2-lon1)*Math.PI/180;
+    const a = Math.sin(dLat/2)**2 +
+              Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  // ── GPX XML 파싱 ──
+  function parseGpx(xmlText) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'text/xml');
+    const trkpts = Array.from(doc.querySelectorAll('trkpt'));
+    if(!trkpts.length) throw new Error('trkpt 없음 — GPX 형식 확인 필요');
+
+    const points = trkpts.map(pt => {
+      const lat  = parseFloat(pt.getAttribute('lat'));
+      const lon  = parseFloat(pt.getAttribute('lon'));
+      const timeEl = pt.querySelector('time');
+      const time = timeEl ? new Date(timeEl.textContent) : null;
+      return {lat, lon, time};
+    }).filter(p => p.time && !isNaN(p.lat));
+
+    points.sort((a,b) => a.time - b.time);
+
+    // 구속시간 (시간)
+    const 구속시간_h = (points[points.length-1].time - points[0].time) / 3600000;
+
+    // 총 주행거리
+    let 주행거리_km = 0;
+    for(let i=1; i<points.length; i++) {
+      주행거리_km += haversine(points[i-1].lat, points[i-1].lon, points[i].lat, points[i].lon);
+    }
+
+    return {
+      points,
+      구속시간_h: Math.round(구속시간_h*100)/100,
+      주행거리_km: Math.round(주행거리_km*100)/100,
+      첫시각: points[0].time.toISOString(),
+      마지막시각: points[points.length-1].time.toISOString(),
+      포인트수: points.length
+    };
+  }
+
+  // ── GPX 위치 → 가장 가까운 포인트 인덱스 ──
+  function findNearestPoint(points, targetTime) {
+    let best = 0, bestDiff = Infinity;
+    for(let i=0; i<points.length; i++) {
+      const diff = Math.abs(points[i].time - targetTime);
+      if(diff < bestDiff) { bestDiff = diff; best = i; }
+    }
+    return best;
+  }
+
+  // ── 좌표 → 동명 역변환 (대구 주요 동 좌표) ──
+  const DONG_COORDS = [
+    ['중구 성내1동', 35.8695, 128.5968],['중구 성내2동', 35.8680, 128.5985],
+    ['중구 삼덕동', 35.8715, 128.5940],['중구 동성로', 35.8680, 128.5960],
+    ['수성구 범어1동', 35.8580, 128.6320],['수성구 범어2동', 35.8560, 128.6350],
+    ['수성구 만촌1동', 35.8510, 128.6400],['수성구 황금1동', 35.8620, 128.6250],
+    ['수성구 황금2동', 35.8600, 128.6280],['수성구 두산동', 35.8540, 128.6150],
+    ['동구 신암2동', 35.8760, 128.6180],['동구 신천4동', 35.8620, 128.5880],
+    ['동구 지저동', 35.8880, 128.6100],['북구 복현2동', 35.9000, 128.6050],
+    ['달서구 월성1동', 35.8380, 128.5120],['달서구 이곡1동', 35.8500, 128.5180],
+    ['달서구 두류1.2동', 35.8570, 128.5600],['남구 대명2동', 35.8420, 128.5880],
+    ['서구 평리3동', 35.8700, 128.5580],['북구 침산2동', 35.8870, 128.5760],
+  ];
+
+  function coordToDong(lat, lon) {
+    let bestDong = '위치미확인', bestDist = Infinity;
+    for(const [dong, dlat, dlon] of DONG_COORDS) {
+      const d = haversine(lat, lon, dlat, dlon);
+      if(d < bestDist) { bestDist = d; bestDong = dong; }
+    }
+    return bestDist < 2.0 ? bestDong : '대구 ' + bestDong.split(' ')[0] + ' (추정)';
+  }
+
+  // ── 배회구역 복원 (요금역산 + GPX 매칭) ──
+  async function restoreBaehoeZones(gpxParsed, dateStr) {
+    // 교차대조에서 배회로 분류된 결제건 조회
+    const baehoeRecs = await sbSelect('raw_calls', {
+      '날짜': 'eq.'+dateStr,
+      '콜유형': 'eq.배회',
+      '출발지': 'is.null'
+    });
+    if(!baehoeRecs.length) return [];
+
+    const results = [];
+    for(const rec of baehoeRecs) {
+      if(!rec.배차시각) continue;
+      // 배차시각 → UTC 변환 (KST = UTC+9)
+      const [hh,mm] = rec.배차시각.split(':').map(Number);
+      let h = hh < 6 ? hh + 24 : hh; // 자정 넘김 보정
+      const baseDate = new Date(dateStr + 'T00:00:00+09:00');
+      const targetTime = new Date(baseDate.getTime() + (h*60+mm)*60000);
+
+      const idx = findNearestPoint(gpxParsed.points, targetTime);
+      const pt = gpxParsed.points[idx];
+
+      // 요금역산으로 영업거리 추정
+      const 요금 = rec.요금 || 0;
+      let 할증 = 1.0;
+      if(hh >= 0 && hh < 2) 할증 = 1.30;
+      else if(hh >= 2 && hh < 4) 할증 = 1.20;
+      else if(hh >= 23) 할증 = 1.20;
+      const 기본_초과 = Math.max(0, 요금/할증 - 4500);
+      const 영업거리_km = Math.round((1.7 + 기본_초과/800) * 100) / 100;
+
+      // GPX에서 출발/도착 구간 찾기
+      const endIdx = Math.min(idx + Math.round(영업거리_km/0.05), gpxParsed.points.length-1);
+      const 출발지 = coordToDong(pt.lat, pt.lon);
+      const 도착지 = coordToDong(gpxParsed.points[endIdx].lat, gpxParsed.points[endIdx].lon);
+
+      results.push({
+        id: rec.id,
+        출발지,
+        도착지,
+        영업거리_km,
+        배차시각: rec.배차시각
+      });
+    }
+    return results;
+  }
+
+  // ── 효율지표 계산 ──
+  function calcEfficiency(calls, gpxParsed) {
+    const 총매출 = calls.reduce((s,c) => s+(c.요금||0), 0);
+    const 구속시간_h = gpxParsed.구속시간_h;
+    const 주행거리_km = gpxParsed.주행거리_km;
+    const 영업거리_km = calls.reduce((s,c) => s+(c.영업거리_km||0), 0);
+    const 공차거리_km = Math.max(0, 주행거리_km - 영업거리_km);
+    const 공차율 = 주행거리_km > 0 ? Math.round(공차거리_km/주행거리_km*1000)/10 : 0;
+    const 구속시간당_매출 = 구속시간_h > 0 ? Math.round(총매출/구속시간_h) : 0;
+    const 자정이후_비중 = calls.length > 0
+      ? Math.round(calls.filter(c=>{const h=parseInt((c.배차시각||'').split(':')[0]);return h<6||h>=24;}).length/calls.length*100)
+      : 0;
+    return {총매출, 구속시간_h, 주행거리_km, 영업거리_km, 공차거리_km, 공차율, 구속시간당_매출, 자정이후_비중};
+  }
+
+  // ── 룰체크 [2단] ──
+  function runRuleCheck(calls) {
+    const violations = [];
+    const toMin = t => {
+      if(!t) return -1;
+      const [h,m] = t.split(':').map(Number);
+      return (h<6?h+24:h)*60+m;
+    };
+    // 직전 30일 km당매출 평균 (간이 추정)
+    const validKm = calls.filter(c=>c.km당매출>0).map(c=>c.km당매출);
+    const avgKm = validKm.length ? validKm.reduce((a,b)=>a+b,0)/validKm.length : 1200;
+
+    for(const c of calls) {
+      const flags = [];
+      // R1: 시간역전
+      if(c.배차시각 && c.하차시각) {
+        const s=toMin(c.배차시각), e=toMin(c.하차시각);
+        if(e>0 && e<s && (s-e)>60) flags.push('R1:시간역전');
+      }
+      // R2: 기본요금 미만
+      if(c.요금 > 0 && c.요금 < 4500) flags.push('R2:기본요금미만('+c.요금+'원)');
+      // R3: 영업거리0 + 고액
+      if(c.영업거리_km===0 && c.요금>=10000) flags.push('R3:영업거리0+고액');
+      // R4: 출발지 없음 (배회건 제외)
+      if(!c.출발지 && c.콜유형==='카카오T') flags.push('R4:출발지없음');
+      // R5: km당매출 이상치 (평균 ±3배)
+      if(c.km당매출 > 0 && (c.km당매출 > avgKm*3 || c.km당매출 < avgKm/3))
+        flags.push('R5:km당매출이상치');
+      // R6: 요금 미확인(0 또는 null)인데 결제수단이 카카오T자동결제
+      if(!c.요금 && c.결제수단==='카카오T자동결제') flags.push('R6:자동결제요금없음');
+
+      if(flags.length) violations.push({id:c.id, 날짜:c.날짜, 배차시각:c.배차시각, flags});
+    }
+    return violations;
+  }
+
+  // ── GPX 파일 처리 메인 ──
+  async function processGpxFile(file) {
+    const spin = document.getElementById('gpx-spin');
+    const errEl = document.getElementById('gpx-err');
+    const resEl = document.getElementById('gpx-result');
+    spin.classList.add('on'); errEl.style.display='none'; resEl.style.display='none';
+
+    try {
+      const xmlText = await file.text();
+      const parsed = parseGpx(xmlText);
+      gpxData = {parsed, file: file.name};
+
+      // 날짜 추출 (첫 trkpt 기준 KST)
+      const kstDate = new Date(new Date(parsed.첫시각).getTime() + 9*3600000);
+      const dateStr = localDate(kstDate);
+      gpxData.dateStr = dateStr;
+
+      // 해당 날짜 raw_calls 조회 (Supabase 없으면 빈 배열)
+      let calls = [];
+      if(sbUrl && sbKey){
+        calls = await sbSelect('raw_calls', {'날짜':'eq.'+dateStr, 'order':'배차시각.asc'}) || [];
+      } else {
+        toast('Supabase 미연결 — GPX 파싱만 진행 (DB 연동 없음)', 'warn');
+      }
+      gpxData.calls = calls;
+
+      // 배회 구역 복원
+      const baehoeZones = (sbUrl && sbKey) ? await restoreBaehoeZones(parsed, dateStr) : [];
+      gpxData.baehoeZones = baehoeZones;
+
+      // 효율지표
+      const eff = calcEfficiency(calls, parsed);
+      gpxData.eff = eff;
+
+      // 룰체크
+      const violations = runRuleCheck(calls);
+      gpxData.violations = violations;
+
+      // 결과 표시
+      showGpxResult(parsed, dateStr, calls.length, baehoeZones, eff, violations);
+
+    } catch(e) {
+      errEl.textContent = 'GPX 오류: '+e.message;
+      errEl.style.display='block';
+    } finally {
+      spin.classList.remove('on');
+    }
+  }
+
+  function showGpxResult(parsed, dateStr, callCount, baehoeZones, eff, violations) {
+    // 요약
+    document.getElementById('gpx-summary-rows').innerHTML = [
+      ['날짜', dateStr],
+      ['구속시간', parsed.구속시간_h+'시간'],
+      ['총 주행거리', parsed.주행거리_km+'km'],
+      ['트랙포인트', parsed.포인트수+'개'],
+      ['연결 운행건수', callCount+'건'],
+    ].map(([k,v])=>`<span style="color:var(--mu)">${k}:</span> <b style="color:var(--tx)">${v}</b><br>`).join('');
+
+    // 배회구역
+    const baehoeEl = document.getElementById('gpx-baehoe-rows');
+    if(baehoeZones.length) {
+      baehoeEl.innerHTML = baehoeZones.map(b=>
+        `${b.배차시각} ${b.출발지} → ${b.도착지} (추정 ${b.영업거리_km}km)`
+      ).join('<br>');
+    } else {
+      baehoeEl.innerHTML = '<span style="color:var(--mu)">배회건 없음 또는 좌표 복원 불필요</span>';
+    }
+
+    // 효율지표
+    document.getElementById('gpx-summary-rows').innerHTML += `<br>
+      <span style="color:var(--green);font-weight:700">⚡ 구속시간당 매출: ${fmt(eff.구속시간당_매출)}원/h</span><br>
+      <span style="color:var(--mu)">공차율: ${eff.공차율}%  자정이후: ${eff.자정이후_비중}%</span>`;
+
+    // 룰체크
+    const ruleEl = document.getElementById('rule-rows');
+    if(violations.length) {
+      ruleEl.innerHTML = violations.map(v=>
+        `⏸️ <b>${v.날짜} ${v.배차시각||''}</b> — ${v.flags.join(', ')}`
+      ).join('<br>');
+      document.getElementById('rule-card').style.display='block';
+    } else {
+      ruleEl.innerHTML = '<span style="color:var(--green)">✅ 룰체크 전체 통과</span>';
+      document.getElementById('rule-card').style.display='block';
+    }
+
+    document.getElementById('gpx-drop').style.display='none';
+    document.getElementById('gpx-result').style.display='block';
+  }
+
+  function resetGpx() {
+    gpxData=null;
+    document.getElementById('gpx-drop').style.display='flex';
+    document.getElementById('gpx-result').style.display='none';
+    document.getElementById('gpx-err').style.display='none';
+    document.getElementById('gpx-file-inp').value='';
+    document.getElementById('eff-card').style.display='none';
+    document.getElementById('rule-card').style.display='none';
+  }
+
+  // ── GPX 결과 DB 저장 ──
+  async function applyGpxResult() {
+    if(!gpxData) return;
+    if(!sbUrl || !sbKey){ toast('Supabase 연결 후 저장 가능합니다', 'warn'); return; }
+    showLoading(true);
+    try {
+      const {parsed, dateStr, calls, baehoeZones, eff, violations} = gpxData;
+
+      // 1. gpx_sessions 저장
+      await sbInsert('gpx_sessions', {
+        날짜: dateStr,
+        파일명: gpxData.file,
+        구속시간_h: parsed.구속시간_h,
+        총주행거리_km: parsed.주행거리_km,
+        첫트랙시각: parsed.첫시각,
+        마지막트랙시각: parsed.마지막시각,
+        트랙포인트수: parsed.포인트수
+      });
+
+      // 2. 배회 구역 복원 → raw_calls 업데이트
+      for(const b of baehoeZones) {
+        await sbReq('PATCH', `raw_calls?id=eq.${b.id}`, {
+          출발지: b.출발지,
+          도착지: b.도착지,
+          영업거리_km: b.영업거리_km
+        });
+      }
+
+      // 3. 영업거리 있는 건들의 km당매출 업데이트
+      for(const c of calls) {
+        if(c.영업거리_km > 0 && c.요금 > 0) {
+          await sbReq('PATCH', `raw_calls?id=eq.${c.id}`, {
+            km당매출: Math.round(c.요금 / c.영업거리_km)
+          });
+        }
+      }
+
+      // 4. 룰체크 위반건 → status='보류' + rule_flag
+      for(const v of violations) {
+        await sbReq('PATCH', `raw_calls?id=eq.${v.id}`, {
+          status: '보류',
+          rule_flag: v.flags.join('|')
+        });
+        // rule_violations 기록
+        for(const flag of v.flags) {
+          await sbInsert('rule_violations', {
+            call_id: v.id,
+            날짜: v.날짜,
+            rule_code: flag.split(':')[0],
+            rule_msg: flag
+          });
+        }
+      }
+
+      // 5. daily_summary 효율지표 저장
+      await sbReq('POST', 'daily_summary', {
+        날짜: dateStr,
+        구속시간_h: eff.구속시간_h,
+        총주행거리_km: eff.주행거리_km,
+        공차율: eff.공차율,
+        구속시간당_매출: eff.구속시간당_매출,
+        자정이후_비중: eff.자정이후_비중
+      }, {}, {'Prefer':'resolution=merge-duplicates,return=minimal'});
+
+      toast(`✅ GPX 저장 완료 — 구속시간당 ${fmt(eff.구속시간당_매출)}원/h`);
+
+      // 홈 효율지표 업데이트
+      updateHomeEff(eff);
+
+      // 룰체크 위반건 수 표시
+      if(violations.length) {
+        toast(`⏸️ 룰체크 위반 ${violations.length}건 보류 처리됨`, 'warn');
+      }
+
+      resetGpx();
+      renderHome();
+
+    } catch(e) {
+      toast('GPX 저장 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  function updateHomeEff(eff) {
+    const card = document.getElementById('home-eff');
+    const main = document.getElementById('h-eff-main');
+    const sub  = document.getElementById('h-eff-sub');
+    if(!card||!main||!sub) return;
+    card.style.display='block';
+    main.textContent = fmt(eff.구속시간당_매출)+'원/h';
+    sub.textContent  = `구속 ${eff.구속시간_h}h · 주행 ${eff.주행거리_km}km · 공차율 ${eff.공차율}%`;
+  }
+
+  // ════════════════════════════════════════
+  //  콜카드·일별운행이력 OCR + 교차대조
+  // ════════════════════════════════════════
+
+  let histOcrData = null;   // OCR 결과 임시 보관
+
+  // 이미지 → base64
+  // 이미지 리사이즈 후 base64 변환 (최대 1200px, 품질 0.85)
+  function fileToB64(file, maxPx=1200, quality=0.85) {
+    return new Promise((res,rej)=>{
+      const reader = new FileReader();
+      reader.onload = e => {
+        const img = new Image();
+        img.onload = () => {
+          // 리사이즈 필요 여부 판단
+          const needResize = img.width > maxPx || img.height > maxPx;
+          if(!needResize && file.type === 'image/jpeg'){
+            res(e.target.result.split(',')[1]);
+            return;
+          }
+          const scale = needResize ? Math.min(maxPx/img.width, maxPx/img.height) : 1;
+          const w = Math.round(img.width * scale);
+          const h = Math.round(img.height * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/jpeg', quality);
+          res(dataUrl.split(',')[1]);
+        };
+        img.onerror = () => rej(new Error('이미지 로드 실패'));
+        img.src = e.target.result;
+      };
+      reader.onerror = () => rej(new Error('파일 읽기 실패'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 날짜 보정: 배차시각 06시 미만 → +1일 (자정 넘긴 운행)
+  function adjustDate(screenDate, hhmm) {
+    const h = parseInt((hhmm||'').split(':')[0]) || 0;
+    if(h < 6) {
+      const d = new Date(screenDate + 'T00:00:00');
+      d.setDate(d.getDate() + 1);
+      return localDate(d);
+    }
+    return screenDate;
+  }
+
+  // ── 일별운행이력 + 결제내역 OCR ──
+  async function runHistOcr(file) {
+    const spin = document.getElementById('hist-spin');
+    const resEl = document.getElementById('hist-ocr-result');
+    const errEl = document.getElementById('hist-ocr-err');
+    const prev = document.getElementById('hist-img-preview');
+    spin.classList.add('on'); resEl.style.display='none'; errEl.style.display='none';
+
+    // 미리보기
+    const previewR = new FileReader();
+    previewR.onload = e => { prev.src=e.target.result; prev.style.display='block'; };
+    previewR.readAsDataURL(file);
+
+
+    try {
+      const fileType = file.type||'image/jpeg';
+      const b64 = await fileToB64(file);
+      let histData = null;
+
+      // 1순위: 봇 서버 경유 (serverUrl 있을 때만)
+      if(serverUrl){
+        try {
+          const resp = await backendReq('/ocr_history', 'POST', {
+            image_b64: b64, media_type: file.type||'image/jpeg'
+          });
+          if(resp && resp.success) histData = resp.data;
+        } catch(e){ /* 서버 실패 → 폴백으로 */ }
+      }
+
+      // 폴백: Claude 직접 호출 (봇 서버 없을 때)
+      if(!histData && claudeKey){
+        const dr = await fetch('https://api.anthropic.com/v1/messages',{
+          method:'POST',
+          headers:{'Content-Type':'application/json','x-api-key':claudeKey,
+                   'anthropic-version':'2023-06-01','anthropic-dangerous-allow-browser':'true'},
+          body: JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:30,
+            messages:[{role:'user',content:[
+              {type:'image',source:{type:'base64',media_type:fileType||'image/jpeg',data:b64}},
+              {type:'text',text:"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
+            ]}]})
+        });
+        const dd = await dr.json();
+        const isDaily = dd.content?.[0]?.text?.includes('일별');
+        const prompt = isDaily
+          ? '이 카카오T 일별운행이력 화면에서 모든 운행건을 추출해서 JSON만 반환해줘.\n{"type":"daily_history","date":"YYYY-MM-DD","calls":[{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n날짜: 상단 YYYY년 M월 D일. JSON만 반환.'
+          : '이 결제내역 화면에서 모든 결제건을 추출해서 JSON만 반환해줘.\n{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":[{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n날짜: 조회일. 취소건 제외. 숫자만. JSON만 반환.';
+        const or2 = await fetch('https://api.anthropic.com/v1/messages',{
+          method:'POST',
+          headers:{'Content-Type':'application/json','x-api-key':claudeKey,
+                   'anthropic-version':'2023-06-01','anthropic-dangerous-allow-browser':'true'},
+          body: JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:2000,
+            messages:[{role:'user',content:[
+              {type:'image',source:{type:'base64',media_type:fileType||'image/jpeg',data:b64}},
+              {type:'text',text:prompt}
+            ]}]})
+        });
+        const od = await or2.json();
+        if(or2.ok){
+          let raw = od.content[0].text.trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
+          histData = JSON.parse(raw);
+        }
+      }
+      if(!histData) throw new Error('OCR 실패 — 설정 탭에서 Claude API 키를 입력해주세요');
+      histOcrData = histData;
+
+
+      // 결과 표시
+      const rows = document.getElementById('hist-ocr-rows');
+      const type = histOcrData.type; // 'daily_history' | 'payment'
+      if(type === 'daily_history') {
+        const calls = histOcrData.calls || [];
+        rows.innerHTML = `<b>📅 일별운행이력 — ${esc(histOcrData.date)} (${calls.length}건)</b><br>` +
+          calls.map(c=>`${esc(c.배차시각)}~${esc(c.하차시각)} ${esc(c.출발지)}→${esc(c.도착지)} ${fmt(c.요금)}원${c.결제방식==='직접'?' [직접]':''}`).join('<br>');
+      } else if(type === 'payment') {
+        const items = histOcrData.items || [];
+        rows.innerHTML = `<b>💳 결제내역 — ${esc(histOcrData.date)} (${items.length}건 / ${fmt(histOcrData.total)}원)</b><br>` +
+          items.slice(0,5).map(i=>`${esc(i.시각)} ${fmt(i.요금)}원 ${esc(i.카드||'')}`).join('<br>') +
+          (items.length>5 ? `<br>...외 ${items.length-5}건` : '');
+      }
+      resEl.style.display='block';
+    } catch(e) {
+      errEl.textContent = '오류: '+e.message; errEl.style.display='block';
+    } finally {
+      spin.classList.remove('on');
+    }
+  }
+
+  function resetHistOcr() {
+    histOcrData = null;
+    document.getElementById('hist-img-preview').style.display='none';
+    document.getElementById('hist-drop').style.display='flex';
+    document.getElementById('hist-ocr-result').style.display='none';
+    document.getElementById('hist-ocr-err').style.display='none';
+    document.getElementById('hist-img-inp').value='';
+  }
+
+  // ── 저장 + 교차대조 ──
+  async function saveHistOcr() {
+    if(!histOcrData) return;
+    showLoading(true);
+    try {
+      const type = histOcrData.type;
+
+      if(type === 'daily_history') {
+        // raw_calls 저장
+        const DOW = ['일','월','화','수','목','금','토'];
+        let saved = 0;
+        for(const c of (histOcrData.calls||[])) {
+          const realDate = adjustDate(histOcrData.date, c.배차시각);
+          const dow = DOW[new Date(realDate+'T12:00:00').getDay()];
+          await sbInsert('raw_calls', {
+            날짜: realDate, 요일: dow,
+            배차시각: c.배차시각, 하차시각: c.하차시각,
+            출발지: c.출발지, 도착지: c.도착지,
+            요금: c.요금, 콜유형: '카카오T',
+            비고: c.결제방식==='직접' ? '직접결제' : null
+          });
+          saved++;
+        }
+        toast(`✅ ${saved}건 저장 완료 — 교차대조 시작`);
+        // 저장 후 교차대조 자동 실행
+        const dates = [...new Set((histOcrData.calls||[]).map(c=>adjustDate(histOcrData.date, c.배차시각)))];
+        for(const d of dates) await runCrossCheck(d);
+
+      } else if(type === 'payment') {
+        // payment_receipts 저장
+        let saved = 0;
+        for(const item of (histOcrData.items||[])) {
+          await sbInsert('payment_receipts', {
+            날짜: histOcrData.date,
+            시각: item.시각,
+            요금: item.요금,
+            결제방법: item.카드 ? '카드' : '현금'
+          });
+          saved++;
+        }
+        toast(`✅ ${saved}건 결제내역 저장 — 교차대조 시작`);
+        await runCrossCheck(histOcrData.date);
+      }
+
+      resetHistOcr();
+      renderHist();
+
+    } catch(e) {
+      toast('저장 오류: '+e.message, 'err');
+    } finally {
+      showLoading(false);
+    }
+  }
+
+  // ── 교차대조 핵심 로직 ──
+  async function runCrossCheck(dateStr) {
+    try {
+      const [calls, receipts] = await Promise.all([
+        sbSelect('raw_calls', {'날짜':'eq.'+dateStr, 'order':'배차시각.asc'}),
+        sbSelect('payment_receipts', {'날짜':'eq.'+dateStr, 'order':'시각.asc'})
+      ]);
+
+      if(!calls.length || !receipts.length) return;
+
+      // 시각 → 분 변환
+      const toMin = t => {
+        if(!t) return -1;
+        const parts = t.replace(/[^0-9:]/g,'').split(':');
+        let h = parseInt(parts[0]||0), m = parseInt(parts[1]||0);
+        if(h < 6) h += 24; // 자정 넘김 보정
+        return h*60 + m;
+      };
+
+      const TOLERANCE = 20; // ±20분
+      let matched = 0, unmatched_receipts = [];
+
+      // 매칭: 결제내역 기준으로 콜카드 찾기
+      const usedCallIds = new Set();
+      for(const r of receipts) {
+        const rMin = toMin(r.시각);
+        let best = null, bestDiff = TOLERANCE+1;
+        for(const c of calls) {
+          if(usedCallIds.has(c.id)) continue;
+          const diff = Math.abs(toMin(c.배차시각) - rMin);
+          if(diff <= TOLERANCE && diff < bestDiff) { bestDiff=diff; best=c; }
+        }
+        if(best) {
+          usedCallIds.add(best.id);
+          matched++;
+          // 금액 불일치 체크 (500원 이상)
+          if(Math.abs((best.요금||0)-(r.요금||0)) >= 500) {
+            await sbReq('PATCH', `raw_calls?id=eq.${best.id}`, {비고:'금액불일치(확인필요)'});
+          }
+        } else {
+          unmatched_receipts.push(r); // 배회 후보
+        }
+      }
+
+      // 미매칭 결제내역 → 배회영업으로 자동 분류
+      let baehoe = 0;
+      for(const r of unmatched_receipts) {
+        await sbInsert('raw_calls', {
+          날짜: r.날짜, 요일: calls[0]?.요일||'',
+          배차시각: r.시각, 요금: r.요금,
+          콜유형: '배회', 비고: '결제내역자동분류'
+        });
+        baehoe++;
+      }
+
+      // 결과 표시
+      showCrossResult(dateStr, calls.length, receipts.length, matched, baehoe);
+
+    } catch(e) {
+      console.error('교차대조 오류:', e.message);
+    }
+  }
+
+  function showCrossResult(date, callCnt, rcptCnt, matched, baehoe) {
+    const container = document.getElementById('cross-result-container');
+    if(!container) return;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.cssText = 'border-left:3px solid var(--green);margin-bottom:12px';
+    card.innerHTML = `
+      <div style="font-size:12px;font-weight:700;color:var(--green);margin-bottom:8px">
+        🔄 교차대조 완료 — ${esc(date)}
+      </div>
+      <div style="font-size:13px;line-height:2;color:var(--sub)">
+        콜카드: <b style="color:var(--tx)">${callCnt}건</b>
+        결제내역: <b style="color:var(--tx)">${rcptCnt}건</b>
+        매칭: <b style="color:var(--green)">${matched}건</b>
+        배회자동분류: <b style="color:var(--gold)">${baehoe}건</b>
+      </div>
+    `;
+    container.prepend(card);
+    if(baehoe > 0) toast(`🚕 배회영업 ${baehoe}건 자동 분류됨`);
+    if(matched === callCnt) toast(`✅ ${date} 교차대조 완료`);
+  }
+
+  // ════════════════════════════════════════
+  //  모듈 C: 맥락 자동주입
+  // ════════════════════════════════════════
+  async function loadMagiContext() {
+    if(!sbUrl || !sbKey) return null;
+    try {
+      const rows = await sbSelect('magi_context', {'is_active':'eq.true','order':'updated_at.desc','limit':'1'});
+      if(rows && rows[0]) {
+        magiContext = rows[0];
+        console.log('맥락 로드 완료 v'+magiContext.version);
+        return magiContext;
+      }
+    } catch(e) { console.error('맥락 로드 오류:', e.message); }
+    return null;
+  }
+
+  function buildMagiSystemPrompt(extraData='') {
+    if(!magiContext) return '당신은 대구 택시기사의 AI 분석 도우미입니다.';
+    return `당신은 마기(MAGI)입니다. 대구 세큐티 가맹 택시기사의 전략 두뇌입니다.
+
+[운영 원칙]
+${magiContext.principles||''}
+
+[핵심 메모리]
+${magiContext.core_memory||''}
+
+[데이터 검증 원칙]
+${magiContext.data_rules||''}
+
+${extraData ? '[최근 데이터]\n'+extraData : ''}
+
+위 맥락을 바탕으로 분석하고 7섹션 브리핑 형식으로 답변하세요.
+통제 가능한 변수만 권고하고, 방어적 화법을 쓰지 마세요.`;
+  }
+
+  // ════════════════════════════════════════
+  //  모듈 A: 아틀라스 보고 수신 (Polling)
+  // ════════════════════════════════════════
+  async function pollAtlasReports() {
+    if(!sbUrl || !sbKey) return;
+    try {
+      const rows = await sbSelect('atlas_reports', {
+        'status':'eq.pending',
+        'order':'created_at.asc',
+        'limit':'3'
+      });
+      if(rows && rows.length > 0) {
+        console.log(`아틀라스 보고 ${rows.length}건 수신`);
+        for(const report of rows) {
+          await processAtlasReport(report);
+        }
+        // 알림 표시
+        showAtlasBadge(rows.length);
+      }
+    } catch(e) { /* 폴링 오류는 무시 */ }
+  }
+
+  function showAtlasBadge(count) {
+    const badge = document.getElementById('atlas-badge');
+    if(badge) {
+      badge.textContent = count;
+      badge.style.display = count > 0 ? 'flex' : 'none';
+    }
+    // 홈 탭 알림 표시
+    const homeBtn = document.querySelector('[data-pg="home"]');
+    if(homeBtn && count > 0) {
+      toast(`📡 아틀라스 보고 ${count}건 도착`, 'warn');
+    }
+  }
+
+  // ════════════════════════════════════════
+  //  모듈 B: Claude API 마기 분석 호출
+  // ════════════════════════════════════════
+  async function processAtlasReport(report) {
+    try {
+      // 최근 운행 추세 데이터 수집
+      const today = td();
+      const recentCalls = await sbSelect('raw_calls', {
+        'order':'날짜.desc,배차시각.desc',
+        'limit':'50'
+      });
+      const recentSummary = recentCalls.slice(0,10).map(c=>
+        `${c.날짜} ${c.배차시각||''} ${c.출발지||''}->${c.도착지||''} ${fmt(c.요금)}원`
+      ).join('\n');
+
+      // 모듈 C: 맥락 주입
+      const systemPrompt = buildMagiSystemPrompt(recentSummary);
+
+      const userMsg = `아틀라스 보고서 (${report.report_type}):
+제목: ${report.title||'제목없음'}
+내용: ${JSON.stringify(report.payload, null, 2)}
+
+위 보고서를 분석하고 7섹션 브리핑을 작성해주세요.`;
+
+      const magiResp = await backendReq('/magi_analyze', 'POST', {
+        system_prompt: systemPrompt,
+        user_message: userMsg,
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500
+      });
+      if(!magiResp || !magiResp.success) throw new Error(magiResp?.error || '마기 분석 서버 오류');
+      const analysis = magiResp.result;
+
+      // DB에 분석 결과 저장 + 상태 업데이트
+      await sbReq('PATCH', `atlas_reports?id=eq.${report.id}`, {
+        status: 'analyzed',
+        magi_analysis: analysis,
+        analyzed_at: new Date().toISOString()
+      });
+
+      // 앱 화면에 표시
+      displayMagiAnalysis(report, analysis);
+
+    } catch(e) {
+      console.error('마기 분석 오류:', e.message);
+      // 오류 시 상태를 error로 변경
+      await sbReq('PATCH', `atlas_reports?id=eq.${report.id}`, { status: 'error' });
+    }
+  }
+
+  function displayMagiAnalysis(report, analysis) {
+    const container = document.getElementById('magi-analysis-container');
+    if(!container) return;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.cssText = 'border-left:3px solid var(--gold);margin-bottom:12px';
+    card.innerHTML = `
+      <div style="font-size:11px;color:var(--mu);margin-bottom:6px">
+        📡 아틀라스 보고 · ${new Date().toLocaleTimeString('ko-KR')}
+      </div>
+      <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:8px">
+        ${esc(report.title || report.report_type)}
+      </div>
+      <div style="font-size:13px;color:var(--sub);line-height:1.7;white-space:pre-wrap">${esc(analysis)}</div>
+    `;
+    container.prepend(card);
+    // 홈 탭이면 보이도록
+    if(document.getElementById('pg-home').classList.contains('on')) {
+      card.scrollIntoView({behavior:'smooth', block:'nearest'});
+    }
+  }
+
+  // 아틀라스에서 직접 보고 입력 (수동 브리지 대체)
+  async function submitAtlasReport(type, title, payload) {
+    if(!sbUrl || !sbKey) { toast('Supabase 연결 필요', 'err'); return; }
+    try {
+      await sbInsert('atlas_reports', {
+        report_type: type,
+        title: title,
+        payload: payload,
+        status: 'pending',
+        run_date: td()
+      });
+      toast('아틀라스 보고 등록 완료!');
+      await pollAtlasReports(); // 즉시 처리
+    } catch(e) { toast('보고 등록 오류: '+e.message, 'err'); }
+  }
+
+  // 폴링 시작/중지
+  function startPipeline() {
+    if(pipelineTimer) return;
+    pollAtlasReports(); // 즉시 1회
+    pipelineTimer = setInterval(pollAtlasReports, 30000); // 30초마다
+    console.log('파이프라인 폴링 시작 (30초)');
+  }
+  function stopPipeline() {
+    if(pipelineTimer) { clearInterval(pipelineTimer); pipelineTimer = null; }
+  }
+
+  async function saveClaudeKeyLocal(){
+    const key = document.getElementById('claude-key-inp')?.value.trim()||'';
+    if(key && !key.startsWith('sk-ant-')){
+      toast('sk-ant- 로 시작하는 키를 입력해주세요','err'); return;
+    }
+    if(!serverUrl){
+      toast('백엔드 서버 URL을 먼저 설정해주세요. API 키는 브라우저에 저장하지 않습니다.','err');
+      return;
+    }
+    const saved = await sbSetClaudeKey(key);
+    if(!saved) return;
+    claudeKey = '';
+    try{ localStorage.removeItem('jv-ck-fb'); }catch{}
+    const st = document.getElementById('claude-key-status');
+    if(st) st.textContent = key ? '✅ 서버에 저장됨' : '서버 키 삭제됨';
+    toast(key ? 'API 키를 서버에 저장했습니다' : 'API 키 삭제');
+  }
+
+  async function checkPipelineStatus() {
+    const statusEl = document.getElementById('pipeline-status');
+    const ctxEl = document.getElementById('ctx-version');
+    const pendingEl = document.getElementById('pending-count');
+    if(statusEl) statusEl.textContent = pipelineTimer ? '🟢 실행 중' : '🔴 중지';
+    if(ctxEl) ctxEl.textContent = magiContext ? 'v'+magiContext.version : '미로드';
+    if(pendingEl && sbUrl && sbKey) {
+      const rows = await sbSelect('atlas_reports', {'status':'eq.pending'});
+      pendingEl.textContent = (rows||[]).length + '건';
+    }
+  }
+
+  async function testPipeline() {
+    await submitAtlasReport(
+      'manual',
+      '파이프라인 테스트 보고',
+      {
+        message: '캐스퍼 파이프라인 테스트',
+        timestamp: new Date().toISOString(),
+        test: true,
+        recent_data: '테스트용 더미 데이터'
+      }
+    );
+  }
+
+  document.addEventListener('DOMContentLoaded', async () => {
+    // logDebug('DOMContentLoaded 이벤트 발생');
+    // ── 로컬 스토리지 복원 ──
+    goals     = lload(KG) || goals;
+    ded       = lload(KD) || ded;
+    serverUrl = normalizeUrl(lload('jv-server-url') || '');
+
+    // Supabase URL/KEY
+    const _sbConf = lload(KSB);
+    if(_sbConf && _sbConf.url && _sbConf.key){
+      sbUrl = _sbConf.url;
+      sbKey = _sbConf.key;
+    }
+
+    // Claude 폴백 키
+    try { const ck = localStorage.getItem('jv-ck-fb'); if(ck) claudeKey = ck; } catch{}
+
+    // 연결 상태 표시
+    setSbStatus(!!(sbUrl && sbKey));
+    if(sbUrl && sbKey) document.getElementById('setup-banner')?.classList.remove('on');
+
+    // 월 선택 옵션 초기화
+    ['hist-mo','anal-mo'].forEach(id=>{
+      const sel=document.getElementById(id); if(!sel) return;
+      const now=new Date();
+      for(let i=0;i<6;i++){
+        const d=new Date(now.getFullYear(),now.getMonth()-i,1);
+        const mo=localMonth(d);
+        const opt=document.createElement('option');
+        opt.value=mo; opt.textContent=d.toLocaleString('ko-KR',{month:'long',year:'numeric'});
+        sel.appendChild(opt);
+      }
+    });
+
+    // Supabase 초기화
+    await initSupabase();
+
+    // 모듈 C: 맥락 로드
+    await loadMagiContext();
+
+    // 모듈 A: 파이프라인 폴링 시작 (Supabase 연결된 경우만)
+    if(sbUrl && sbKey) startPipeline();
+
+    // 초기 페이지 렌더링
+    goPage('home');
+
+    // ── GPX 파일 이벤트 ──
+    const gpxInp = document.getElementById('gpx-file-inp');
+    if(gpxInp){
+      gpxInp.addEventListener('change', async (e)=>{
+        const file = e.target.files[0];
+        if(!file) return;
+        const drop = document.getElementById('gpx-drop');
+        if(drop) drop.style.display='none';
+        await processGpxFile(file);
+      });
+    }
+
+    // ── 일별이력/결제내역 이미지 이벤트 ──
+    const histInp = document.getElementById('hist-img-inp');
+    if(histInp){
+      histInp.addEventListener('change', async (e)=>{
+        const file = e.target.files[0];
+        if(!file) return;
+        const drop = document.getElementById('hist-drop');
+        if(drop) drop.style.display='none';
+        await runHistOcr(file);
+      });
+    }
+
+    // 영수증 OCR 이벤트는 상단의 단일 핸들러에서만 처리한다.
+
+    // Chart.js는 하단 <script src>로 이미 로드됨
+
+    // logDebug(`초기 설정 - sbUrl: ${sbUrl}, sbKey: ${sbKey ? '*****' : '없음'}, serverUrl: ${serverUrl}`);
+  });
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</body>
+</html>
