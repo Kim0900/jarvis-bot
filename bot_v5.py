@@ -124,7 +124,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     model="claude-haiku-4-5-20251001", max_tokens=400,
                     messages=[{"role":"user","content":[
                         {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                        {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라. 숫자만(원제외). JSON만 반환.'}
+                        {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라.\n⚠️ commission(수수료)은 영수증에 "수수료"라고 명시적으로 적힌 금액만 사용해라. "카드결제"·"앱결제"·"현금결제"처럼 결제수단별로 나눈 금액은 수수료가 아니니 절대 혼동하지 마라. "수수료"라는 글자가 영수증에 없으면 commission은 0으로 반환해라. 숫자만(원제외). JSON만 반환.'}
                     ]}]
                 )
                 txt = _re.sub(r"```[a-z]*", "", msg.content[0].text.strip()).strip()
