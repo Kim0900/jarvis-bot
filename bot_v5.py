@@ -193,7 +193,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 import anthropic as _ant
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
                 msg = client.messages.create(
-                    model=payload.get('model','claude-sonnet-4-20250514'),
+                    model=payload.get('model','claude-sonnet-5'),
                     max_tokens=int(payload.get('max_tokens',1500)),
                     system=payload.get('system_prompt','당신은 마기입니다.'),
                     messages=[{"role":"user","content":payload.get('user_message','')}]
@@ -3641,7 +3641,7 @@ async def process_atlas_report_server(report: dict) -> bool:
         import anthropic as _ant
         client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-5",
             max_tokens=1500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_msg}],
