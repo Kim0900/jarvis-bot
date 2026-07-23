@@ -2488,7 +2488,7 @@ ${extraData ? '[최근 데이터]\n'+extraData : ''}
       const magiResp = await backendReq('/magi_analyze', 'POST', {
         system_prompt: systemPrompt,
         user_message: userMsg,
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-5',
         max_tokens: 1500
       });
       if(!magiResp || !magiResp.success) throw new Error(magiResp?.error || '마기 분석 서버 오류');
