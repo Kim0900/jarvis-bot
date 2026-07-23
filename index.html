@@ -1390,7 +1390,7 @@ select.inp{padding:10px 13px}
           });
           const od = await or2.json();
           if(or2.ok){
-            const raw = od.content[0].text.trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
+            const raw = (od.content.find(b=>b.type==='text')?.text || '').trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
             ocrData_raw = JSON.parse(raw);
           }
         } catch(e){ /* 폴백도 실패 → 아래에서 최종 에러 처리 */ }
@@ -2209,7 +2209,7 @@ select.inp{padding:10px 13px}
         });
         const od = await or2.json();
         if(or2.ok){
-          let raw = od.content[0].text.trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
+          let raw = (od.content.find(b=>b.type==='text')?.text || '').trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
           histData = JSON.parse(raw);
         }
       }
