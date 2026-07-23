@@ -620,6 +620,13 @@ select.inp{padding:10px 13px}
       try { errMsg = JSON.parse(errText).message || errText; } catch{}
       throw new Error(`Supabase ${method} ${path}: ${errMsg}`);
     }
+    // 캐스퍼 수정 2026-07-23: 초기 연결테스트가 콜드스타트로 한 번 실패하면 배지가
+    // "미연결"로 고정된 채, 이후 실제 요청들이 전부 성공해도 절대 안 돌아오던 문제.
+    // 어떤 Supabase 요청이든 성공하면 배지를 즉시 "연결됨"으로 자동 회복.
+    try {
+      const dot = document.getElementById('sb-dot');
+      if (dot && dot.classList.contains('off')) setSbStatus(true);
+    } catch {}
     const text = await res.text();
     return text ? JSON.parse(text) : [];
   }
@@ -1659,14 +1666,24 @@ select.inp{padding:10px 13px}
     if (sbConfig && sbConfig.url && sbConfig.key) {
       sbUrl = sbConfig.url;
       sbKey = sbConfig.key;
-      try {
-        const rows = await sbSelect('raw_calls', {'limit':'1'});
-        if (rows === null) throw new Error('연결 실패');
-        setSbStatus(true);
-      } catch (e) {
-        console.error('Supabase 연결 오류:', e.message);
-        toast('Supabase 연결 오류: '+e.message, 'err');
-        setSbStatus(false);
+      // 캐스퍼 수정 2026-07-23: 페이지 로딩 직후 가장 먼저 나가는 요청이라
+      // Supabase 무료(Nano) 사양 콜드스타트에 유독 취약해서, 실제로는 멀쩡한데도
+      // "미연결"로 고정 표시되던 문제. 1회 실패 시 1.5초 후 한 번 더 시도.
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const rows = await sbSelect('raw_calls', {'limit':'1'});
+          if (rows === null) throw new Error('연결 실패');
+          setSbStatus(true);
+          return;
+        } catch (e) {
+          console.error(`Supabase 연결 시도 ${attempt}회 실패:`, e.message);
+          if (attempt === 2) {
+            toast('Supabase 연결 오류: '+e.message, 'err');
+            setSbStatus(false);
+          } else {
+            await new Promise(r => setTimeout(r, 1500));
+          }
+        }
       }
     } else {
       setSbStatus(false);
