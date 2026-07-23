@@ -116,11 +116,15 @@ class HealthHandler(BaseHTTPRequestHandler):
                 b64 = payload.get('image_b64', '')
                 mt  = payload.get('media_type', 'image/jpeg')
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+                # 캐스퍼 수정 2026-07-23: 영수증에 연도가 없는 경우가 대부분이라
+                # 오늘 날짜를 프롬프트에 명시하지 않으면 모델이 엉뚱한 연도(예: 2023)를
+                # 추측해버리는 버그가 있었음. 오늘 날짜를 컨텍스트로 반드시 제공.
+                _today_str = str(today_kst())
                 msg = client.messages.create(
                     model="claude-haiku-4-5-20251001", max_tokens=400,
                     messages=[{"role":"user","content":[
                         {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                        {"type":"text","text":'이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}\n숫자만(원제외). JSON만 반환.'}
+                        {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라. 숫자만(원제외). JSON만 반환.'}
                     ]}]
                 )
                 txt = _re.sub(r"```[a-z]*", "", msg.content[0].text.strip()).strip()
@@ -152,19 +156,22 @@ class HealthHandler(BaseHTTPRequestHandler):
                 )
                 is_daily = '일별' in cls_msg.content[0].text
 
+                # 캐스퍼 수정 2026-07-23: 연도 미표시 영수증/화면에서 모델이 엉뚱한 연도를
+                # 추측하던 버그(예: 2023) 방지 — 오늘 날짜를 프롬프트에 명시.
+                _today_str = str(today_kst())
                 if is_daily:
                     prompt = (
-                        '이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
+                        f'오늘 날짜는 {_today_str}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
                         '{"type":"daily_history","date":"YYYY-MM-DD","calls":['
                         '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
-                        '날짜: 상단 YYYY년 M월 D일. 결제방식: 직접결제 있으면 직접, 없으면 자동. JSON만 반환.'
+                        f'날짜: 화면에 연도가 없으면 오늘({_today_str}) 기준 연도 사용. 상단 YYYY년 M월 D일 있으면 그것 우선. 결제방식: 직접결제 있으면 직접, 없으면 자동. JSON만 반환.'
                     )
                 else:
                     prompt = (
-                        '이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
+                        f'오늘 날짜는 {_today_str}입니다. 이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
                         '{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":['
                         '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
-                        '날짜: 조회일/거래일. 취소건 제외. 숫자만(원제외). JSON만 반환.'
+                        f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외). JSON만 반환.'
                     )
                 ocr_msg = client.messages.create(
                     model="claude-haiku-4-5-20251001", max_tokens=2000,
