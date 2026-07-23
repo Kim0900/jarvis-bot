@@ -3589,6 +3589,115 @@ async def get_fish_report_db(hour=None, tag_filter=None):
     return "\n".join(lines)
 
 
+# ──────────────────────────────────────────────
+# atlas_reports 서버사이드 폴링 (2026-07-24 신규)
+# 기존엔 앱(index.html) 켜져있을 때만 pollAtlasReports가 돌아서
+# "자동 감지"가 실제로는 반자동이었던 문제를 해결. 봇(24시간 서버)에
+# 동일 로직을 이식해서 앱을 안 켜놔도 진짜 자동으로 처리되게 함.
+# ──────────────────────────────────────────────
+
+async def build_magi_system_prompt(recent_summary: str = "") -> str:
+    try:
+        rows = await sb_select("magi_context", {"is_active": "eq.true", "order": "version.desc", "limit": "1"})
+    except Exception:
+        rows = None
+    if not rows:
+        return "당신은 대구 택시기사의 AI 분석 도우미입니다."
+    ctx = rows[0]
+    extra = f"\n[최근 데이터]\n{recent_summary}" if recent_summary else ""
+    return f"""당신은 마기(MAGI)입니다. 대구 세큐티 가맹 택시기사의 전략 두뇌입니다.
+
+[운영 원칙]
+{ctx.get('principles') or ''}
+
+[핵심 메모리]
+{ctx.get('core_memory') or ''}
+
+[데이터 검증 원칙]
+{ctx.get('data_rules') or ''}
+{extra}
+
+위 맥락을 바탕으로 분석하고 7섹션 브리핑 형식으로 답변하세요.
+통제 가능한 변수만 권고하고, 방어적 화법을 쓰지 마세요."""
+
+
+async def process_atlas_report_server(report: dict) -> bool:
+    """앱의 processAtlasReport()와 동일 로직의 서버사이드(봇) 버전.
+    반환: True=분석 성공(status=analyzed), False=실패(status=error)"""
+    try:
+        recent_calls = await sb_select("raw_calls", {"order": "날짜.desc,배차시각.desc", "limit": "10"}) or []
+        recent_summary = "\n".join(
+            f"{c.get('날짜')} {c.get('배차시각') or ''} {c.get('출발지') or ''}->{c.get('도착지') or ''} {fmt(c.get('요금'))}"
+            for c in recent_calls
+        )
+        system_prompt = await build_magi_system_prompt(recent_summary)
+        user_msg = (
+            f"아틀라스 보고서 ({report.get('report_type')}):\n"
+            f"제목: {report.get('title') or '제목없음'}\n"
+            f"내용: {json.dumps(report.get('payload'), ensure_ascii=False, indent=2)}\n\n"
+            f"위 보고서를 분석하고 7섹션 브리핑을 작성해주세요."
+        )
+
+        import anthropic as _ant
+        client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
+        msg = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        analysis = msg.content[0].text
+
+        await sb_h(
+            "PATCH", f"atlas_reports?id=eq.{report['id']}",
+            json={"status": "analyzed", "magi_analysis": analysis, "analyzed_at": datetime.now(KST).isoformat()},
+            headers={**HEADERS_SB, "Prefer": "return=minimal"},
+        )
+        logger.info(f"atlas_reports #{report['id']} 분석 완료")
+        return True
+
+    except Exception as e:
+        logger.error(f"atlas_reports #{report.get('id')} 분석 오류: {e}")
+        try:
+            await sb_h(
+                "PATCH", f"atlas_reports?id=eq.{report['id']}",
+                json={"status": "error"},
+                headers={**HEADERS_SB, "Prefer": "return=minimal"},
+            )
+        except Exception:
+            pass
+        return False
+
+
+def atlas_reports_scheduler(app):
+    """30초마다 atlas_reports(status=pending) 폴링, 앱 미실행 시에도 동작.
+    처리 성공 시 텔레그램으로도 요약 알림."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    chat_ids = [x for x in [os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")] if x]
+
+    async def notify(report, ok):
+        title = report.get("title") or "제목없음"
+        text = f"📡 아틀라스 보고 처리 {'완료' if ok else '실패'}: {title}"
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(chat_id=cid, text=text)
+            except Exception:
+                pass
+
+    while True:
+        try:
+            rows = loop.run_until_complete(
+                sb_select("atlas_reports", {"status": "eq.pending", "order": "created_at.asc", "limit": "3"})
+            ) or []
+            for report in rows:
+                ok = loop.run_until_complete(process_atlas_report_server(report))
+                loop.run_until_complete(notify(report, ok))
+        except Exception as e:
+            logger.error(f"atlas_reports 스케줄러 오류: {e}")
+        time.sleep(30)
+
+
 def fish_scheduler(app):
     """18:50 영업준비 브리핑 + 19~02시 매 정각 자동 브리핑
     2026-07-13 수정: 하드코딩 FISH_DATA(get_fish_report) → 실데이터 기반(get_fish_report_db)으로 전환.
@@ -4254,6 +4363,8 @@ def main():
 
     # 어군탐지기 스케줄러 — app 생성 후 시작
     threading.Thread(target=fish_scheduler, args=(app,), daemon=True).start()
+    threading.Thread(target=atlas_reports_scheduler, args=(app,), daemon=True).start()
+    logger.info("atlas_reports 서버사이드 폴링 시작")
     logger.info("어군탐지기 스케줄러 시작")
 
     # 핸들러 등록
