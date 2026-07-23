@@ -1485,11 +1485,13 @@ select.inp{padding:10px 13px}
         const dayRecs = await sbSelect('raw_calls',{'날짜':'eq.'+rec.날짜}) || [];
         const dayTotal = dayRecs.reduce((s,r)=>s+(r.요금||0),0);
         const dayCount = dayRecs.length;
+        // 캐스퍼 수정 2026-07-23: daily_summary 실제 컬럼명은 '총콜수'가 아니라 '총건수'.
+        // 존재하지 않는 컬럼(총콜수)으로 계속 POST해서 매번 저장 실패하던 버그.
+        // '건당단가'는 테이블에 컬럼 자체가 없고 총매출/총건수로 언제든 계산 가능한 파생값이라 저장 생략.
         await sbReq('POST','daily_summary',{
           날짜: rec.날짜,
           총매출: dayTotal,
-          총콜수: dayCount,
-          건당단가: dayCount ? Math.round(dayTotal/dayCount) : 0
+          총건수: dayCount
         }, {'on_conflict':'날짜'}, {'Prefer':'resolution=merge-duplicates,return=minimal'});
       }
       cancelOcr();
