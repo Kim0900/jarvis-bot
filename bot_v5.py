@@ -55,6 +55,17 @@ GITHUB_OWNER = os.getenv("GITHUB_OWNER", "Kim0900")
 GITHUB_REPO  = os.getenv("GITHUB_REPO", "magi-taxi-data")
 
 OCR_MODEL      = "claude-haiku-4-5-20251001"
+
+def _extract_claude_text(msg) -> str:
+    """캐스퍼 수정 2026-07-24: Claude 응답의 content가 항상 텍스트 블록이라는
+    가정(content[0].text)이 최신 모델(sonnet-5 등)에서 ThinkingBlock이 먼저
+    오는 경우 깨짐('ThinkingBlock' object has no attribute 'text'). 
+    type=='text'인 블록만 안전하게 찾아서 반환."""
+    for block in msg.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
 HEADERS_SB = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -127,7 +138,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                         {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라.\n⚠️ commission(수수료)은 영수증에 "수수료"라고 명시적으로 적힌 금액만 사용해라. "카드결제"·"앱결제"·"현금결제"처럼 결제수단별로 나눈 금액은 수수료가 아니니 절대 혼동하지 마라. "수수료"라는 글자가 영수증에 없으면 commission은 0으로 반환해라. 숫자만(원제외). JSON만 반환.'}
                     ]}]
                 )
-                txt = _re.sub(r"```[a-z]*", "", msg.content[0].text.strip()).strip()
+                txt = _re.sub(r"```[a-z]*", "", _extract_claude_text(msg).strip()).strip()
                 send_json(200, {"success": True, "data": _j.loads(txt)})
             except Exception as e:
                 logger.error(f"OCR 오류: {e}")
@@ -154,7 +165,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                         {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
                     ]}]
                 )
-                is_daily = '일별' in cls_msg.content[0].text
+                is_daily = '일별' in _extract_claude_text(cls_msg)
 
                 # 캐스퍼 수정 2026-07-23: 연도 미표시 영수증/화면에서 모델이 엉뚱한 연도를
                 # 추측하던 버그(예: 2023) 방지 — 오늘 날짜를 프롬프트에 명시.
@@ -180,7 +191,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                         {"type":"text","text":prompt}
                     ]}]
                 )
-                txt = _re.sub(r"```[a-z]*","",ocr_msg.content[0].text.strip()).strip()
+                txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
                 data = _j.loads(txt)
                 send_json(200, {"success":True,"data":data})
             except Exception as e:
@@ -198,7 +209,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     system=payload.get('system_prompt','당신은 마기입니다.'),
                     messages=[{"role":"user","content":payload.get('user_message','')}]
                 )
-                send_json(200, {"success": True, "result": msg.content[0].text})
+                send_json(200, {"success": True, "result": _extract_claude_text(msg)})
             except Exception as e:
                 logger.error(f"마기분석 오류: {e}")
                 send_json(400, {"success": False, "error": str(e)})
@@ -460,7 +471,7 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
                 ],
             }],
         )
-        return msg.content[0].text.strip()
+        return _extract_claude_text(msg).strip()
 
     return await asyncio.to_thread(_sync_call)
 
@@ -3646,7 +3657,7 @@ async def process_atlas_report_server(report: dict) -> bool:
             system=system_prompt,
             messages=[{"role": "user", "content": user_msg}],
         )
-        analysis = msg.content[0].text
+        analysis = _extract_claude_text(msg)
 
         await sb_h(
             "PATCH", f"atlas_reports?id=eq.{report['id']}",
