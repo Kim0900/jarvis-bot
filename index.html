@@ -198,6 +198,10 @@ select.inp{padding:10px 13px}
       <span style="font-size:14px;font-weight:700">🤖 마기 분석 피드</span>
       <span id="atlas-badge" style="background:var(--gold);color:#000;border-radius:12px;padding:2px 8px;font-size:11px;font-weight:700;display:none">0</span>
     </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input type="date" id="magi-feed-date" class="inp" style="flex:1;font-size:13px" onchange="renderMagiFeed(this.value)">
+      <button class="btn-ghost" style="padding:8px 14px;font-size:12px" onclick="document.getElementById('magi-feed-date').value='';renderMagiFeed()">최신</button>
+    </div>
     <div id="magi-analysis-container">
       <div style="text-align:center;color:var(--mu);padding:20px;font-size:13px">
         아틀라스 보고 대기 중...<br>
@@ -2429,27 +2433,47 @@ ${extraData ? '[최근 데이터]\n'+extraData : ''}
   // ════════════════════════════════════════
   //  모듈 A: 아틀라스 보고 수신 (Polling)
   // ════════════════════════════════════════
+  // 캐스퍼 수정 2026-07-24: 앱이 직접 분석·저장하던 로직(processAtlasReport) 제거.
+  // 봇(서버, atlas_reports_scheduler)이 이미 30초마다 자동 처리하고 있어서
+  // 앱도 동시에 처리하면 같은 보고서를 이중 처리 → 중복 카드가 쌓이던 원인이었음.
+  // 이제 앱은 "pending 건수 확인 + 이미 analyzed된 결과 조회 표시"만 담당.
   async function pollAtlasReports() {
     if(!sbUrl || !sbKey) return;
     try {
-      const rows = await sbSelect('atlas_reports', {
-        'status':'eq.pending',
-        'order':'created_at.asc',
-        'limit':'3'
-      });
-      if(rows && rows.length > 0) {
-        console.log(`아틀라스 보고 ${rows.length}건 수신`);
-        let successCount = 0;
-        for(const report of rows) {
-          const ok = await processAtlasReport(report);
-          if(ok) successCount++;
-        }
-        // 알림 표시 — 실제로 화면에 뜬(분석 성공한) 건수만 배지에 반영
-        // 캐스퍼 수정 2026-07-06: 이전엔 pending 건수를 그대로 배지에 띄워서
-        // 분석이 실패해도 "1건 도착"처럼 보이고 화면엔 아무것도 안 뜨는 모순이 있었음
-        showAtlasBadge(successCount);
-      }
+      const pending = await sbSelect('atlas_reports', {'status':'eq.pending'});
+      showAtlasBadge(pending ? pending.length : 0);
+      const dateInp = document.getElementById('magi-feed-date');
+      await renderMagiFeed(dateInp ? dateInp.value : '');
     } catch(e) { /* 폴링 오류는 무시 */ }
+  }
+
+  // 마기 분석 피드 렌더링 — 누적 X, 선택 날짜(없으면 최신) 1건만 전체 표시
+  async function renderMagiFeed(dateStr) {
+    const container = document.getElementById('magi-analysis-container');
+    if(!container || !sbUrl || !sbKey) return;
+    try {
+      const params = dateStr
+        ? {'run_date':'eq.'+dateStr, 'status':'eq.analyzed', 'order':'analyzed_at.desc', 'limit':'1'}
+        : {'status':'eq.analyzed', 'order':'analyzed_at.desc', 'limit':'1'};
+      const rows = await sbSelect('atlas_reports', params);
+      if(!rows || !rows.length) {
+        container.innerHTML = `<div style="text-align:center;color:var(--mu);padding:20px;font-size:13px">
+          ${dateStr ? esc(dateStr)+' 보고 없음' : '아틀라스 보고 대기 중...'}<br>
+          <span style="font-size:11px">Supabase 연결 후 자동 수신됩니다</span>
+        </div>`;
+        return;
+      }
+      const report = rows[0];
+      const timeStr = report.analyzed_at ? new Date(report.analyzed_at).toLocaleString('ko-KR') : '';
+      container.innerHTML = `
+        <div class="card" style="border-left:3px solid var(--gold)">
+          <div style="font-size:11px;color:var(--mu);margin-bottom:6px">📡 ${esc(report.run_date||'')} · ${esc(timeStr)}</div>
+          <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:8px">${esc(report.title || report.report_type || '제목없음')}</div>
+          <div style="font-size:13px;color:var(--sub);line-height:1.7;white-space:pre-wrap">${esc(report.magi_analysis || '(분석 내용 없음)')}</div>
+        </div>`;
+    } catch(e) {
+      container.innerHTML = `<div style="text-align:center;color:var(--red);padding:20px;font-size:13px">조회 오류: ${esc(e.message)}</div>`;
+    }
   }
 
   function showAtlasBadge(count) {
@@ -2469,101 +2493,9 @@ ${extraData ? '[최근 데이터]\n'+extraData : ''}
   //  모듈 B: Claude API 마기 분석 호출
   //  반환값: true=화면 표시 성공, false=실패(에러 카드 표시)
   // ════════════════════════════════════════
-  async function processAtlasReport(report) {
-    try {
-      // 최근 운행 추세 데이터 수집
-      const today = td();
-      const recentCalls = await sbSelect('raw_calls', {
-        'order':'날짜.desc,배차시각.desc',
-        'limit':'50'
-      });
-      const recentSummary = recentCalls.slice(0,10).map(c=>
-        `${c.날짜} ${c.배차시각||''} ${c.출발지||''}->${c.도착지||''} ${fmt(c.요금)}원`
-      ).join('\n');
-
-      // 모듈 C: 맥락 주입
-      const systemPrompt = buildMagiSystemPrompt(recentSummary);
-
-      const userMsg = `아틀라스 보고서 (${report.report_type}):
-제목: ${report.title||'제목없음'}
-내용: ${JSON.stringify(report.payload, null, 2)}
-
-위 보고서를 분석하고 7섹션 브리핑을 작성해주세요.`;
-
-      const magiResp = await backendReq('/magi_analyze', 'POST', {
-        system_prompt: systemPrompt,
-        user_message: userMsg,
-        model: 'claude-sonnet-5',
-        max_tokens: 1500
-      });
-      if(!magiResp || !magiResp.success) throw new Error(magiResp?.error || '마기 분석 서버 오류');
-      const analysis = magiResp.result;
-
-      // DB에 분석 결과 저장 + 상태 업데이트
-      await sbReq('PATCH', `atlas_reports?id=eq.${report.id}`, {
-        status: 'analyzed',
-        magi_analysis: analysis,
-        analyzed_at: new Date().toISOString()
-      });
-
-      // 앱 화면에 표시
-      displayMagiAnalysis(report, analysis);
-      return true;
-
-    } catch(e) {
-      console.error('마기 분석 오류:', e.message);
-      // 오류 시 상태를 error로 변경
-      try { await sbReq('PATCH', `atlas_reports?id=eq.${report.id}`, { status: 'error' }); } catch(e2){}
-      // 캐스퍼 수정 2026-07-06: 실패해도 화면에 아무 표시가 없던 문제 — 에러 카드 표시
-      displayMagiError(report, e.message);
-      return false;
-    }
-  }
-
-  function displayMagiError(report, message) {
-    const container = document.getElementById('magi-analysis-container');
-    if(!container) return;
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.style.cssText = 'border-left:3px solid var(--red);margin-bottom:12px';
-    card.innerHTML = `
-      <div style="font-size:11px;color:var(--mu);margin-bottom:6px">
-        ⚠️ 아틀라스 보고 분석 실패 · ${new Date().toLocaleTimeString('ko-KR')}
-      </div>
-      <div style="font-size:13px;font-weight:700;margin-bottom:4px">${esc(report.title || report.report_type || '제목없음')}</div>
-      <div style="font-size:12px;color:var(--red)">${esc(message || '알 수 없는 오류')}</div>
-      <div style="font-size:11px;color:var(--mu);margin-top:6px">보고 자체는 DB에 저장되어 있습니다. 백엔드 서버 상태나 연결 상태를 확인해주세요.</div>
-    `;
-    // 최초 placeholder 문구는 지우고 카드로 교체
-    const placeholder = container.querySelector('div[style*="text-align:center"]');
-    if(placeholder) placeholder.remove();
-    container.prepend(card);
-  }
-
-  function displayMagiAnalysis(report, analysis) {
-    const container = document.getElementById('magi-analysis-container');
-    if(!container) return;
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.style.cssText = 'border-left:3px solid var(--gold);margin-bottom:12px';
-    card.innerHTML = `
-      <div style="font-size:11px;color:var(--mu);margin-bottom:6px">
-        📡 아틀라스 보고 · ${new Date().toLocaleTimeString('ko-KR')}
-      </div>
-      <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:8px">
-        ${esc(report.title || report.report_type)}
-      </div>
-      <div style="font-size:13px;color:var(--sub);line-height:1.7;white-space:pre-wrap">${esc(analysis)}</div>
-    `;
-    // 최초 placeholder 문구 제거 (캐스퍼 수정 2026-07-06, displayMagiError와 동일 처리)
-    const placeholder = container.querySelector('div[style*="text-align:center"]');
-    if(placeholder) placeholder.remove();
-    container.prepend(card);
-    // 홈 탭이면 보이도록
-    if(document.getElementById('pg-home').classList.contains('on')) {
-      card.scrollIntoView({behavior:'smooth', block:'nearest'});
-    }
-  }
+  // 캐스퍼 수정 2026-07-24: processAtlasReport/displayMagiAnalysis/displayMagiError
+  // 제거됨(더 이상 호출 안 됨). 분석은 봇(서버, atlas_reports_scheduler)이 전담하고
+  // 앱은 renderMagiFeed()로 결과만 조회 표시하는 구조로 전환.
 
   // 아틀라스에서 직접 보고 입력 (수동 브리지 대체)
   async function submitAtlasReport(type, title, payload) {
