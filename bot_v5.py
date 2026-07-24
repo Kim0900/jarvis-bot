@@ -3661,7 +3661,7 @@ async def process_atlas_report_server(report: dict) -> bool:
         client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
         msg = client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=4000,  # 캐스퍼 수정 2026-07-24: 1500이었는데 확장사고가
+            max_tokens=8000,  # 캐스퍼 수정 2026-07-24: 1500이었는데 확장사고가
             # 토큰을 다 써버려 실제 텍스트가 생성되기 전에 잘리는 경우가 있어 상향
             system=system_prompt,
             messages=[{"role": "user", "content": user_msg}],
