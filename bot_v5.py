@@ -182,7 +182,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                         f'오늘 날짜는 {_today_str}입니다. 이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
                         '{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":['
                         '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
-                        f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외). JSON만 반환.'
+                        f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외).\n'
+                        '⚠️ "카드"는 반드시 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용해라. '
+                        '화면 맨 위 상태바(통신사명·시간·배터리 등 휴대폰 UI)는 절대 참고하지 마라. '
+                        '개별 건에 카드사 표시가 없으면 "미상"으로 반환해라. JSON만 반환.'
                     )
                 ocr_msg = client.messages.create(
                     model="claude-haiku-4-5-20251001", max_tokens=2000,
@@ -3653,11 +3656,16 @@ async def process_atlas_report_server(report: dict) -> bool:
         client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
         msg = client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=1500,
+            max_tokens=4000,  # 캐스퍼 수정 2026-07-24: 1500이었는데 확장사고가
+            # 토큰을 다 써버려 실제 텍스트가 생성되기 전에 잘리는 경우가 있어 상향
             system=system_prompt,
             messages=[{"role": "user", "content": user_msg}],
         )
         analysis = _extract_claude_text(msg)
+        if not analysis:
+            # 캐스퍼 수정 2026-07-24: 빈 응답을 "성공"으로 잘못 저장하던 버그.
+            # 텍스트를 못 뽑으면 명시적으로 실패 처리해서 재시도 가능하게 함.
+            raise ValueError(f"Claude 응답에 텍스트 블록 없음 (content 타입들: {[getattr(b,'type',None) for b in msg.content]}, stop_reason: {msg.stop_reason})")
 
         await sb_h(
             "PATCH", f"atlas_reports?id=eq.{report['id']}",
