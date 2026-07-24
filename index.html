@@ -2195,8 +2195,8 @@ select.inp{padding:10px 13px}
         const dd = await dr.json();
         const isDaily = dd.content?.[0]?.text?.includes('일별');
         const prompt = isDaily
-          ? '이 카카오T 일별운행이력 화면에서 모든 운행건을 추출해서 JSON만 반환해줘.\n{"type":"daily_history","date":"YYYY-MM-DD","calls":[{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n날짜: 상단 YYYY년 M월 D일. JSON만 반환.'
-          : '이 결제내역 화면에서 모든 결제건을 추출해서 JSON만 반환해줘.\n{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":[{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n날짜: 조회일. 취소건 제외. 숫자만.\n"카드"는 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용, 화면 상단 상태바(통신사·시간·배터리)는 참고하지 마라. 표시 없으면 "미상". JSON만 반환.';
+          ? `오늘 날짜는 ${td()}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행건을 추출해서 JSON만 반환해줘.\n{"type":"daily_history","date":"YYYY-MM-DD","calls":[{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n날짜: 화면에 연도 없으면 오늘(${td()}) 기준 연도 사용, 상단 YYYY년 M월 D일 있으면 그것 우선.\n⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 지명을 지어내거나 짐작하지 마라. 흐리거나 확신 안 서면 "미확인". JSON만 반환.`
+          : `오늘 날짜는 ${td()}입니다. 이 결제내역 화면에서 모든 결제건을 추출해서 JSON만 반환해줘.\n{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":[{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n날짜: 조회일, 연도 없으면 오늘(${td()}) 기준. 취소건 제외. 숫자만.\n"카드"는 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용, 화면 상단 상태바(통신사·시간·배터리)는 참고하지 마라. 표시 없으면 "미상". JSON만 반환.`;
         const or2 = await fetch('https://api.anthropic.com/v1/messages',{
           method:'POST',
           headers:{'Content-Type':'application/json','x-api-key':claudeKey,
@@ -2324,13 +2324,18 @@ select.inp{padding:10px 13px}
       let matched = 0, unmatched_receipts = [];
 
       // 매칭: 결제내역 기준으로 콜카드 찾기
+      // 캐스퍼 수정 2026-07-24: 배차시각 기준으로 비교하고 있었는데, 결제는
+      // 배차가 아니라 "하차 후"에 이뤄지므로 운행시간이 20분(TOLERANCE) 넘는
+      // 콜은 전부 매칭 실패하던 구조적 결함. 하차시각 기준으로 비교하도록 수정
+      // (하차시각 없는 옛날 데이터 대비 배차시각 폴백 유지).
       const usedCallIds = new Set();
       for(const r of receipts) {
         const rMin = toMin(r.시각);
         let best = null, bestDiff = TOLERANCE+1;
         for(const c of calls) {
           if(usedCallIds.has(c.id)) continue;
-          const diff = Math.abs(toMin(c.배차시각) - rMin);
+          const cMin = toMin(c.하차시각 || c.배차시각);
+          const diff = Math.abs(cMin - rMin);
           if(diff <= TOLERANCE && diff < bestDiff) { bestDiff=diff; best=c; }
         }
         if(best) {
