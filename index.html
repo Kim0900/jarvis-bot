@@ -2214,7 +2214,7 @@ select.inp{padding:10px 13px}
         const isDaily = dd.content?.[0]?.text?.includes('일별');
         const prompt = isDaily
           ? `오늘 날짜는 ${td()}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행건을 추출해서 JSON만 반환해줘.\n{"type":"daily_history","date":"YYYY-MM-DD","calls":[{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n날짜: 화면에 연도 없으면 오늘(${td()}) 기준 연도 사용, 상단 YYYY년 M월 D일 있으면 그것 우선.\n⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 지명을 지어내거나 짐작하지 마라. 흐리거나 확신 안 서면 "미확인". JSON만 반환.`
-          : `오늘 날짜는 ${td()}입니다. 이 결제내역 화면에서 모든 결제건을 추출해서 JSON만 반환해줘.\n{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":[{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n날짜: 조회일, 연도 없으면 오늘(${td()}) 기준. 취소건 제외. 숫자만.\n"카드"는 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용, 화면 상단 상태바(통신사·시간·배터리)는 참고하지 마라. 표시 없으면 "미상". JSON만 반환.`;
+          : `오늘 날짜는 ${td()}입니다. 이 결제내역 화면에서 모든 결제건을 추출해서 JSON만 반환해줘.\n{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":[{"시각":"HH:MM","요금":숫자,"카드":"카드사명 또는 빈 문자열"}]}\n날짜: 조회일, 연도 없으면 오늘(${td()}) 기준. 취소건 제외. 숫자만.\n"카드"는 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용, 화면 상단 상태바(통신사·시간·배터리)는 참고하지 마라. 표시 없으면 빈 문자열("")로 둬라, 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.`;
         const or2 = await fetch('https://api.anthropic.com/v1/messages',{
           method:'POST',
           headers:{'Content-Type':'application/json','x-api-key':claudeKey,
@@ -2245,7 +2245,7 @@ select.inp{padding:10px 13px}
       } else if(type === 'payment') {
         const items = histOcrData.items || [];
         rows.innerHTML = `<b>💳 결제내역 — ${esc(histOcrData.date)} (${items.length}건 / ${fmt(histOcrData.total)}원)</b><br>` +
-          items.slice(0,5).map(i=>`${esc(i.시각)} ${fmt(i.요금)}원 ${esc(i.카드||'')}`).join('<br>') +
+          items.slice(0,5).map(i=>`${esc(i.시각)} ${fmt(i.요금)}원${(i.카드 && i.카드!=='미상') ? ' '+esc(i.카드) : ''}`).join('<br>') +
           (items.length>5 ? `<br>...외 ${items.length-5}건` : '');
       }
       resEl.style.display='block';
@@ -2301,7 +2301,7 @@ select.inp{padding:10px 13px}
             날짜: histOcrData.date,
             시각: item.시각,
             요금: item.요금,
-            결제방법: item.카드 ? '카드' : '현금'
+            결제방법: (item.카드 && item.카드 !== '미상') ? '카드' : '현금'
           });
           saved++;
         }
