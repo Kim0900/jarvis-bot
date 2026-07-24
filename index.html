@@ -2466,9 +2466,13 @@ ${extraData ? '[최근 데이터]\n'+extraData : ''}
     const container = document.getElementById('magi-analysis-container');
     if(!container || !sbUrl || !sbKey) return;
     try {
+      // 캐스퍼 수정 2026-07-25: analyzed_at(마기 처리시각) 기준 정렬이라 밀려서 뒤늦게
+      // 처리된 과거 브리핑(예: 07-15가 07-24에 처리)이 "최신"으로 뜨던 버그.
+      // run_date(브리핑이 다루는 실제 날짜) 기준으로 정렬하도록 수정, 동일 날짜 내에서만
+      // analyzed_at으로 보조 정렬.
       const params = dateStr
-        ? {'run_date':'eq.'+dateStr, 'status':'eq.analyzed', 'order':'analyzed_at.desc', 'limit':'1'}
-        : {'status':'eq.analyzed', 'order':'analyzed_at.desc', 'limit':'1'};
+        ? {'run_date':'eq.'+dateStr, 'status':'eq.analyzed', 'order':'run_date.desc,analyzed_at.desc', 'limit':'1'}
+        : {'status':'eq.analyzed', 'order':'run_date.desc,analyzed_at.desc', 'limit':'1'};
       const rows = await sbSelect('atlas_reports', params);
       if(!rows || !rows.length) {
         container.innerHTML = `<div style="text-align:center;color:var(--mu);padding:20px;font-size:13px">
