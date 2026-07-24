@@ -2273,10 +2273,27 @@ select.inp{padding:10px 13px}
       const type = histOcrData.type;
 
       if(type === 'daily_history') {
-        // raw_calls 저장
+        const calls = histOcrData.calls || [];
         const DOW = ['일','월','화','수','목','금','토'];
+
+        // 캐스퍼 수정 2026-07-25: 저장 전 중복 체크 — 같은 날짜/배차시각/요금 조합이
+        // 이미 raw_calls에 있으면 그대로 다시 INSERT하지 않고 먼저 사용자에게 확인받는다.
+        const dupDates = [...new Set(calls.map(c=>adjustDate(histOcrData.date, c.배차시각)))];
+        const existingByDate = {};
+        for(const d of dupDates) existingByDate[d] = await sbSelect('raw_calls', {'날짜':'eq.'+d});
+        const dupSet = new Set(calls.filter(c => {
+          const realDate = adjustDate(histOcrData.date, c.배차시각);
+          return (existingByDate[realDate]||[]).some(e => e.배차시각===c.배차시각 && Number(e.요금)===Number(c.요금));
+        }));
+        let toSave = calls;
+        if(dupSet.size) {
+          const list = [...dupSet].map(c=>`· ${c.배차시각} ${fmt(c.요금)}원`).join('\n');
+          const keepDup = confirm(`⚠️ 이미 저장된 것과 동일한 항목 ${dupSet.size}건이 있습니다 (중복 가능성):\n${list}\n\n[확인] = 중복 포함 전부 저장\n[취소] = 중복 제외하고 나머지만 저장`);
+          if(!keepDup) toSave = calls.filter(c=>!dupSet.has(c));
+        }
+
         let saved = 0;
-        for(const c of (histOcrData.calls||[])) {
+        for(const c of toSave) {
           const realDate = adjustDate(histOcrData.date, c.배차시각);
           const dow = DOW[new Date(realDate+'T12:00:00').getDay()];
           await sbInsert('raw_calls', {
@@ -2290,13 +2307,24 @@ select.inp{padding:10px 13px}
         }
         toast(`✅ ${saved}건 저장 완료 — 교차대조 시작`);
         // 저장 후 교차대조 자동 실행
-        const dates = [...new Set((histOcrData.calls||[]).map(c=>adjustDate(histOcrData.date, c.배차시각)))];
+        const dates = [...new Set(toSave.map(c=>adjustDate(histOcrData.date, c.배차시각)))];
         for(const d of dates) await runCrossCheck(d);
 
       } else if(type === 'payment') {
-        // payment_receipts 저장
+        const items = histOcrData.items || [];
+
+        // 캐스퍼 수정 2026-07-25: 저장 전 중복 체크 (payment_receipts, 날짜+시각+요금 기준)
+        const existing = await sbSelect('payment_receipts', {'날짜':'eq.'+histOcrData.date});
+        const dupSet = new Set(items.filter(i => (existing||[]).some(e => e.시각===i.시각 && Number(e.요금)===Number(i.요금))));
+        let toSave = items;
+        if(dupSet.size) {
+          const list = [...dupSet].map(i=>`· ${i.시각} ${fmt(i.요금)}원`).join('\n');
+          const keepDup = confirm(`⚠️ 이미 저장된 것과 동일한 항목 ${dupSet.size}건이 있습니다 (중복 가능성):\n${list}\n\n[확인] = 중복 포함 전부 저장\n[취소] = 중복 제외하고 나머지만 저장`);
+          if(!keepDup) toSave = items.filter(i=>!dupSet.has(i));
+        }
+
         let saved = 0;
-        for(const item of (histOcrData.items||[])) {
+        for(const item of toSave) {
           await sbInsert('payment_receipts', {
             날짜: histOcrData.date,
             시각: item.시각,
@@ -2306,7 +2334,7 @@ select.inp{padding:10px 13px}
           saved++;
         }
         toast(`✅ ${saved}건 결제내역 저장 — 교차대조 시작`);
-        await runCrossCheck(histOcrData.date);
+        if(saved) await runCrossCheck(histOcrData.date);
       }
 
       resetHistOcr();
