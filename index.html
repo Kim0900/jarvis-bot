@@ -813,7 +813,11 @@ select.inp{padding:10px 13px}
       }
 
       st('h-week', fmt(weekTotal)+'원');
-      st('h-wd', weekRecs.length);
+      // 캐스퍼 수정 2026-07-24: 월간 카드(h-md)와 동일한 버그 — weekRecs.length는
+      // 콜 건수(레코드 수)라 "14일 운행" 같은 말도 안되는 숫자가 뜨고 있었음.
+      // 실제 고유 운행일수(Set of 날짜)로 수정.
+      const weekWorkDays = new Set(weekRecs.map(r=>r.날짜).filter(Boolean)).size;
+      st('h-wd', weekWorkDays);
       st('h-lw', fmt(lwTotal));
       document.getElementById('h-wdiff').innerHTML = lwTotal ? db(weekTotal-lwTotal) : '<span class="nm">비교 없음</span>';
 
