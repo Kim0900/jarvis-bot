@@ -1939,6 +1939,15 @@ select.inp{padding:10px 13px}
       const baehoeZones = (sbUrl && sbKey) ? await restoreBaehoeZones(parsed, dateStr) : [];
       gpxData.baehoeZones = baehoeZones;
 
+      // 캐스퍼 명령서#023 ①번 수정 (2026-07-24): restoreBaehoeZones() 결과가 로컬 calls
+      // 배열에 병합되지 않은 채 calcEfficiency()로 넘어가서 영업거리 합계가 항상 0으로
+      // 계산되던 버그. DB PATCH와 별개로, 효율지표 계산용 로컬 calls에도 반영한다.
+      const baehoeById = new Map(baehoeZones.map(b => [b.id, b]));
+      calls = calls.map(c => baehoeById.has(c.id)
+        ? {...c, 영업거리_km: baehoeById.get(c.id).영업거리_km}
+        : c);
+      gpxData.calls = calls;
+
       // 효율지표
       const eff = calcEfficiency(calls, parsed);
       gpxData.eff = eff;
@@ -1988,7 +1997,8 @@ select.inp{padding:10px 13px}
     // 효율지표
     document.getElementById('gpx-summary-rows').innerHTML += `<br>
       <span style="color:var(--green);font-weight:700">⚡ 구속시간당 매출: ${fmt(eff.구속시간당_매출)}원/h</span><br>
-      <span style="color:var(--mu)">공차율: ${eff.공차율}%  자정이후: ${eff.자정이후_비중}%</span>`;
+      <span style="color:var(--mu)">공차율: ${eff.공차율}%  자정이후: ${eff.자정이후_비중}%</span><br>
+      <span style="color:var(--orange,#e6a23c);font-size:11px">⚠️ 추정치 — 카카오T 콜 실거리 미반영, 실제보다 과대추정됨</span>`;
 
     // 룰체크
     const ruleEl = document.getElementById('rule-rows');
@@ -2107,7 +2117,7 @@ select.inp{padding:10px 13px}
     if(!card||!main||!sub) return;
     card.style.display='block';
     main.textContent = fmt(eff.구속시간당_매출)+'원/h';
-    sub.textContent  = `구속 ${eff.구속시간_h}h · 주행 ${eff.주행거리_km}km · 공차율 ${eff.공차율}%`;
+    sub.textContent  = `구속 ${eff.구속시간_h}h · 주행 ${eff.주행거리_km}km · 공차율 ${eff.공차율}% ⚠️추정(과대)`;
   }
 
   // ════════════════════════════════════════
