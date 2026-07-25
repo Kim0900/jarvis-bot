@@ -2169,6 +2169,41 @@ select.inp{padding:10px 13px}
     return screenDate;
   }
 
+  // 캐스퍼 수정 2026-07-25: 시각(HH:MM)→분 변환 전역 유틸. 중복체크/교차대조 공용.
+  // OCR 시각 인식이 1~2분 오차 나는 경우가 있어 중복판정은 ±DUP_TOLERANCE_MIN분까지 허용.
+  const DUP_TOLERANCE_MIN = 2;
+  function toMin(t) {
+    if(!t) return -1;
+    const parts = String(t).replace(/[^0-9:]/g,'').split(':');
+    let h = parseInt(parts[0]||0), m = parseInt(parts[1]||0);
+    if(h < 6) h += 24; // 자정 넘김 보정
+    return h*60 + m;
+  }
+
+  // 캐스퍼 명령서#020 처리 (2026-07-25): daegu_dongs.json(행안부 행정동 데이터, 150개)
+  // 로드 + 구-동 조합 검증. 콜카드 OCR이 서로 다른 행의 구/동을 섞어서 읽는 문제
+  // (예: "북구 동인동" — 동인동은 실제 중구) 사후 검증용.
+  let daeguDongs = null;
+  async function loadDaeguDongs() {
+    if(daeguDongs) return daeguDongs;
+    try {
+      const r = await fetch('./daegu_dongs.json');
+      daeguDongs = await r.json();
+    } catch(e) { daeguDongs = {dong_to_gu:{}}; }
+    return daeguDongs;
+  }
+  // addr 예: "대구 중구 삼덕동" → 목록에 있는 동인데 구가 다르면 {dong,wrongGu,correctGu} 반환
+  // 목록에 없는 동(대구 밖 지명, 법정동 세부표기 등)은 판단보류로 null 반환 — 오탐 방지
+  function checkGuDong(addr) {
+    if(!addr || !daeguDongs || !daeguDongs.dong_to_gu) return null;
+    const m = String(addr).match(/(\S+?[구군])\s*(\S+?동)/);
+    if(!m) return null;
+    const [, gu, dong] = m;
+    const correctGu = daeguDongs.dong_to_gu[dong];
+    if(!correctGu || correctGu === gu) return null;
+    return {dong, wrongGu: gu, correctGu};
+  }
+
   // ── 일별운행이력 + 결제내역 OCR ──
   async function runHistOcr(file) {
     const spin = document.getElementById('hist-spin');
@@ -2240,8 +2275,16 @@ select.inp{padding:10px 13px}
       const type = histOcrData.type; // 'daily_history' | 'payment'
       if(type === 'daily_history') {
         const calls = histOcrData.calls || [];
+        await loadDaeguDongs();
         rows.innerHTML = `<b>📅 일별운행이력 — ${esc(histOcrData.date)} (${calls.length}건)</b><br>` +
-          calls.map(c=>`${esc(c.배차시각)}~${esc(c.하차시각)} ${esc(c.출발지)}→${esc(c.도착지)} ${fmt(c.요금)}원${c.결제방식==='직접'?' [직접]':''}`).join('<br>');
+          calls.map(c=>{
+            const warn1 = checkGuDong(c.출발지);
+            const warn2 = checkGuDong(c.도착지);
+            const warnHtml = (warn1||warn2)
+              ? `<br><span style="color:var(--orange,#e6a23c);font-size:11px">⚠️ "${esc((warn1||warn2).dong)}"은 ${esc((warn1||warn2).correctGu)} 소속인데 ${esc((warn1||warn2).wrongGu)}로 인식됨 — OCR 오인식 의심, 원본 확인 필요</span>`
+              : '';
+            return `${esc(c.배차시각)}~${esc(c.하차시각)} ${esc(c.출발지)}→${esc(c.도착지)} ${fmt(c.요금)}원${c.결제방식==='직접'?' [직접]':''}${warnHtml}`;
+          }).join('<br>');
       } else if(type === 'payment') {
         const items = histOcrData.items || [];
         rows.innerHTML = `<b>💳 결제내역 — ${esc(histOcrData.date)} (${items.length}건 / ${fmt(histOcrData.total)}원)</b><br>` +
@@ -2283,7 +2326,9 @@ select.inp{padding:10px 13px}
         for(const d of dupDates) existingByDate[d] = await sbSelect('raw_calls', {'날짜':'eq.'+d});
         const dupSet = new Set(calls.filter(c => {
           const realDate = adjustDate(histOcrData.date, c.배차시각);
-          return (existingByDate[realDate]||[]).some(e => e.배차시각===c.배차시각 && Number(e.요금)===Number(c.요금));
+          return (existingByDate[realDate]||[]).some(e =>
+            Math.abs(toMin(e.배차시각) - toMin(c.배차시각)) <= DUP_TOLERANCE_MIN
+            && Number(e.요금)===Number(c.요금));
         }));
         let toSave = calls;
         if(dupSet.size) {
@@ -2301,7 +2346,10 @@ select.inp{padding:10px 13px}
             배차시각: c.배차시각, 하차시각: c.하차시각,
             출발지: c.출발지, 도착지: c.도착지,
             요금: c.요금, 콜유형: '카카오T',
-            비고: c.결제방식==='직접' ? '직접결제' : null
+            비고: [
+              (checkGuDong(c.출발지)||checkGuDong(c.도착지)) ? '구동불일치(확인필요)' : null,
+              c.결제방식==='직접' ? '직접결제' : null
+            ].filter(Boolean).join(', ') || null
           });
           saved++;
         }
@@ -2315,7 +2363,9 @@ select.inp{padding:10px 13px}
 
         // 캐스퍼 수정 2026-07-25: 저장 전 중복 체크 (payment_receipts, 날짜+시각+요금 기준)
         const existing = await sbSelect('payment_receipts', {'날짜':'eq.'+histOcrData.date});
-        const dupSet = new Set(items.filter(i => (existing||[]).some(e => e.시각===i.시각 && Number(e.요금)===Number(i.요금))));
+        const dupSet = new Set(items.filter(i => (existing||[]).some(e =>
+          Math.abs(toMin(e.시각) - toMin(i.시각)) <= DUP_TOLERANCE_MIN
+          && Number(e.요금)===Number(i.요금))));
         let toSave = items;
         if(dupSet.size) {
           const list = [...dupSet].map(i=>`· ${i.시각} ${fmt(i.요금)}원`).join('\n');
