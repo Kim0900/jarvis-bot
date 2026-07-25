@@ -132,7 +132,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 # 추측해버리는 버그가 있었음. 오늘 날짜를 컨텍스트로 반드시 제공.
                 _today_str = str(today_kst())
                 msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=400,
+                    model="claude-haiku-4-5-20251001", max_tokens=400, temperature=0,
                     messages=[{"role":"user","content":[
                         {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                         {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라.\n⚠️ commission(수수료)은 영수증에 "수수료"라고 명시적으로 적힌 금액만 사용해라. "카드결제"·"앱결제"·"현금결제"처럼 결제수단별로 나눈 금액은 수수료가 아니니 절대 혼동하지 마라. "수수료"라는 글자가 영수증에 없으면 commission은 0으로 반환해라. 숫자만(원제외). JSON만 반환.'}
@@ -159,7 +159,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
                 # 1단계: 유형 분류
                 cls_msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=20,
+                    model="claude-haiku-4-5-20251001", max_tokens=20, temperature=0,
                     messages=[{"role":"user","content":[
                         {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                         {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
@@ -190,7 +190,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                         '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
                     )
                 ocr_msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=2000,
+                    model="claude-haiku-4-5-20251001", max_tokens=2000, temperature=0,
                     messages=[{"role":"user","content":[
                         {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                         {"type":"text","text":prompt}
