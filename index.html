@@ -581,6 +581,12 @@ select.inp{padding:10px 13px}
     if(r.건수 != null && !isNaN(Number(r.건수))) return Number(r.건수);
     return 1;
   };
+  // 캐스퍼 수정 2026-07-25: 영수증 OCR(saveOcr)이 그날 총합계를 raw_calls에 요약행 1개로
+  // 저장하는데(배차시각 00:00 고정, 비고에 "OCR 추출: 매출 N원..."), 이게 개별 콜과 같은
+  // 테이블/컬럼에 섞여있어서 홈화면·일별이력의 단순 합계 로직이 이걸 또 하나의 콜로 오인해
+  // 이중집계하던 문제. 이 요약행을 구분해서 집계에서 제외하는 공용 필터.
+  const isReceiptSummaryRow = r => String(r?.비고||'').startsWith('OCR 추출:');
+  const excludeSummaryRows = rows => (rows||[]).filter(r => !isReceiptSummaryRow(r));
   const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const sv = (id,v) => { const e=document.getElementById(id); if(e) e.value=v; };
   const st = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=v; };
@@ -773,8 +779,13 @@ select.inp{padding:10px 13px}
           sbSelect('raw_calls', {'날짜':['gte.'+wk0, 'lte.'+wkEnd], 'order':'날짜.asc'}),
           sbSelect('raw_calls', {'날짜':['gte.'+lwStart, 'lte.'+lwEnd], 'order':'날짜.asc'})
         ]);
+        // 영수증 요약행(비고 "OCR 추출: 매출...")은 개별 콜이 아니므로 집계에서 제외
+        todayRecs = excludeSummaryRows(todayRecs);
+        monthRecs = excludeSummaryRows(monthRecs);
+        weekRecs = excludeSummaryRows(weekRecs);
+        lastWeekRecs = excludeSummaryRows(lastWeekRecs);
       } else {
-        const all = lload(KLO)||[];
+        const all = excludeSummaryRows(lload(KLO)||[]);
         todayRecs    = all.filter(r=>r.날짜===today);
         monthRecs    = all.filter(r=>r.날짜&&r.날짜.startsWith(mo));
         weekRecs     = all.filter(r=>r.날짜>=wk0 && r.날짜<=wkEnd);
@@ -959,8 +970,9 @@ select.inp{padding:10px 13px}
               '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
               'order':'날짜.desc,배차시각.desc'
             });
+        recs = excludeSummaryRows(recs);
       } else {
-        const all = lload(KLO)||[];
+        const all = excludeSummaryRows(lload(KLO)||[]);
         recs = specificDate ? all.filter(r=>r.날짜===specificDate) : all.filter(r=>r.날짜&&r.날짜.startsWith(mo));
         recs.sort((a,b)=>b.날짜.localeCompare(a.날짜)||(b.배차시각||'').localeCompare(a.배차시각||''));
       }
