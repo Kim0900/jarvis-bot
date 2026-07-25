@@ -586,7 +586,21 @@ select.inp{padding:10px 13px}
   // 테이블/컬럼에 섞여있어서 홈화면·일별이력의 단순 합계 로직이 이걸 또 하나의 콜로 오인해
   // 이중집계하던 문제. 이 요약행을 구분해서 집계에서 제외하는 공용 필터.
   const isReceiptSummaryRow = r => String(r?.비고||'').startsWith('OCR 추출:');
-  const excludeSummaryRows = rows => (rows||[]).filter(r => !isReceiptSummaryRow(r));
+  // 캐스퍼 수정 2026-07-25(2차): 위 excludeSummaryRows를 무조건 제외로 짰더니, 개별콜 없이
+  // 영수증 요약행 하나뿐인 날(예: 07-03,07-12,07-14,07-22)이 화면에서 통째로 사라지는
+  // 과교정이 발생함. 날짜별로 개별콜이 하나라도 있으면 요약행만 빼고(이중집계 방지),
+  // 개별콜이 아예 없는 날은 요약행이라도 남겨서 그날 매출이 안 보이는 일이 없게 함.
+  const excludeSummaryRows = rows => {
+    rows = rows || [];
+    const byDate = new Map();
+    for(const r of rows){ if(!byDate.has(r.날짜)) byDate.set(r.날짜, []); byDate.get(r.날짜).push(r); }
+    const out = [];
+    for(const dayRows of byDate.values()){
+      const hasReal = dayRows.some(r=>!isReceiptSummaryRow(r));
+      out.push(...(hasReal ? dayRows.filter(r=>!isReceiptSummaryRow(r)) : dayRows));
+    }
+    return out;
+  };
   const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const sv = (id,v) => { const e=document.getElementById(id); if(e) e.value=v; };
   const st = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=v; };
