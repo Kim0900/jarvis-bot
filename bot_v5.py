@@ -166,8 +166,15 @@ class HealthHandler(BaseHTTPRequestHandler):
                 # 자동 재시도하고, 그래도 안 맞으면 "인식완료"로 속이지 않고 불일치 사실을 그대로
                 # 반환해서 앱이 사용자에게 경고하도록 한다.
                 def _run_ocr_history(model):
+                    # 캐스퍼 수정 2026-07-25(5차, 긴급): Claude Sonnet 5는 temperature 등
+                    # 샘플링 파라미터를 기본값이 아닌 값으로 주면 400 에러를 반환함(적응형 사고
+                    # 방식이라 수동 파라미터 자체를 거부). 재시도 때 sonnet에도 무조건
+                    # temperature=0을 넣고 있어서 재시도가 걸릴 때마다 400으로 끊기고,
+                    # 그 결과 서버가 success:false를 반환 → 앱이 클라이언트 폴백(API키 없음
+                    # 에러)으로 떨어지던 것이 이번 장애의 실제 원인. 모델별로 파라미터를 분리.
+                    extra_kwargs = {"temperature": 0} if model.startswith("claude-haiku") else {}
                     cls_msg = client.messages.create(
-                        model=model, max_tokens=20, temperature=0,
+                        model=model, max_tokens=20, **extra_kwargs,
                         messages=[{"role":"user","content":[
                             {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                             {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
@@ -196,7 +203,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                             '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
                         )
                     ocr_msg = client.messages.create(
-                        model=model, max_tokens=2000, temperature=0,
+                        model=model, max_tokens=2000, **extra_kwargs,
                         messages=[{"role":"user","content":[
                             {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                             {"type":"text","text":prompt}
@@ -205,15 +212,22 @@ class HealthHandler(BaseHTTPRequestHandler):
                     txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
                     return _j.loads(txt)
 
+                def _safe_int(v):
+                    if v is None: return None
+                    try: return int(v)
+                    except (ValueError, TypeError):
+                        digits = _re.sub(r'[^0-9]', '', str(v))
+                        return int(digits) if digits else None
+
                 def _verify(data):
                     items = data.get('calls') if data.get('type')=='daily_history' else data.get('items')
                     items = items or []
                     actual_count = len(items)
-                    actual_sum = sum(int(i.get('요금') or 0) for i in items)
-                    header_count = data.get('표시건수')
-                    header_total = data.get('표시금액')
+                    actual_sum = sum((_safe_int(i.get('요금')) or 0) for i in items)
+                    header_count = _safe_int(data.get('표시건수'))
+                    header_total = _safe_int(data.get('표시금액'))
                     ok = (header_count is not None and header_total is not None
-                          and int(header_count)==actual_count and int(header_total)==actual_sum)
+                          and header_count==actual_count and header_total==actual_sum)
                     return ok, actual_count, actual_sum, header_count, header_total
 
                 data = _run_ocr_history("claude-haiku-4-5-20251001")
