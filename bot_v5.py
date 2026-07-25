@@ -157,47 +157,78 @@ class HealthHandler(BaseHTTPRequestHandler):
                 b64 = payload.get('image_b64', '')
                 mt  = payload.get('media_type', 'image/jpeg')
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
-                # 1단계: 유형 분류
-                cls_msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=20, temperature=0,
-                    messages=[{"role":"user","content":[
-                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                        {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
-                    ]}]
-                )
-                is_daily = '일별' in _extract_claude_text(cls_msg)
-
-                # 캐스퍼 수정 2026-07-23: 연도 미표시 영수증/화면에서 모델이 엉뚱한 연도를
-                # 추측하던 버그(예: 2023) 방지 — 오늘 날짜를 프롬프트에 명시.
                 _today_str = str(today_kst())
-                if is_daily:
-                    prompt = (
-                        f'오늘 날짜는 {_today_str}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
-                        '{"type":"daily_history","date":"YYYY-MM-DD","calls":['
-                        '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
-                        f'날짜: 화면에 연도가 없으면 오늘({_today_str}) 기준 연도 사용. 상단 YYYY년 M월 D일 있으면 그것 우선. 결제방식: 직접결제 있으면 직접, 없으면 자동.\n'
-                        '⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 절대로 지명을 지어내거나 비슷하게 짐작하지 마라. '
-                        '흐리거나 잘려서 확신이 안 서면 "미확인"으로 반환해라. JSON만 반환.'
+
+                # 캐스퍼 수정 2026-07-25(4차): "손으로 대조하겠다"는 임시방편 대신,
+                # 카카오T 화면 상단에 항상 표시되는 큰 글씨 합계(건수/금액)를 개별항목 합계와
+                # 코드로 직접 대조하는 자체검증을 추가. 화면 상단 합계는 작은 줄줄이 항목보다
+                # 훨씬 읽기 쉬워서 신뢰도 기준으로 쓸 만함. 불일치 시 상위모델(sonnet)로 1회
+                # 자동 재시도하고, 그래도 안 맞으면 "인식완료"로 속이지 않고 불일치 사실을 그대로
+                # 반환해서 앱이 사용자에게 경고하도록 한다.
+                def _run_ocr_history(model):
+                    cls_msg = client.messages.create(
+                        model=model, max_tokens=20, temperature=0,
+                        messages=[{"role":"user","content":[
+                            {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                            {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
+                        ]}]
                     )
-                else:
-                    prompt = (
-                        f'오늘 날짜는 {_today_str}입니다. 이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
-                        '{"type":"payment","date":"YYYY-MM-DD","total":숫자,"items":['
-                        '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
-                        f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외).\n'
-                        '⚠️ "카드"는 반드시 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용해라. '
-                        '화면 맨 위 상태바(통신사명·시간·배터리 등 휴대폰 UI)는 절대 참고하지 마라. '
-                        '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
+                    is_daily = '일별' in _extract_claude_text(cls_msg)
+                    if is_daily:
+                        prompt = (
+                            f'오늘 날짜는 {_today_str}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
+                            '{"type":"daily_history","date":"YYYY-MM-DD","표시건수":숫자,"표시금액":숫자,"calls":['
+                            '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
+                            f'날짜: 화면에 연도가 없으면 오늘({_today_str}) 기준 연도 사용. 상단 YYYY년 M월 D일 있으면 그것 우선. 결제방식: 직접결제 있으면 직접, 없으면 자동.\n'
+                            '⚠️ "표시건수"/"표시금액"은 화면 맨 위에 큰 글씨로 적힌 "OO건", "OOO원" 합계를 그대로 옮겨라(개별항목과 별개로, 화면에 인쇄된 숫자 그대로).\n'
+                            '⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 절대로 지명을 지어내거나 비슷하게 짐작하지 마라. '
+                            '흐리거나 잘려서 확신이 안 서면 "미확인"으로 반환해라. 화면에 보이는 모든 운행 건을 빠짐없이 포함해라(스크롤로 이어지는 항목도 전부). JSON만 반환.'
+                        )
+                    else:
+                        prompt = (
+                            f'오늘 날짜는 {_today_str}입니다. 이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
+                            '{"type":"payment","date":"YYYY-MM-DD","표시건수":숫자,"표시금액":숫자,"items":['
+                            '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
+                            f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외).\n'
+                            '⚠️ "표시건수"/"표시금액"은 화면 맨 위에 큰 글씨로 적힌 "OO건", "OOO원" 합계를 그대로 옮겨라.\n'
+                            '⚠️ "카드"는 반드시 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용해라. '
+                            '화면 맨 위 상태바(통신사명·시간·배터리 등 휴대폰 UI)는 절대 참고하지 마라. '
+                            '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
+                        )
+                    ocr_msg = client.messages.create(
+                        model=model, max_tokens=2000, temperature=0,
+                        messages=[{"role":"user","content":[
+                            {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                            {"type":"text","text":prompt}
+                        ]}]
                     )
-                ocr_msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=2000, temperature=0,
-                    messages=[{"role":"user","content":[
-                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                        {"type":"text","text":prompt}
-                    ]}]
-                )
-                txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
-                data = _j.loads(txt)
+                    txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
+                    return _j.loads(txt)
+
+                def _verify(data):
+                    items = data.get('calls') if data.get('type')=='daily_history' else data.get('items')
+                    items = items or []
+                    actual_count = len(items)
+                    actual_sum = sum(int(i.get('요금') or 0) for i in items)
+                    header_count = data.get('표시건수')
+                    header_total = data.get('표시금액')
+                    ok = (header_count is not None and header_total is not None
+                          and int(header_count)==actual_count and int(header_total)==actual_sum)
+                    return ok, actual_count, actual_sum, header_count, header_total
+
+                data = _run_ocr_history("claude-haiku-4-5-20251001")
+                verified, a_cnt, a_sum, h_cnt, h_sum = _verify(data)
+                model_used = "claude-haiku-4-5-20251001"
+                if not verified:
+                    logger.warning(f"OCR 합계불일치 — haiku 결과 재시도(sonnet): 실제 {a_cnt}건/{a_sum}원 vs 화면표시 {h_cnt}건/{h_sum}원")
+                    data2 = _run_ocr_history("claude-sonnet-5")
+                    verified2, a_cnt2, a_sum2, h_cnt2, h_sum2 = _verify(data2)
+                    if verified2 or (a_cnt2, a_sum2) != (a_cnt, a_sum):
+                        data, verified, a_cnt, a_sum, h_cnt, h_sum = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2
+                        model_used = "claude-sonnet-5"
+
+                data['_verified'] = verified
+                data['_verify_detail'] = {"실제건수":a_cnt,"실제금액":a_sum,"화면표시건수":h_cnt,"화면표시금액":h_sum,"model":model_used}
                 send_json(200, {"success":True,"data":data})
             except Exception as e:
                 logger.error(f"OCR history 오류: {e}")
