@@ -380,7 +380,12 @@ select.inp{padding:10px 13px}
     <!-- 기록 조회 -->
     <div class="card">
       <div class="lbl" style="margin-bottom:6px">조회 월</div>
-      <select class="inp" id="hist-mo" onchange="renderHist()"></select>
+      <select class="inp" id="hist-mo" onchange="document.getElementById('hist-date').value='';renderHist()"></select>
+      <div class="lbl" style="margin:10px 0 6px">특정 날짜로 바로 검색 (선택)</div>
+      <div style="display:flex;gap:8px">
+        <input type="date" class="inp" id="hist-date" onchange="renderHist()" style="flex:1">
+        <button class="btn-ghost" style="padding:0 14px;font-size:12px" onclick="document.getElementById('hist-date').value='';renderHist()">전체월보기</button>
+      </div>
     </div>
     <div id="hist-list"></div>
   </div>
@@ -941,22 +946,45 @@ select.inp{padding:10px 13px}
   // ════════════════════════════════════════
   async function renderHist(){
     const mo=gv('hist-mo');
+    const specificDate = gv('hist-date'); // 특정 날짜 직접 검색 (선택사항)
     const el=document.getElementById('hist-list');
     el.innerHTML='<div style="text-align:center;color:var(--mu);padding:20px">불러오는 중...</div>';
     showLoading(true);
     try {
       let recs=[];
       if(sbUrl && sbKey){
-        recs = await sbSelect('raw_calls',{
-          '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
-          'order':'날짜.desc,배차시각.desc'
-        });
+        recs = specificDate
+          ? await sbSelect('raw_calls', {'날짜':'eq.'+specificDate, 'order':'배차시각.desc'})
+          : await sbSelect('raw_calls', {
+              '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
+              'order':'날짜.desc,배차시각.desc'
+            });
       } else {
-        recs = (lload(KLO)||[]).filter(r=>r.날짜&&r.날짜.startsWith(mo));
-        recs.sort((a,b)=>b.날짜.localeCompare(a.날짜));
+        const all = lload(KLO)||[];
+        recs = specificDate ? all.filter(r=>r.날짜===specificDate) : all.filter(r=>r.날짜&&r.날짜.startsWith(mo));
+        recs.sort((a,b)=>b.날짜.localeCompare(a.날짜)||(b.배차시각||'').localeCompare(a.배차시각||''));
       }
-      if(!recs.length){ el.innerHTML='<div style="text-align:center;color:var(--mu);padding:40px">기록 없음</div>'; return; }
-      el.innerHTML = recs.map(r=>`
+      if(!recs.length){
+        el.innerHTML = `<div style="text-align:center;color:var(--mu);padding:40px">${specificDate?esc(specificDate)+' 기록 없음':'기록 없음'}</div>`;
+        return;
+      }
+      // 캐스퍼 수정 2026-07-25: "일자별로 매출금액과 내역을 보고 싶다"는 요청 반영 —
+      // 월 전체를 평평한 목록으로만 뿌리던 것을, 날짜별로 묶어서 그날의 소계(건수/합계)를
+      // 헤더에 보여주고 그 아래 개별 건을 나열하는 구조로 변경. 특정 날짜 검색 input도 추가.
+      const byDate = new Map();
+      for(const r of recs){
+        if(!byDate.has(r.날짜)) byDate.set(r.날짜, []);
+        byDate.get(r.날짜).push(r);
+      }
+      el.innerHTML = [...byDate.entries()].map(([date, rows])=>{
+        const dayTotal = rows.reduce((s,r)=>s+(Number(r.요금)||0), 0);
+        const dow = rows[0]?.요일 || '';
+        return `
+        <div style="margin:14px 0 6px;padding:8px 12px;background:var(--card2,#161a24);border-radius:10px;display:flex;justify-content:space-between;align-items:center">
+          <b style="font-size:13px">${esc(date)} ${esc(dow)}</b>
+          <span style="font-size:13px;color:var(--gold,#f0c419)">${rows.length}건 · ${fmt(dayTotal)}원</span>
+        </div>` +
+        rows.map(r=>`
         <div class="rc">
           <div class="rc-d">${esc(r.날짜)} ${esc(r.요일)} ${esc(r.배차시각)} ${esc(r.콜유형)}</div>
           <div class="rc-a">${fmt(r.요금)}원</div>
@@ -966,6 +994,7 @@ select.inp{padding:10px 13px}
             <button class="rcx" onclick="delRec(${r.id||0})">삭제</button>
           </div>
         </div>`).join('');
+      }).join('');
     } catch(e){ el.innerHTML='<div style="color:var(--red);padding:20px">오류: '+e.message+'</div>'; }
     finally { showLoading(false); }
   }
