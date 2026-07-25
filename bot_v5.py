@@ -223,9 +223,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                     logger.warning(f"OCR 합계불일치 — haiku 결과 재시도(sonnet): 실제 {a_cnt}건/{a_sum}원 vs 화면표시 {h_cnt}건/{h_sum}원")
                     data2 = _run_ocr_history("claude-sonnet-5")
                     verified2, a_cnt2, a_sum2, h_cnt2, h_sum2 = _verify(data2)
-                    if verified2 or (a_cnt2, a_sum2) != (a_cnt, a_sum):
-                        data, verified, a_cnt, a_sum, h_cnt, h_sum = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2
-                        model_used = "claude-sonnet-5"
+                    # 캐스퍼(전임) 지적 반영 2026-07-25: 기존 `verified2 or (다르면 교체)` 조건은
+                    # sonnet도 검증 실패했는데 haiku랑 결과만 다르면 무조건 교체해버리는 허점이 있었음
+                    # (sonnet이 haiku보다 더 틀렸을 가능성을 못 거름). 재시도했으면 상위모델 결과를
+                    # 항상 채택하되, verified 플래그는 실제 재검증 결과를 정직하게 반영한다
+                    # (재시도 후에도 불일치면 verified=False로 남아 화면에 경고가 그대로 뜬다).
+                    data, verified, a_cnt, a_sum, h_cnt, h_sum = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2
+                    model_used = "claude-sonnet-5"
 
                 data['_verified'] = verified
                 data['_verify_detail'] = {"실제건수":a_cnt,"실제금액":a_sum,"화면표시건수":h_cnt,"화면표시금액":h_sum,"model":model_used}
