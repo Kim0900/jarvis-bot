@@ -1114,6 +1114,9 @@ select.inp{padding:10px 13px}
           '날짜': ['gte.'+mo+'-01', 'lte.'+endOfMonth(mo)],
           'order':'날짜.asc,배차시각.asc'
         }) || [];
+        // 캐스퍼 수정 2026-07-25(전수조사): 분석페이지 월간 집계(총매출/총건수/요일별통계)가
+        // 영수증 요약행까지 그대로 합산해서 이중집계되고 있었음.
+        recs = excludeSummaryRows(recs);
       } else {
         recs = (lload(KLO)||[]).filter(r=>r.날짜&&r.날짜.startsWith(mo));
       }
@@ -1552,9 +1555,14 @@ select.inp{padding:10px 13px}
       }
       // daily_summary 효율지표 업데이트
       if(sbUrl && sbKey && rec.날짜){
-        const dayRecs = await sbSelect('raw_calls',{'날짜':'eq.'+rec.날짜}) || [];
-        const dayTotal = dayRecs.reduce((s,r)=>s+(r.요금||0),0);
-        const dayCount = dayRecs.length;
+        const dayRecsAll = await sbSelect('raw_calls',{'날짜':'eq.'+rec.날짜}) || [];
+        // 캐스퍼 수정 2026-07-25(전수조사): 방금 저장한 영수증 요약행까지 포함해서 그대로
+        // sum해버려서, 개별콜 매출 + 영수증 총액이 이중으로 daily_summary에 들어가던 버그.
+        // 개별콜이 있으면 그것만 집계(요약행 제외), 개별콜이 아예 없는 날은 방금 저장한
+        // 영수증 자체 수치를 그대로 쓴다(재조회해서 또 더하지 않음).
+        const realDayRecs = dayRecsAll.filter(r => !String(r.비고||'').startsWith('OCR 추출:'));
+        const dayTotal = realDayRecs.length ? realDayRecs.reduce((s,r)=>s+(r.요금||0),0) : (Number(rec.요금)||0);
+        const dayCount = realDayRecs.length ? realDayRecs.length : (Number(rec.건수)||1);
         // 캐스퍼 수정 2026-07-23: daily_summary 실제 컬럼명은 '총콜수'가 아니라 '총건수'.
         // 존재하지 않는 컬럼(총콜수)으로 계속 POST해서 매번 저장 실패하던 버그.
         // '건당단가'는 테이블에 컬럼 자체가 없고 총매출/총건수로 언제든 계산 가능한 파생값이라 저장 생략.
@@ -1985,6 +1993,9 @@ select.inp{padding:10px 13px}
       let calls = [];
       if(sbUrl && sbKey){
         calls = await sbSelect('raw_calls', {'날짜':'eq.'+dateStr, 'order':'배차시각.asc'}) || [];
+        // 캐스퍼 수정 2026-07-25(전수조사): 영수증 요약행이 섞여 들어오면
+        // calcEfficiency의 매출 합계가 이중계산돼 구속시간당매출이 부풀려짐.
+        calls = excludeSummaryRows(calls);
       } else {
         toast('Supabase 미연결 — GPX 파싱만 진행 (DB 연동 없음)', 'warn');
       }
@@ -2476,10 +2487,13 @@ select.inp{padding:10px 13px}
   // ── 교차대조 핵심 로직 ──
   async function runCrossCheck(dateStr) {
     try {
-      const [calls, receipts] = await Promise.all([
+      const [callsRaw, receipts] = await Promise.all([
         sbSelect('raw_calls', {'날짜':'eq.'+dateStr, 'order':'배차시각.asc'}),
         sbSelect('payment_receipts', {'날짜':'eq.'+dateStr, 'order':'시각.asc'})
       ]);
+      // 캐스퍼 수정 2026-07-25(전수조사): 영수증 요약행(비고 "OCR 추출:...")이 개별 콜
+      // 후보로 섞여 들어가면, 결제내역과 엉뚱하게 매칭되거나 건수가 왜곡될 수 있었음.
+      const calls = excludeSummaryRows(callsRaw);
 
       if(!calls.length || !receipts.length) return;
 
