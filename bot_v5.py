@@ -326,6 +326,24 @@ async def sb_select(table: str, params: dict = None) -> list:
     result = await sb_h("GET", table, params=params or {})
     return result if isinstance(result, list) else []
 
+# 캐스퍼 명령서#024 (2026-08-05): 영수증 OCR 요약행(비고 "OCR 추출: 매출...")이 개별 콜과
+# 같은 테이블/컬럼에 섞여있어서, raw_calls를 그대로 sum/count하는 모든 곳에서 매출·건수가
+# 이중집계되던 근본원인. index.html 쪽은 이미 excludeSummaryRows()로 수정 완료.
+# bot_v5.py도 13곳이 각자 raw_calls를 직접 조회하고 있어 공용 헬퍼로 일괄 대응.
+# 캐스퍼 수정 2026-08-05 (명령서#024 검증 중 발견): 아르고스 재삽입 데이터는 비고가 아니라
+# 콜유형='합계'로 요약행을 표시함(비고는 null). 두 컨벤션 다 인식하도록 확대.
+def _is_receipt_summary_row(r: dict) -> bool:
+    return str(r.get("비고") or "").startswith("OCR 추출:") or r.get("콜유형") == "합계"
+
+def exclude_summary_rows(calls: list) -> list:
+    return [c for c in calls if not _is_receipt_summary_row(c)]
+
+async def sb_select_calls(params: dict = None) -> list:
+    """raw_calls 전용 조회 — 영수증 요약행을 자동으로 제외한다.
+    기존 `await sb_select("raw_calls", {...})`를 대체."""
+    raw = await sb_select("raw_calls", params)
+    return exclude_summary_rows(raw)
+
 async def sb_upsert(table: str, data: dict, on_conflict: str) -> dict | None:
     return await sb_h(
         "POST", table,
@@ -366,7 +384,7 @@ async def github_commit_briefing(날짜: str, content: str) -> dict:
 
         # 카카오/우버/배회 건수 커밋 메시지용 집계
         try:
-            calls = await sb_select("raw_calls", {"날짜": f"eq.{날짜}"}) or []
+            calls = await sb_select_calls( {"날짜": f"eq.{날짜}"}) or []
             kakao_n = sum(1 for c in calls if (c.get("콜유형") or "") == "카카오T")
             uber_n  = sum(1 for c in calls if (c.get("콜유형") or "") == "우버")
             bhw_n   = sum(1 for c in calls if (c.get("콜유형") or "") == "배회")
@@ -438,7 +456,7 @@ def calc_net(매출: int, 지출: int) -> int:
 
 async def today_summary() -> dict:
     today = str(today_kst())
-    calls = await sb_select("raw_calls", {"날짜": f"eq.{today}"})
+    calls = await sb_select_calls( {"날짜": f"eq.{today}"})
     expenses = await sb_select("expenses", {"날짜": f"eq.{today}"})
     건수 = len(calls)
     매출 = sum(c.get("요금", 0) or 0 for c in calls)
@@ -811,11 +829,11 @@ async def calc_official_var_score(날짜: str) -> dict:
     mo = 날짜[:7]
 
     # var_2: 오늘 운행완료수
-    calls_today = await sb_select("raw_calls", {"날짜": f"eq.{날짜}"})
+    calls_today = await sb_select_calls( {"날짜": f"eq.{날짜}"})
     daily_completed = len(calls_today)
 
     # var_2: 이번달 일평균
-    calls_month = await sb_select("raw_calls", {
+    calls_month = await sb_select_calls( {
         "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
     })
     from datetime import date as _d2
@@ -943,7 +961,7 @@ async def handle_completion_status(update):
     today = str(_dc.today())
     mo = today[:7]
 
-    calls_month = await sb_select("raw_calls", {
+    calls_month = await sb_select_calls( {
         "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
     })
     from datetime import date as _d2
@@ -1041,7 +1059,7 @@ async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
     # 축B 전용 지표(kpi_7day_avg, kpi_longdist_rate)는 date_axis='B' 행만 사용.
     # kpi_avg_fare(오늘 평일단가)는 오늘 하루치 실적 확인용이라 축 구분 없이
     # 전체 사용 — 아래에서 today_kakao는 window_calls 전체 기준으로 별도 처리.
-    window_calls_all = await sb_select("raw_calls", {
+    window_calls_all = await sb_select_calls( {
         "and": f"(날짜.gte.{window_start},날짜.lte.{날짜})"
     }) or []
     window_calls = [c for c in window_calls_all if (c.get("date_axis") or "B") == "B"]
@@ -1114,8 +1132,8 @@ async def handle_briefing(update, date_str: str = None):
     await update.message.reply_text(f"📋 {날짜} 브리핑 생성 중...")
 
     # 데이터 수집
-    calls = await sb_select("raw_calls", {"날짜": f"eq.{날짜}"})
-    calls_month = await sb_select("raw_calls", {
+    calls = await sb_select_calls( {"날짜": f"eq.{날짜}"})
+    calls_month = await sb_select_calls( {
         "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
     })
 
@@ -1616,7 +1634,7 @@ async def cross_check(date_str: str) -> str:
     """
     from datetime import date as date_cls, timedelta
 
-    calls = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    calls = await sb_select_calls( {"날짜": f"eq.{date_str}"})
     try:
         y, mo, d = date_str.split("-")
         next_date_str = str(date_cls(int(y),int(mo),int(d)) + timedelta(days=1))
@@ -1799,7 +1817,7 @@ async def cross_check(date_str: str) -> str:
 
 async def confirm_baehoe_classification(date_str: str) -> str:
     """미매칭 콜카드를 배회영업으로 자동 분류 확정"""
-    calls = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    calls = await sb_select_calls( {"날짜": f"eq.{date_str}"})
     receipts = await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})
 
     def to_minutes(t_str):
@@ -1842,7 +1860,7 @@ async def confirm_baehoe_classification(date_str: str) -> str:
 # ──────────────────────────────────────────────
 async def check_duplicate_call(날짜: str, 배차시각: str, 요금: int) -> bool:
     """raw_calls 중복 체크: 날짜+배차시각+요금 동일하면 True"""
-    rows = await sb_select("raw_calls", {
+    rows = await sb_select_calls( {
         "날짜": f"eq.{날짜}",
         "배차시각": f"eq.{배차시각}",
         "요금": f"eq.{요금}",
@@ -2295,7 +2313,7 @@ async def handle_monthly(update: Update):
     start_str = today.replace(day=1).isoformat()
     end_str = str(today)
 
-    calls = await sb_select("raw_calls", {"날짜": f"gte.{start_str}"})
+    calls = await sb_select_calls( {"날짜": f"gte.{start_str}"})
     expenses = await sb_select("expenses", {"날짜": f"gte.{start_str}"})
     총건수 = len(calls)
     총매출 = sum(c.get("요금", 0) or 0 for c in calls)
@@ -2429,7 +2447,7 @@ async def confirm_cross_check(date_str: str) -> str:
         return "❌ 날짜 형식 오류 (YYYY-MM-DD)"
 
     # 콜카드 + 결제내역 조회 (익일 포함)
-    calls    = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    calls    = await sb_select_calls( {"날짜": f"eq.{date_str}"})
     receipts = (await sb_select("payment_receipts", {"날짜": f"eq.{date_str}"})) +                (await sb_select("payment_receipts", {"날짜": f"eq.{next_date_str}"}))
 
     def to_min_smart(배차, 대상시각, 대상날짜):
@@ -2522,7 +2540,7 @@ async def handle_fee_confirm_request(update, date_str: str):
     """
     from datetime import date as date_cls, timedelta
 
-    calls    = await sb_select("raw_calls", {"날짜": f"eq.{date_str}"})
+    calls    = await sb_select_calls( {"날짜": f"eq.{date_str}"})
     try:
         y,mo,d = date_str.split("-")
         next_d = str(date_cls(int(y),int(mo),int(d)) + timedelta(days=1))
@@ -2633,7 +2651,7 @@ async def handle_date_stat(update, text: str):
 
     # 통계 키워드 판단
     if any(kw in text for kw in ["총건수", "건수"]):
-        calls = await sb_select("raw_calls", {"날짜": f"eq.{date_key}"})
+        calls = await sb_select_calls( {"날짜": f"eq.{date_key}"})
         카카오 = sum(1 for c in calls if (c.get("콜유형") or "") == "카카오T")
         배회   = sum(1 for c in calls if (c.get("콜유형") or "") == "배회")
         총매출 = sum(c.get("요금") or 0 for c in calls)
@@ -2647,7 +2665,7 @@ async def handle_date_stat(update, text: str):
         )
 
     elif "매출" in text:
-        calls = await sb_select("raw_calls", {"날짜": f"eq.{date_key}"})
+        calls = await sb_select_calls( {"날짜": f"eq.{date_key}"})
         총매출 = sum(c.get("요금") or 0 for c in calls)
         건수   = len(calls)
         건당   = 총매출 // 건수 if 건수 else 0
@@ -2658,7 +2676,7 @@ async def handle_date_stat(update, text: str):
         )
 
     elif "순수익" in text:
-        calls    = await sb_select("raw_calls",  {"날짜": f"eq.{date_key}"})
+        calls    = await sb_select_calls(  {"날짜": f"eq.{date_key}"})
         expenses = await sb_select("expenses",   {"날짜": f"eq.{date_key}"})
         총매출 = sum(c.get("요금") or 0 for c in calls)
         총지출 = sum(e.get("금액") or 0 for e in expenses)
@@ -2726,7 +2744,7 @@ async def handle_date_query(update, date_str: str):
     dow_map = ["월","화","수","목","금","토","일"]
     dow = dow_map[parsed.weekday()]
 
-    calls    = await sb_select("raw_calls", {"날짜": f"eq.{date_key}", "order": "배차시각.asc"})
+    calls    = await sb_select_calls( {"날짜": f"eq.{date_key}", "order": "배차시각.asc"})
     expenses = await sb_select("expenses",  {"날짜": f"eq.{date_key}", "order": "id.asc"})
 
     if not calls and not expenses:
@@ -3154,7 +3172,7 @@ async def handle_download_month(update, ym: str):
     end_str   = str(end_date)
 
     # AND 조건 (날짜 키 중복 버그 방지)
-    calls    = await sb_select("raw_calls",    {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"})
+    calls    = await sb_select_calls(    {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"})
     expenses = await sb_select("expenses",     {"and": f"(날짜.gte.{start_str},날짜.lte.{end_str})"})
     charging = await sb_select("charging_log", {"and": f"(충전일.gte.{start_str},충전일.lte.{end_str})"})
 
@@ -3214,7 +3232,7 @@ async def handle_download(update: Update, scope: str):
         start_str = "2000-01-01"
         label = "전체"
 
-    calls = await sb_select("raw_calls", {"날짜": f"gte.{start_str}"})
+    calls = await sb_select_calls( {"날짜": f"gte.{start_str}"})
     expenses = await sb_select("expenses", {"날짜": f"gte.{start_str}"})
     charging = await sb_select("charging_log", {"충전일": f"gte.{start_str}"})
 
@@ -3432,7 +3450,7 @@ async def recalc_fish_hour_data():
     이 계산은 "시간대별 패턴 분석"이라는 call_quality_history 본래 목적과 일치하므로 사용함.
     """
     try:
-        raw = await sb_select("raw_calls", {}) or []
+        raw = await sb_select_calls( {}) or []
     except Exception as e:
         logger.error(f"fish_hour_data 재계산 - raw_calls 조회 실패: {e}")
         raw = []
