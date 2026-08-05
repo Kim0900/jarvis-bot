@@ -336,7 +336,21 @@ def _is_receipt_summary_row(r: dict) -> bool:
     return str(r.get("비고") or "").startswith("OCR 추출:") or r.get("콜유형") == "합계"
 
 def exclude_summary_rows(calls: list) -> list:
-    return [c for c in calls if not _is_receipt_summary_row(c)]
+    # 캐스퍼 수정 2026-08-05: 단순 전체제외는 "개별콜 없이 합계행만 있는 날"의 매출이
+    # 통째로 0으로 사라지는 과교정을 낳음(index.html에서 실제로 겪은 문제, 동일 로직 이식).
+    # 날짜별로 묶어서: 개별콜이 하나라도 있으면 그 날짜의 합계행만 제외, 없으면 유지.
+    from collections import defaultdict
+    by_date = defaultdict(list)
+    for c in calls:
+        by_date[c.get("날짜")].append(c)
+    out = []
+    for day_rows in by_date.values():
+        has_real = any(not _is_receipt_summary_row(r) for r in day_rows)
+        if has_real:
+            out.extend(r for r in day_rows if not _is_receipt_summary_row(r))
+        else:
+            out.extend(day_rows)
+    return out
 
 async def sb_select_calls(params: dict = None) -> list:
     """raw_calls 전용 조회 — 영수증 요약행을 자동으로 제외한다.
