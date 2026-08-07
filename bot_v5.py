@@ -208,7 +208,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                             '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
                         )
                     ocr_msg = client.messages.create(
-                        model=model, max_tokens=2000, **extra_kwargs,
+                        # 캐스퍼 긴급수정 2026-08-07(2차): thinking 끄니 실제 응답이 나오기
+                        # 시작했는데, 항목 많은 화면(20건 이상)은 2000토큰으로 JSON을 다 못
+                        # 채우고 중간에 잘림(로그 확인: "line 84 column 13"에서 끊김,
+                        # 즉 응답은 정상 진행되다 max_tokens 한도에 걸린 것). 여유있게 상향.
+                        model=model, max_tokens=8000, **extra_kwargs,
                         messages=[{"role":"user","content":[
                             {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
                             {"type":"text","text":prompt}
