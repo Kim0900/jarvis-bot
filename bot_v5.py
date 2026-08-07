@@ -221,7 +221,16 @@ class HealthHandler(BaseHTTPRequestHandler):
                     txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
                     if not txt:
                         raise ValueError(f"모델({model}) 응답에 텍스트가 없음 (stop_reason={getattr(ocr_msg,'stop_reason',None)}) — 사고예산 소진 또는 응답거부 의심")
-                    return _j.loads(txt)
+                    # 캐스퍼 수정 2026-08-07(3차): max_tokens를 8000으로 올려도 정확히 같은
+                    # 지점(char 1557)에서 실패 — 토큰부족이 아니라 모델이 그 지점에 실제
+                    # JSON 문법오류를 내고 있다는 뜻(전 진단 정정). 다음번엔 추측 안 하고
+                    # 바로 보이도록, 파싱 실패 시 에러지점 앞뒤 원문을 로그에 남긴다.
+                    try:
+                        return _j.loads(txt)
+                    except _j.JSONDecodeError as je:
+                        ctx = txt[max(0,je.pos-150):je.pos+150]
+                        logger.error(f"OCR JSON 파싱 실패 상세 — stop_reason={getattr(ocr_msg,'stop_reason',None)}, 전체길이={len(txt)}자, 에러지점 앞뒤 300자:\n{ctx}")
+                        raise
 
                 def _safe_int(v):
                     if v is None: return None
