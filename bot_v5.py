@@ -246,6 +246,22 @@ class HealthHandler(BaseHTTPRequestHandler):
                         digits = _re.sub(r'[^0-9]', '', str(v))
                         return int(digits) if digits else None
 
+                # 캐스퍼 수정 2026-08-07(5차): 지금까지 자체검증(_verify)이 합계(건수/금액)만
+                # 봐서, 개별 주소가 거의 다 오독이어도(예: "력선동","안성3동" 등 150개 목록에
+                # 없는 지명 다수) 합계만 맞으면 그냥 통과되던 구조적 허점. 대구 150개 행정동
+                # 매핑을 서버에도 넣어서, 무효 주소 개수가 많으면 합계가 맞아도 재시도하도록 확장.
+                _DONG_TO_GU = {"가창면":"달성군","감삼동":"달서구","검단동":"북구","고산1동":"수성구","고산2동":"수성구","고산3동":"수성구","고성동":"북구","공산동":"동구","관문동":"북구","관음동":"북구","구암동":"북구","구지면":"달성군","국우동":"북구","군위읍":"군위군","남산1동":"중구","남산2동":"중구","남산3동":"중구","남산4동":"중구","내당1동":"서구","내당2·3동":"서구","내당4동":"서구","노원동":"북구","논공읍":"달성군","다사읍":"달성군","대명10동":"남구","대명11동":"남구","대명1동":"남구","대명2동":"남구","대명3동":"남구","대명4동":"남구","대명5동":"남구","대명6동":"남구","대명9동":"남구","대봉1동":"중구","대봉2동":"중구","대신동":"중구","대현동":"북구","도원동":"달서구","도평동":"동구","동인동":"중구","동천동":"북구","동촌동":"동구","두류1,2동":"달서구","두류3동":"달서구","두산동":"수성구","만촌1동":"수성구","만촌2동":"수성구","만촌3동":"수성구","무태조야동":"북구","방촌동":"동구","범물1동":"수성구","범물2동":"수성구","범어1동":"수성구","범어2동":"수성구","범어3동":"수성구","범어4동":"수성구","복현1동":"북구","복현2동":"북구","본동":"달서구","본리동":"달서구","봉덕1동":"남구","봉덕2동":"남구","봉덕3동":"남구","부계면":"군위군","불로·봉무동":"동구","비산1동":"서구","비산2·3동":"서구","비산4동":"서구","비산5동":"서구","비산6동":"서구","비산7동":"서구","산격1동":"북구","산격2동":"북구","산격3동":"북구","산격4동":"북구","산성면":"군위군","삼국유사면":"군위군","삼덕동":"중구","상동":"수성구","상인1동":"달서구","상인2동":"달서구","상인3동":"달서구","상중이동":"서구","성내1동":"중구","성내2동":"중구","성내3동":"중구","성당동":"달서구","소보면":"군위군","송현1동":"달서구","송현2동":"달서구","수성1가동":"수성구","수성2·3가동":"수성구","수성4가동":"수성구","신당동":"달서구","신암1동":"동구","신암2동":"동구","신암3동":"동구","신암4동":"동구","신암5동":"동구","신천1·2동":"동구","신천3동":"동구","신천4동":"동구","안심1동":"동구","안심2동":"동구","안심3동":"동구","안심4동":"동구","옥포읍":"달성군","용산1동":"달서구","용산2동":"달서구","우보면":"군위군","원대동":"서구","월성1동":"달서구","월성2동":"달서구","유가읍":"달성군","유천동":"달서구","읍내동":"북구","의흥면":"군위군","이곡1동":"달서구","이곡2동":"달서구","이천동":"남구","장기동":"달서구","죽전동":"달서구","중동":"수성구","지산1동":"수성구","지산2동":"수성구","지저동":"동구","진천동":"달서구","칠성동":"북구","침산1동":"북구","침산2동":"북구","침산3동":"북구","태전1동":"북구","태전2동":"북구","파동":"수성구","평리1동":"서구","평리2동":"서구","평리3동":"서구","평리4동":"서구","평리5동":"서구","평리6동":"서구","하빈면":"달성군","해안동":"동구","혁신동":"동구","현풍읍":"달성군","화원읍":"달성군","황금1동":"수성구","황금2동":"수성구","효령면":"군위군","효목1동":"동구","효목2동":"동구"}
+
+                def _addr_is_bad(addr):
+                    if not addr: return False
+                    m = _re.search(r'(\S+?[구군])\s*(\S+?동)', str(addr))
+                    if not m: return False
+                    gu, dong = m.group(1), m.group(2)
+                    correct_gu = _DONG_TO_GU.get(dong)
+                    if correct_gu is None:
+                        return str(addr).strip().startswith('대구')  # 대구인데 목록에 없는 동
+                    return correct_gu != gu  # 구 불일치
+
                 def _verify(data):
                     items = data.get('calls') if data.get('type')=='daily_history' else data.get('items')
                     items = items or []
@@ -253,27 +269,34 @@ class HealthHandler(BaseHTTPRequestHandler):
                     actual_sum = sum((_safe_int(i.get('요금')) or 0) for i in items)
                     header_count = _safe_int(data.get('표시건수'))
                     header_total = _safe_int(data.get('표시금액'))
-                    ok = (header_count is not None and header_total is not None
-                          and header_count==actual_count and header_total==actual_sum)
-                    return ok, actual_count, actual_sum, header_count, header_total
+                    totals_ok = (header_count is not None and header_total is not None
+                                 and header_count==actual_count and header_total==actual_sum)
+                    bad_addr_count = sum(
+                        1 for i in items
+                        if _addr_is_bad(i.get('출발지')) or _addr_is_bad(i.get('도착지'))
+                    ) if data.get('type') == 'daily_history' else 0
+                    # 무효주소가 전체 30% 넘거나 3건 넘으면(둘 중 먼저 걸리는 기준) 재시도 트리거
+                    addr_ok = bad_addr_count <= max(1, int(actual_count * 0.3)) and bad_addr_count <= 3
+                    ok = totals_ok and addr_ok
+                    return ok, actual_count, actual_sum, header_count, header_total, bad_addr_count
 
                 data = _run_ocr_history("claude-haiku-4-5-20251001")
-                verified, a_cnt, a_sum, h_cnt, h_sum = _verify(data)
+                verified, a_cnt, a_sum, h_cnt, h_sum, bad_addr = _verify(data)
                 model_used = "claude-haiku-4-5-20251001"
                 if not verified:
-                    logger.warning(f"OCR 합계불일치 — haiku 결과 재시도(sonnet): 실제 {a_cnt}건/{a_sum}원 vs 화면표시 {h_cnt}건/{h_sum}원")
+                    logger.warning(f"OCR 검증 실패 — haiku 결과 재시도(sonnet): 실제 {a_cnt}건/{a_sum}원 vs 화면표시 {h_cnt}건/{h_sum}원, 무효주소 {bad_addr}건")
                     data2 = _run_ocr_history("claude-sonnet-5")
-                    verified2, a_cnt2, a_sum2, h_cnt2, h_sum2 = _verify(data2)
+                    verified2, a_cnt2, a_sum2, h_cnt2, h_sum2, bad_addr2 = _verify(data2)
                     # 캐스퍼(전임) 지적 반영 2026-07-25: 기존 `verified2 or (다르면 교체)` 조건은
                     # sonnet도 검증 실패했는데 haiku랑 결과만 다르면 무조건 교체해버리는 허점이 있었음
                     # (sonnet이 haiku보다 더 틀렸을 가능성을 못 거름). 재시도했으면 상위모델 결과를
                     # 항상 채택하되, verified 플래그는 실제 재검증 결과를 정직하게 반영한다
                     # (재시도 후에도 불일치면 verified=False로 남아 화면에 경고가 그대로 뜬다).
-                    data, verified, a_cnt, a_sum, h_cnt, h_sum = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2
+                    data, verified, a_cnt, a_sum, h_cnt, h_sum, bad_addr = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2, bad_addr2
                     model_used = "claude-sonnet-5"
 
                 data['_verified'] = verified
-                data['_verify_detail'] = {"실제건수":a_cnt,"실제금액":a_sum,"화면표시건수":h_cnt,"화면표시금액":h_sum,"model":model_used}
+                data['_verify_detail'] = {"실제건수":a_cnt,"실제금액":a_sum,"화면표시건수":h_cnt,"화면표시금액":h_sum,"무효주소건수":bad_addr,"model":model_used}
                 send_json(200, {"success":True,"data":data})
             except Exception as e:
                 logger.error(f"OCR history 오류: {e}")
