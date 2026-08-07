@@ -153,9 +153,22 @@ class HealthHandler(BaseHTTPRequestHandler):
 
         if self.path == '/ocr_history':
             try:
-                import anthropic as _ant, re as _re, json as _j
+                import anthropic as _ant, re as _re, json as _j, base64 as _b64mod
                 b64 = payload.get('image_b64', '')
                 mt  = payload.get('media_type', 'image/jpeg')
+                # 캐스퍼 수정 2026-08-07(6차): 이전 캐스퍼(07-15)가 텔레그램 경로에만 넣어둔
+                # resize_image_if_needed()가 앱이 쓰는 이 엔드포인트엔 빠져있었음 — 재사용.
+                # 참고: Claude 비전은 긴 쪽 약 1568px 이상은 내부적으로 어차피 다운스케일해서
+                # 처리하므로, 여기서 미리 줄여도 "그 이상으로 더 나빠지진" 않음. 다만 이 화면
+                # (일별운행이력, 세로로 긴 목록)은 원래도 정보밀도가 높아서, 리사이즈만으로
+                # 완전히 해결 안 될 수 있음 — 그 경우 화면을 나눠 찍는 게 더 근본적인 해법.
+                try:
+                    raw_bytes = _b64mod.b64decode(b64)
+                    resized_bytes = resize_image_if_needed(raw_bytes)
+                    b64 = _b64mod.b64encode(resized_bytes).decode('utf-8')
+                    mt = 'image/jpeg'
+                except Exception as _rez_err:
+                    logger.warning(f"OCR 이미지 리사이즈 실패, 원본 사용: {_rez_err}")
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
                 _today_str = str(today_kst())
 
