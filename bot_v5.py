@@ -172,7 +172,12 @@ class HealthHandler(BaseHTTPRequestHandler):
                     # temperature=0을 넣고 있어서 재시도가 걸릴 때마다 400으로 끊기고,
                     # 그 결과 서버가 success:false를 반환 → 앱이 클라이언트 폴백(API키 없음
                     # 에러)으로 떨어지던 것이 이번 장애의 실제 원인. 모델별로 파라미터를 분리.
-                    extra_kwargs = {"temperature": 0} if model.startswith("claude-haiku") else {}
+                    # 캐스퍼 긴급수정 2026-08-07: Claude Sonnet 5는 적응형 사고(adaptive thinking)가
+                    # 기본 켜져 있고, 사고에 쓴 토큰도 max_tokens 예산에서 차감됨. 분류 호출
+                    # (max_tokens=20)처럼 예산이 작으면 사고만 하다 끝나서 실제 텍스트가
+                    # 하나도 안 나와 "Expecting value"(빈 문자열 JSON파싱 실패)로 이어짐.
+                    # 구조화 추출은 추론이 필요 없는 작업이라 사고 자체를 꺼서 예산을 답변에 전부 쓰게 한다.
+                    extra_kwargs = {"temperature": 0} if model.startswith("claude-haiku") else {"thinking": {"type": "disabled"}}
                     cls_msg = client.messages.create(
                         model=model, max_tokens=20, **extra_kwargs,
                         messages=[{"role":"user","content":[
@@ -210,6 +215,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                         ]}]
                     )
                     txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
+                    if not txt:
+                        raise ValueError(f"모델({model}) 응답에 텍스트가 없음 (stop_reason={getattr(ocr_msg,'stop_reason',None)}) — 사고예산 소진 또는 응답거부 의심")
                     return _j.loads(txt)
 
                 def _safe_int(v):
