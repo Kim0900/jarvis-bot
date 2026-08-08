@@ -1853,7 +1853,7 @@ select.inp{padding:10px 13px}
     return best;
   }
 
-  // ── 좌표 → 동명 역변환 (대구 주요 동 좌표) ──
+  // ── 좌표 → 동명 역변환 (구버전, 20개 표본점 최근접 — 폴리곤 로드 실패시 폴백용) ──
   const DONG_COORDS = [
     ['중구 성내1동', 35.8695, 128.5968],['중구 성내2동', 35.8680, 128.5985],
     ['중구 삼덕동', 35.8715, 128.5940],['중구 동성로', 35.8680, 128.5960],
@@ -1866,14 +1866,79 @@ select.inp{padding:10px 13px}
     ['달서구 두류1.2동', 35.8570, 128.5600],['남구 대명2동', 35.8420, 128.5880],
     ['서구 평리3동', 35.8700, 128.5580],['북구 침산2동', 35.8870, 128.5760],
   ];
-
-  function coordToDong(lat, lon) {
+  function coordToDongFallback(lat, lon) {
     let bestDong = '위치미확인', bestDist = Infinity;
     for(const [dong, dlat, dlon] of DONG_COORDS) {
       const d = haversine(lat, lon, dlat, dlon);
       if(d < bestDist) { bestDist = d; bestDong = dong; }
     }
     return bestDist < 2.0 ? bestDong : '대구 ' + bestDong.split(' ')[0] + ' (추정)';
+  }
+
+  // ── 명령서#026 (2026-08-08): 좌표 → 동 역지오코딩을 실제 행정동 경계 폴리곤 기반으로 ──
+  // 서버(bot_v5.py)와 동일한 daegu_boundaries.geojson(150개 행정동, vuski/admdongkor
+  // ver20260701) + 광선교차법(ray casting)을 클라이언트에도 포팅.
+  // 검증: 동대구역→동구 신암4동, 대구시청→중구 동인동, 동성로→중구 성내1동,
+  //       수성구청→수성구 범어1동 (서버쪽과 동일 4곳, 동일 결과 확인).
+  let daeguBoundaries = null;
+  async function loadDaeguBoundaries() {
+    if(daeguBoundaries) return daeguBoundaries;
+    try {
+      const r = await fetch('./daegu_boundaries.geojson');
+      const gj = await r.json();
+      daeguBoundaries = gj.features;
+    } catch(e) { daeguBoundaries = []; }
+    return daeguBoundaries;
+  }
+  function pointInRing(x, y, ring) {
+    let inside = false;
+    for(let i=0, j=ring.length-1; i<ring.length; j=i++) {
+      const [xi,yi] = ring[i], [xj,yj] = ring[j];
+      if(((yi>y) !== (yj>y)) && (x < (xj-xi)*(y-yi)/((yj-yi)||1e-15) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  function pointInPolygonCoords(x, y, coords) {
+    if(!pointInRing(x, y, coords[0])) return false;
+    return !coords.slice(1).some(hole => pointInRing(x, y, hole));
+  }
+  function coordToDong(lat, lon) {
+    if(!daeguBoundaries || !daeguBoundaries.length) return coordToDongFallback(lat, lon);
+    const x = lon, y = lat;
+    for(const feat of daeguBoundaries) {
+      const geom = feat.geometry, props = feat.properties;
+      if(geom.type === 'Polygon') {
+        if(pointInPolygonCoords(x, y, geom.coordinates)) return (props.adm_nm||'').replace('대구광역시 ','대구 ');
+      } else if(geom.type === 'MultiPolygon') {
+        for(const poly of geom.coordinates) {
+          if(pointInPolygonCoords(x, y, poly)) return (props.adm_nm||'').replace('대구광역시 ','대구 ');
+        }
+      }
+    }
+    return coordToDongFallback(lat, lon); // 대구 경계 밖(경산 등)이거나 폴리곤 미매칭 시 폴백
+  }
+
+  // ── 명령서#026 A안: 카카오T 콜의 실제 GPX 이동거리 산출 (공차율 100% 근본해결) ──
+  // 배차시각~하차시각 구간의 트랙포인트를 골라 point-to-point haversine 누적.
+  // 배회처럼 요금역산 추정이 아니라 GPX 실측이라 훨씬 정확함.
+  function estimateCallDistanceFromGpx(points, dateStr, 배차시각, 하차시각) {
+    if(!배차시각 || !하차시각 || !points || !points.length) return null;
+    const toTime = (hhmm) => {
+      const [hh,mm] = hhmm.split(':').map(Number);
+      const h = hh < 6 ? hh + 24 : hh; // 자정 넘김 보정(운행일 기준)
+      const base = new Date(dateStr + 'T00:00:00+09:00');
+      return new Date(base.getTime() + (h*60+mm)*60000);
+    };
+    const startT = toTime(배차시각);
+    let endT = toTime(하차시각);
+    if(endT < startT) endT = new Date(endT.getTime() + 24*3600000); // 하차시각이 자정 넘어간 경우
+    const inWindow = points.filter(p => p.time >= startT && p.time <= endT);
+    if(inWindow.length < 2) return null;
+    let dist = 0;
+    for(let i=1; i<inWindow.length; i++) {
+      dist += haversine(inWindow[i-1].lat, inWindow[i-1].lon, inWindow[i].lat, inWindow[i].lon);
+    }
+    return Math.round(dist*100)/100;
   }
 
   // ── 배회구역 복원 (요금역산 + GPX 매칭) ──
@@ -2014,6 +2079,17 @@ select.inp{padding:10px 13px}
       calls = calls.map(c => baehoeById.has(c.id)
         ? {...c, 영업거리_km: baehoeById.get(c.id).영업거리_km}
         : c);
+
+      // 캐스퍼 명령서#026 A안 (2026-08-08): 카카오T 콜은 지금까지 영업거리_km을 채워주는
+      // 로직이 아예 없어서(배회만 요금역산 추정이 있었음) 공차율이 무조건 100%로 나오던
+      // 구조적 문제. 배차시각~하차시각 구간의 실제 GPX 이동거리를 계산해서 채운다.
+      await loadDaeguBoundaries();
+      calls = calls.map(c => {
+        if(baehoeById.has(c.id)) return c; // 배회는 이미 위에서 처리됨
+        if(c.영업거리_km > 0) return c; // 이미 값 있으면 덮어쓰지 않음
+        const est = estimateCallDistanceFromGpx(parsed.points, dateStr, c.배차시각, c.하차시각);
+        return est != null ? {...c, 영업거리_km: est, _gpx추정: true} : c;
+      });
       gpxData.calls = calls;
 
       // 효율지표
@@ -2120,6 +2196,17 @@ select.inp{padding:10px 13px}
           도착지: b.도착지,
           영업거리_km: b.영업거리_km
         });
+      }
+
+      // 2-1. 캐스퍼 명령서#026 A안 (2026-08-08): 카카오T 콜의 GPX 실측 영업거리를
+      // 지금까지 로컬(gpxData.calls)에만 계산해두고 실제 DB에 저장하는 코드가 없었음
+      // (그래서 공차율 100%가 매번 재발). 여기서 실제로 PATCH해서 영구 반영한다.
+      for(const c of calls) {
+        if(c._gpx추정 && c.영업거리_km > 0) {
+          await sbReq('PATCH', `raw_calls?id=eq.${c.id}`, {
+            영업거리_km: c.영업거리_km
+          });
+        }
       }
 
       // 3. 영업거리 있는 건들의 km당매출 업데이트
