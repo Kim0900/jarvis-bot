@@ -414,6 +414,58 @@ def exclude_summary_rows(calls: list) -> list:
             out.extend(day_rows)
     return out
 
+# ──────────────────────────────────────────────
+# 명령서#026: GPX 좌표 → 대구 행정동 역지오코딩 (2026-08-08)
+# 카카오T 실거리 매칭(공차율 100% 문제)과 배회 핵심동선 분석(하드코딩 제거) 두 프로젝트가
+# 공유하는 핵심 자산. daegu_boundaries.geojson(150개 행정동 폴리곤, vuski/admdongkor
+# ver20260701 기준)을 광선교차법(ray casting)으로 point-in-polygon 판정.
+# 검증: 동대구역→동구 신암4동, 대구시청→중구 동인동, 동성로→중구 성내1동,
+#       수성구청→수성구 범어1동 — 4곳 다 실제 위치와 일치 확인(2026-08-08).
+# ──────────────────────────────────────────────
+_DAEGU_BOUNDARIES_CACHE = None
+
+def _load_daegu_boundaries():
+    global _DAEGU_BOUNDARIES_CACHE
+    if _DAEGU_BOUNDARIES_CACHE is None:
+        import json as _json, os as _os
+        path = _os.path.join(_os.path.dirname(__file__), "daegu_boundaries.geojson")
+        with open(path, encoding="utf-8") as f:
+            _DAEGU_BOUNDARIES_CACHE = _json.load(f)["features"]
+    return _DAEGU_BOUNDARIES_CACHE
+
+def _point_in_ring(x, y, ring):
+    n = len(ring)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = ring[i]
+        xj, yj = ring[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-15) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+def _point_in_polygon_coords(x, y, coords):
+    if not _point_in_ring(x, y, coords[0]):
+        return False
+    return not any(_point_in_ring(x, y, hole) for hole in coords[1:])
+
+def latlon_to_dong(lat: float, lon: float) -> str | None:
+    """GPS 좌표 → 대구 행정동 전체명(예: '대구광역시 중구 동인동') 반환. 대구 밖이면 None."""
+    x, y = lon, lat
+    for feat in _load_daegu_boundaries():
+        geom = feat["geometry"]
+        props = feat["properties"]
+        if geom["type"] == "Polygon":
+            if _point_in_polygon_coords(x, y, geom["coordinates"]):
+                return props.get("adm_nm")
+        elif geom["type"] == "MultiPolygon":
+            for poly in geom["coordinates"]:
+                if _point_in_polygon_coords(x, y, poly):
+                    return props.get("adm_nm")
+    return None
+
+
 async def sb_select_calls(params: dict = None) -> list:
     """raw_calls 전용 조회 — 영수증 요약행을 자동으로 제외한다.
     기존 `await sb_select("raw_calls", {...})`를 대체."""
