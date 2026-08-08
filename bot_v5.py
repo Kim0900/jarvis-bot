@@ -190,15 +190,14 @@ class HealthHandler(BaseHTTPRequestHandler):
                     # (max_tokens=20)처럼 예산이 작으면 사고만 하다 끝나서 실제 텍스트가
                     # 하나도 안 나와 "Expecting value"(빈 문자열 JSON파싱 실패)로 이어짐.
                     # 구조화 추출은 추론이 필요 없는 작업이라 사고 자체를 꺼서 예산을 답변에 전부 쓰게 한다.
+                    # 캐스퍼 수정 2026-08-08: 유형분류(일별운행이력/결제내역) API 호출이
+                    # 반복적으로 흔들려서(같은 화면이 매번 다르게 분류됨) 주소정보가 통째로
+                    # 빠지는 사고가 계속 재발함. 실사용 기록 전부(오늘까지) 일별운행이력
+                    # 화면만 업로드됐음을 확인 — 분류 호출 자체를 없애고 기본값 고정.
+                    # (결제내역 화면을 실제로 올릴 일이 생기면 이 값을 되돌리거나 수동 선택
+                    # 옵션을 추가해야 함.)
+                    is_daily = True
                     extra_kwargs = {"temperature": 0} if model.startswith("claude-haiku") else {"thinking": {"type": "disabled"}}
-                    cls_msg = client.messages.create(
-                        model=model, max_tokens=20, **extra_kwargs,
-                        messages=[{"role":"user","content":[
-                            {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                            {"type":"text","text":"'일별운행이력' 또는 '결제내역' 중 하나만 답해."}
-                        ]}]
-                    )
-                    is_daily = '일별' in _extract_claude_text(cls_msg)
                     if is_daily:
                         prompt = (
                             f'오늘 날짜는 {_today_str}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
@@ -3657,9 +3656,12 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         if n >= 3: return "★★"
         return "★"
 
-    anchor_night = "중구 성내·삼덕·동인 / 동구 신암"
-    anchor_late  = "북구 침산↔복현·노원동"
-    anchor_dawn  = "북구 노원동 / 중구 동인동"
+    # 캐스퍼 수정 2026-08-08: "핵심 동선"이 실데이터 아니라 하드코딩된 고정 문자열이었음
+    # (raw_calls의 배회 출발지는 대부분 null/미상이라 대체할 실데이터도 현재 없음).
+    # "실데이터 기반" 헤더 아래에서 마치 검증된 것처럼 보이던 문제 — 라벨로 명시.
+    anchor_night = "중구 성내·삼덕·동인 / 동구 신암 (미검증·고정값)"
+    anchor_late  = "북구 침산↔복현·노원동 (미검증·고정값)"
+    anchor_dawn  = "북구 노원동 / 중구 동인동 (미검증·고정값)"
 
     if 0 <= h <= 2:
         anchor = anchor_night + " / " + anchor_late
