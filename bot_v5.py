@@ -459,6 +459,17 @@ async def sb_select(table: str, params: dict = None) -> list:
 def _is_receipt_summary_row(r: dict) -> bool:
     return str(r.get("비고") or "").startswith("OCR 추출:") or r.get("콜유형") == "합계"
 
+# 캐스퍼 긴급수정 2026-08-10: _safe_int가 /ocr_history 핸들러 안에 지역함수로만 있어서
+# dual_verify_7day_average()·MCP 엔드포인트에서 NameError 발생(카산드라 실기기 테스트로 발견).
+# 모듈레벨로 승격해서 어디서든 쓸 수 있게 함.
+import re as _re_mod
+def _safe_int(v):
+    if v is None: return None
+    try: return int(v)
+    except (ValueError, TypeError):
+        digits = _re_mod.sub(r'[^0-9]', '', str(v))
+        return int(digits) if digits else None
+
 def exclude_summary_rows(calls: list) -> list:
     # 캐스퍼 수정 2026-08-05: 단순 전체제외는 "개별콜 없이 합계행만 있는 날"의 매출이
     # 통째로 0으로 사라지는 과교정을 낳음(index.html에서 실제로 겪은 문제, 동일 로직 이식).
