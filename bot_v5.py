@@ -3570,7 +3570,60 @@ def get_fish_report(custom_hour: int = None) -> str | None:
     return "\n".join(lines)
 
 
-async def recalc_fish_hour_data():
+# ──────────────────────────────────────────────
+# 명령서#028 갭3 (2026-08-09, 마기 발부): 7일 이동평균 이중검증
+# 가장 중요한 단일 지표(7일 이동평균)가 지금까지 daily_summary 한 가지 계산 방식에만
+# 의존했음. raw_calls 직접집계(방식A)와 daily_summary(방식B) 두 방식으로 각각 계산해서
+# 서로 다르면 즉시 경고한다. 자기검증시스템 갭분석(2026-08-09) 후속.
+# ──────────────────────────────────────────────
+async def dual_verify_7day_average() -> dict:
+    """7일 이동평균을 raw_calls 직접집계(A)와 daily_summary(B) 두 방식으로 계산해 대조.
+    반환: {"match": bool, "method_a": {...}, "method_b": {...}, "diff": 숫자, "dates": [...]}"""
+    end = today_kst()
+    dates = [str(end - timedelta(days=i)) for i in range(7)]
+    start = dates[-1]
+
+    # 방식A: raw_calls 직접집계 (요약행 제외)
+    calls_raw = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    calls = exclude_summary_rows(calls_raw)
+    a_by_date = {}
+    for c in calls:
+        d = c.get("날짜")
+        if d not in dates: continue
+        a_by_date.setdefault(d, {"매출": 0, "건수": 0})
+        a_by_date[d]["매출"] += _safe_int(c.get("요금")) or 0
+        a_by_date[d]["건수"] += 1
+    a_total = sum(v["매출"] for v in a_by_date.values())
+    a_days_with_data = len(a_by_date)
+    a_avg = round(a_total / 7, 0)
+
+    # 방식B: daily_summary (봇 계산값)
+    ds_rows = await sb_select("daily_summary", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    b_by_date = {r["날짜"]: {"매출": _safe_int(r.get("총매출")) or 0, "건수": _safe_int(r.get("총건수")) or 0} for r in ds_rows if r.get("날짜") in dates}
+    b_total = sum(v["매출"] for v in b_by_date.values())
+    b_avg = round(b_total / 7, 0)
+
+    diff = a_total - b_total
+    match = (diff == 0)
+
+    result = {
+        "match": match, "diff": diff,
+        "method_a": {"총매출": a_total, "일평균": a_avg, "데이터있는날": a_days_with_data},
+        "method_b": {"총매출": b_total, "일평균": b_avg},
+        "dates": dates,
+        "date_range": f"{start}~{end}",
+    }
+    if not match:
+        # 날짜별 상세 차이도 같이 산출 (원인 파악용)
+        detail = []
+        for d in dates:
+            av = a_by_date.get(d, {}).get("매출", 0)
+            bv = b_by_date.get(d, {}).get("매출", 0)
+            if av != bv:
+                detail.append(f"{d}: A={av:,}원 vs B={bv:,}원 (차이 {av-bv:+,}원)")
+        result["detail"] = detail
+    return result
+
     """어군 브리핑 시간대별 통계 재계산 (2026-07-13, 하드코딩 HOUR_DATA/FISH_DATA 제거).
     raw_calls(실시간 데이터) + call_quality_history(2/14~3/31 368건 검증데이터)를
     합쳐서 시간대별 카카오T/배회 평균 건수·비중·평균단가를 계산해 fish_hour_data에 저장.
@@ -3944,6 +3997,7 @@ def fish_scheduler(app):
     sent_start_brief = False
     last_reset_day = -1
     last_recalc_day = -1
+    last_dualverify_day = -1
 
     # 최초 기동 시 1회 즉시 재계산 (테이블이 비어있으면 폴백값으로 작동하다가 여기서 채워짐)
     try:
@@ -3953,6 +4007,26 @@ def fish_scheduler(app):
 
     while True:
         now = datetime.now(KST)
+
+        # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
+        if now.hour == 8 and now.day != last_dualverify_day:
+            try:
+                dv = loop.run_until_complete(dual_verify_7day_average())
+                last_dualverify_day = now.day
+                if not dv["match"]:
+                    msg = (
+                        f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
+                        f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
+                        f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
+                        f"차이: {dv['diff']:+,}원\n"
+                        + "\n".join(dv.get("detail", []))
+                    )
+                    logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
+                    loop.run_until_complete(send_all(msg))
+                else:
+                    logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
+            except Exception as e:
+                logger.error(f"7일평균 이중검증 실행 오류: {e}")
 
         # ── 매일 03시 플래그 리셋 (운행 종료 후)
         if now.hour == 3 and now.day != last_reset_day:
