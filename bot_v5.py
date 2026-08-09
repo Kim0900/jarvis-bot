@@ -151,6 +151,68 @@ class HealthHandler(BaseHTTPRequestHandler):
             send_json(200, {"status":"ok","message":"GPX는 앱 내 파싱 완료"})
             return
 
+        # ──────────────────────────────────────────────
+        # 명령서#029 (2026-08-09, 마기 발부): MAGI 전용 MCP 서버 1단계
+        # 카산드라(ChatGPT) 등 외부AI가 읽기전용으로 조회할 수 있는 통로 3개.
+        # 범위: 조회만, 쓰기·전략판단·자동오케스트레이션은 포함하지 않음(§0 명시).
+        # 인증: X-MCP-Key 헤더가 환경변수 MCP_API_KEY와 일치해야 함.
+        # ──────────────────────────────────────────────
+        if self.path.startswith('/mcp/'):
+            mcp_key = os.getenv("MCP_API_KEY", "")
+            req_key = self.headers.get("X-MCP-Key", "")
+            if not mcp_key or req_key != mcp_key:
+                send_json(401, {"success": False, "error": "MCP 인증 실패 (X-MCP-Key 헤더 확인)"})
+                return
+
+            if self.path == '/mcp/recent_events':
+                try:
+                    n = int(payload.get("limit", 5))
+                    rows = asyncio.run(sb_select("atlas_reports", {
+                        "status": "eq.analyzed", "order": "run_date.desc", "limit": str(n)
+                    }))
+                    events = [{"run_date": r.get("run_date"), "title": r.get("title"),
+                               "summary": (r.get("content") or "")[:500]} for r in rows]
+                    send_json(200, {"success": True, "events": events})
+                except Exception as e:
+                    logger.error(f"MCP recent_events 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            if self.path == '/mcp/kpi_status':
+                try:
+                    dv = asyncio.run(dual_verify_7day_average())
+                    today = str(today_kst())
+                    today_calls = asyncio.run(sb_select_calls({"날짜": f"eq.{today}"}))
+                    send_json(200, {
+                        "success": True,
+                        "seven_day_avg_krw": dv["method_a"]["일평균"],
+                        "seven_day_total_krw": dv["method_a"]["총매출"],
+                        "days_with_data": dv["method_a"]["데이터있는날"],
+                        "today_date": today,
+                        "today_driving": len(today_calls) > 0,
+                        "today_calls_so_far": len(today_calls),
+                        "dual_verify_match": dv["match"],
+                    })
+                except Exception as e:
+                    logger.error(f"MCP kpi_status 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            if self.path == '/mcp/corrections':
+                try:
+                    n = int(payload.get("limit", 10))
+                    rows = asyncio.run(sb_select("correction_log", {
+                        "order": "changed_at.desc", "limit": str(n)
+                    }))
+                    send_json(200, {"success": True, "corrections": rows})
+                except Exception as e:
+                    logger.error(f"MCP corrections 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            send_json(404, {"success": False, "error": f"알 수 없는 MCP 엔드포인트: {self.path}"})
+            return
+
         if self.path == '/ocr_history':
             try:
                 import anthropic as _ant, re as _re, json as _j, base64 as _b64mod
