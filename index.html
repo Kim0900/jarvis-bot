@@ -1533,6 +1533,7 @@ select.inp{padding:10px 13px}
       요금: ocrData.total_sales,
       콜유형: '카카오T',
       건수: Number(ocrData.trip_count)||1,
+      data_source: 'app_ocr_summary',
       비고: `OCR 추출: 매출 ${fmt(ocrData.total_sales)}원, 수수료 ${fmt(ocrData.commission)}원, 건수 ${ocrData.trip_count}건`
     };
 
@@ -2529,6 +2530,7 @@ select.inp{padding:10px 13px}
             배차시각: c.배차시각, 하차시각: c.하차시각,
             출발지: c.출발지, 도착지: c.도착지,
             요금: c.요금, 콜유형: '카카오T',
+            data_source: 'app_ocr_individual',
             비고: [
               (checkGuDong(c.출발지)||checkGuDong(c.도착지)) ? '구동불일치(확인필요)' : null,
               c.결제방식==='직접' ? '직접결제' : null
@@ -2638,7 +2640,8 @@ select.inp{padding:10px 13px}
         await sbInsert('raw_calls', {
           날짜: r.날짜, 요일: calls[0]?.요일||'',
           배차시각: r.시각, 요금: r.요금,
-          콜유형: '배회', 비고: '결제내역자동분류'
+          콜유형: '배회', 비고: '결제내역자동분류',
+          data_source: 'app_ocr_individual'
         });
         baehoe++;
       }
