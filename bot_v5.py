@@ -984,6 +984,7 @@ async def process_daily_history(update, image_bytes: bytes):
             "요금":     요금,
             "콜유형":   "카카오T",
             "비고":     비고,
+            "data_source": "app_ocr_individual",
         }
         result = await sb_insert("raw_calls", payload)
         if result:
@@ -2142,6 +2143,7 @@ async def process_call_card(update: Update, image_bytes: bytes):
         "요금": 요금,
         "콜유형": data.get("콜유형", "카카오T"),
         "비고": 비고,
+        "data_source": "app_ocr_individual",
     }
     result = await sb_insert("raw_calls", payload)
     if result:
@@ -2714,6 +2716,7 @@ async def confirm_cross_check(date_str: str) -> str:
             "요금":     r.get("요금"),
             "콜유형":   "배회",
             "비고":     "결제내역 교차대조 자동추가",
+            "data_source": "app_ocr_individual",
         }
         result = await sb_insert("raw_calls", payload)
         if result:
