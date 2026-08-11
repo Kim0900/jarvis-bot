@@ -3700,6 +3700,8 @@ async def dual_verify_7day_average() -> dict:
         result["detail"] = detail
     return result
 
+
+async def recalc_fish_hour_data():
     """어군 브리핑 시간대별 통계 재계산 (2026-07-13, 하드코딩 HOUR_DATA/FISH_DATA 제거).
     raw_calls(실시간 데이터) + call_quality_history(2/14~3/31 368건 검증데이터)를
     합쳐서 시간대별 카카오T/배회 평균 건수·비중·평균단가를 계산해 fish_hour_data에 저장.
@@ -4082,63 +4084,78 @@ def fish_scheduler(app):
         logger.error(f"fish_hour_data 최초 재계산 실패: {e}")
 
     while True:
-        now = datetime.now(KST)
+        try:
+            now = datetime.now(KST)
 
-        # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
-        if now.hour == 8 and now.day != last_dualverify_day:
-            try:
-                dv = loop.run_until_complete(dual_verify_7day_average())
-                last_dualverify_day = now.day
-                if not dv["match"]:
-                    msg = (
-                        f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
-                        f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
-                        f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
-                        f"차이: {dv['diff']:+,}원\n"
-                        + "\n".join(dv.get("detail", []))
-                    )
-                    logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
+            # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
+            if now.hour == 8 and now.day != last_dualverify_day:
+                try:
+                    dv = loop.run_until_complete(dual_verify_7day_average())
+                    last_dualverify_day = now.day
+                    if not dv["match"]:
+                        msg = (
+                            f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
+                            f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
+                            f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
+                            f"차이: {dv['diff']:+,}원\n"
+                            + "\n".join(dv.get("detail", []))
+                        )
+                        logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
+                        loop.run_until_complete(send_all(msg))
+                    else:
+                        logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
+                except Exception as e:
+                    logger.error(f"7일평균 이중검증 실행 오류: {e}")
+
+            # ── 매일 03시 플래그 리셋 (운행 종료 후)
+            if now.hour == 3 and now.day != last_reset_day:
+                sent_start_brief = False
+                last_sent_hour   = -1
+                last_reset_day   = now.day
+                logger.info("어군 스케줄러 일간 리셋")
+
+            # ── 매일 03:10 시간대별 통계 자동 재계산 (하드코딩 제거 후속)
+            if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
+                try:
+                    loop.run_until_complete(recalc_fish_hour_data())
+                    global _FISH_HOUR_CACHE
+                    _FISH_HOUR_CACHE = {}  # 캐시 무효화 → 다음 조회 시 새 값 로드
+                    logger.info("fish_hour_data 일일 재계산 완료")
+                except Exception as e:
+                    logger.error(f"fish_hour_data 일일 재계산 실패: {e}")
+                last_recalc_day = now.day
+
+            # ── 18:50 영업 준비 브리핑
+            if now.hour == 18 and now.minute == 50 and not sent_start_brief:
+                try:
+                    report = loop.run_until_complete(get_fish_report_db(hour=19)) or "데이터 없음"
+                    msg = f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"
                     loop.run_until_complete(send_all(msg))
-                else:
-                    logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
-            except Exception as e:
-                logger.error(f"7일평균 이중검증 실행 오류: {e}")
+                    logger.info("18:50 영업준비 브리핑 발송")
+                except Exception as e:
+                    # 캐스퍼 긴급수정 2026-08-11 (명령서#031): 이 구간에 예외처리가 없어서
+                    # 여기서 죽으면 while루프 전체(03:10 재계산 포함)가 영구정지되던 게
+                    # fish_hour_data 29일간 미갱신의 유력한 원인으로 추정됨. 재발방지.
+                    logger.error(f"18:50 영업준비 브리핑 오류: {e}")
+                sent_start_brief = True
 
-        # ── 매일 03시 플래그 리셋 (운행 종료 후)
-        if now.hour == 3 and now.day != last_reset_day:
-            sent_start_brief = False
-            last_sent_hour   = -1
-            last_reset_day   = now.day
-            logger.info("어군 스케줄러 일간 리셋")
-
-        # ── 매일 03:10 시간대별 통계 자동 재계산 (하드코딩 제거 후속)
-        if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
-            try:
-                loop.run_until_complete(recalc_fish_hour_data())
-                global _FISH_HOUR_CACHE
-                _FISH_HOUR_CACHE = {}  # 캐시 무효화 → 다음 조회 시 새 값 로드
-                logger.info("fish_hour_data 일일 재계산 완료")
-            except Exception as e:
-                logger.error(f"fish_hour_data 일일 재계산 실패: {e}")
-            last_recalc_day = now.day
-
-        # ── 18:50 영업 준비 브리핑
-        if now.hour == 18 and now.minute == 50 and not sent_start_brief:
-            report = loop.run_until_complete(get_fish_report_db(hour=19)) or "데이터 없음"
-            msg = f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"
-            loop.run_until_complete(send_all(msg))
-            sent_start_brief = True
-            logger.info("18:50 영업준비 브리핑 발송")
-
-        # ── 19:00 ~ 02:00 매 정각 브리핑
-        if now.minute == 0 and now.hour != last_sent_hour:
-            in_service = (19 <= now.hour <= 23) or (0 <= now.hour < 2)
-            if in_service:
-                report = loop.run_until_complete(get_fish_report_db())
-                if report:
-                    loop.run_until_complete(send_all(report))
-                    logger.info(f"어군 브리핑 발송: {now.hour}시")
+            # ── 19:00 ~ 02:00 매 정각 브리핑
+            if now.minute == 0 and now.hour != last_sent_hour:
+                in_service = (19 <= now.hour <= 23) or (0 <= now.hour < 2)
+                if in_service:
+                    try:
+                        report = loop.run_until_complete(get_fish_report_db())
+                        if report:
+                            loop.run_until_complete(send_all(report))
+                            logger.info(f"어군 브리핑 발송: {now.hour}시")
+                    except Exception as e:
+                        logger.error(f"{now.hour}시 정각 브리핑 오류: {e}")
                 last_sent_hour = now.hour
+
+        except Exception as e:
+            # 명령서#031 최외곽 안전망: 위에서 못 잡은 예상 밖 예외까지 전부 여기서 흡수해서
+            # 스레드 자체가 죽는 일은 절대 없게 함. 이게 이번 사건(29일 정지)의 재발을 막는 핵심.
+            logger.error(f"fish_scheduler 최외곽 예외 포착(스레드 생존): {e}")
 
         time.sleep(30)
 
