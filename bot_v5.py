@@ -3703,23 +3703,19 @@ async def dual_verify_7day_average() -> dict:
 
 async def recalc_fish_hour_data():
     """어군 브리핑 시간대별 통계 재계산 (2026-07-13, 하드코딩 HOUR_DATA/FISH_DATA 제거).
-    raw_calls(실시간 데이터) + call_quality_history(2/14~3/31 368건 검증데이터)를
-    합쳐서 시간대별 카카오T/배회 평균 건수·비중·평균단가를 계산해 fish_hour_data에 저장.
-    주의: call_quality_history는 마기 명령서#016에 따라 공식 건수 KPI에는 사용 금지지만,
-    이 계산은 "시간대별 패턴 분석"이라는 call_quality_history 본래 목적과 일치하므로 사용함.
+    raw_calls(실시간 데이터) 기반으로 시간대별 카카오T/배회 평균 건수·비중·평균단가를
+    계산해 fish_hour_data에 저장.
+    (2026-08-11 정리: call_quality_history 테이블이 실제로 존재하지 않아 매번 404 에러만
+    발생시키고 있었음 — Render 로그로 반복 확인, 항상 빈 배열이라 결과값엔 영향 없었지만
+    불필요한 조회+에러로그를 없앰. 필요시 call_distribution 등 대체 테이블 연동은 별도 검토.)
     """
     try:
         raw = await sb_select_calls( {}) or []
     except Exception as e:
         logger.error(f"fish_hour_data 재계산 - raw_calls 조회 실패: {e}")
         raw = []
-    try:
-        quality = await sb_select("call_quality_history", {}) or []
-    except Exception as e:
-        logger.error(f"fish_hour_data 재계산 - call_quality_history 조회 실패: {e}")
-        quality = []
 
-    all_rows = raw + quality
+    all_rows = raw
     if not all_rows:
         logger.warning("fish_hour_data 재계산 - 데이터 없음, 건너뜀")
         return
@@ -3742,7 +3738,7 @@ async def recalc_fish_hour_data():
         except Exception:
             continue
         ct = r.get("콜유형") or ""
-        cnt = _extract_count(r)  # raw_calls OCR요약행 보정, call_quality_history는 항상 1
+        cnt = _extract_count(r)  # raw_calls OCR요약행 보정
         fare = r.get("요금")
         if ct == "카카오T":
             hour_kakao_cnt[h] += cnt
@@ -3801,7 +3797,7 @@ async def load_fish_hour_data():
 
 
 async def get_fish_report_db(hour=None, tag_filter=None):
-    """어군 브리핑 v3 - 카카오/배회 분리, raw_calls+call_quality_history 실데이터 기반(하드코딩 제거)"""
+    """어군 브리핑 v3 - 카카오/배회 분리, raw_calls 실데이터 기반(하드코딩 제거)"""
     now = datetime.now(KST)
     h   = hour if hour is not None else now.hour
     day = DOW_KOR[now.weekday()]
