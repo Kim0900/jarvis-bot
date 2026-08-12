@@ -3835,12 +3835,48 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         if n >= 3: return "★★"
         return "★"
 
-    # 캐스퍼 수정 2026-08-08: "핵심 동선"이 실데이터 아니라 하드코딩된 고정 문자열이었음
-    # (raw_calls의 배회 출발지는 대부분 null/미상이라 대체할 실데이터도 현재 없음).
-    # "실데이터 기반" 헤더 아래에서 마치 검증된 것처럼 보이던 문제 — 라벨로 명시.
-    anchor_night = "중구 성내·삼덕·동인 / 동구 신암 (미검증·고정값)"
-    anchor_late  = "북구 침산↔복현·노원동 (미검증·고정값)"
-    anchor_dawn  = "북구 노원동 / 중구 동인동 (미검증·고정값)"
+    # 캐스퍼 수정 2026-08-12: "핵심 동선" 하드코딩을 실데이터 기반으로 교체.
+    # 배회 콜의 출발지(GPX 역지오코딩으로 채워진 실좌표 기반값, 명령서#026)를 시간대별로
+    # GROUP BY해서 실제 최다빈도 동을 계산. 표본이 너무 적으면(3건 미만) 정직하게
+    # "데이터부족"으로 표시하고 지어내지 않는다.
+    async def _baehoe_hotspot(hour_list):
+        try:
+            rows = await sb_select_calls({
+                "콜유형": "in.(배회,배회(잠정))",
+                "출발지": "not.is.null",
+            })
+        except Exception as e:
+            logger.error(f"배회 핵심동선 조회 실패: {e}")
+            return "조회오류"
+        counts = {}
+        for r in rows:
+            addr = r.get("출발지")
+            if not addr or addr in ("미상", ""):
+                continue
+            bt = r.get("배차시각")
+            if not bt:
+                continue
+            try:
+                rh = int(str(bt).split(":")[0])
+            except Exception:
+                continue
+            if rh not in hour_list:
+                continue
+            # "대구 OO구 OO동" → "OO동(OO구)" 형태로 요약
+            parts = addr.replace("대구 ", "").split(" ")
+            key = f"{parts[-1]}({parts[0]})" if len(parts) >= 2 else addr
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return "데이터부족(미검증)"
+        total = sum(counts.values())
+        if total < 3:
+            return f"데이터부족(표본{total}건, 미검증)"
+        top = sorted(counts.items(), key=lambda x: -x[1])[:2]
+        return " / ".join(f"{loc}({cnt}건)" for loc, cnt in top) + f" [실측 표본{total}건]"
+
+    anchor_night = await _baehoe_hotspot([19,20,21,22,23])
+    anchor_late  = await _baehoe_hotspot([0,1,2])
+    anchor_dawn  = await _baehoe_hotspot([3,4,5])
 
     if 0 <= h <= 2:
         anchor = anchor_night + " / " + anchor_late
