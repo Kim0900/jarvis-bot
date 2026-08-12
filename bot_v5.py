@@ -3878,12 +3878,16 @@ async def get_fish_report_db(hour=None, tag_filter=None):
     anchor_late  = await _baehoe_hotspot([0,1,2])
     anchor_dawn  = await _baehoe_hotspot([3,4,5])
 
-    if 0 <= h <= 2:
-        anchor = anchor_night + " / " + anchor_late
-    elif h >= 3:
-        anchor = anchor_dawn
-    else:
+    # 캐스퍼 긴급수정 2026-08-12 (대표님 실측대조로 발견): `elif h >= 3` 조건이
+    # 3시~23시를 전부 삼켜버려서 `else: anchor = anchor_night`가 절대 실행 안 되는
+    # 죽은 분기였음. 20시(night 구간)인데 dawn(3~5시) 표본이 뜨던 원인이 이것.
+    # night(19-23시) 구간을 먼저 확정하도록 순서/경계 수정.
+    if 19 <= h <= 23:
         anchor = anchor_night
+    elif 0 <= h <= 2:
+        anchor = anchor_night + " / " + anchor_late
+    else:
+        anchor = anchor_dawn
 
     if 19 <= h <= 21:
         decision   = "카카오 우선 대기"
