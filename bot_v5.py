@@ -210,6 +210,65 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e)})
                 return
 
+            # ──────────────────────────────────────────────
+            # 명령서#032 (2026-08-12): ATHENA Task Registry Phase 1 — MCP READ tool 4종.
+            # 전부 읽기전용(§4 명시). WRITE는 이번 범위 밖.
+            # ──────────────────────────────────────────────
+            if self.path == '/mcp/get_active_tasks':
+                try:
+                    params = {"status": "not.in.(CLOSED,CANCELLED)", "order": "updated_at.desc"}
+                    owner = payload.get("owner_agent")
+                    if owner:
+                        params["owner_agent"] = f"eq.{owner}"
+                    rows = asyncio.run(sb_select("magi_tasks", params))
+                    send_json(200, {"success": True, "tasks": rows})
+                except Exception as e:
+                    logger.error(f"MCP get_active_tasks 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            if self.path == '/mcp/get_task':
+                try:
+                    tid = payload.get("task_id")
+                    if tid is None:
+                        send_json(400, {"success": False, "error": "task_id 필요"})
+                        return
+                    task_rows = asyncio.run(sb_select("magi_tasks", {"task_id": f"eq.{tid}"}))
+                    event_rows = asyncio.run(sb_select("magi_task_events", {
+                        "task_id": f"eq.{tid}", "order": "created_at.asc"
+                    }))
+                    if not task_rows:
+                        send_json(404, {"success": False, "error": f"task_id={tid} 없음"})
+                        return
+                    send_json(200, {"success": True, "task": task_rows[0], "events": event_rows})
+                except Exception as e:
+                    logger.error(f"MCP get_task 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            if self.path == '/mcp/get_blocked_tasks':
+                try:
+                    rows = asyncio.run(sb_select("magi_tasks", {
+                        "status": "eq.BLOCKED", "order": "updated_at.desc"
+                    }))
+                    send_json(200, {"success": True, "tasks": rows})
+                except Exception as e:
+                    logger.error(f"MCP get_blocked_tasks 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
+            if self.path == '/mcp/get_recent_completed_tasks':
+                try:
+                    n = int(payload.get("limit", 10))
+                    rows = asyncio.run(sb_select("magi_tasks", {
+                        "status": "eq.COMPLETED", "order": "completed_at.desc", "limit": str(n)
+                    }))
+                    send_json(200, {"success": True, "tasks": rows})
+                except Exception as e:
+                    logger.error(f"MCP get_recent_completed_tasks 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             send_json(404, {"success": False, "error": f"알 수 없는 MCP 엔드포인트: {self.path}"})
             return
 
