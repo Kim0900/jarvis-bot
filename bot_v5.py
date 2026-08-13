@@ -214,6 +214,12 @@ class HealthHandler(BaseHTTPRequestHandler):
             # 명령서#032 (2026-08-12): ATHENA Task Registry Phase 1 — MCP READ tool 4종.
             # 전부 읽기전용(§4 명시). WRITE는 이번 범위 밖.
             # ──────────────────────────────────────────────
+            # ──────────────────────────────────────────────
+            # 명령서#034 (2026-08-13): magi_tasks에 problem/target/dependencies/
+            # context_summary 4개 컬럼 추가됨. 아래 sb_select()들은 select 파라미터를
+            # 지정하지 않아 PostgREST 기본동작(전체 컬럼 반환)으로 신규 필드도 이미
+            # 자동 포함됨 — 코드 로직 변경 불필요, curl 실기기검증으로 확인함.
+            # ──────────────────────────────────────────────
             if self.path == '/mcp/get_active_tasks':
                 try:
                     params = {"status": "not.in.(CLOSED,CANCELLED)", "order": "updated_at.desc"}
