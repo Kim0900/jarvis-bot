@@ -3724,6 +3724,174 @@ def get_fish_report(custom_hour: int = None) -> str | None:
 # 의존했음. raw_calls 직접집계(방식A)와 daily_summary(방식B) 두 방식으로 각각 계산해서
 # 서로 다르면 즉시 경고한다. 자기검증시스템 갭분석(2026-08-09) 후속.
 # ──────────────────────────────────────────────
+async def recalc_7day_average():
+    """명령서#035: 7일 이동평균(콜건수 기준, 축B 캘린더일) 자동 재계산.
+    필수 필터링: 콜유형='카카오T'만, verify_status != 'invalidated_duplicate'.
+    콜유형='합계'(미분류) 행이 있는 날은 계산에서 빼고 unclassified_days에 기록해서
+    숨기지 않는다. 결과는 kpi_7day_snapshot에 append(덮어쓰지 않음)."""
+    end = today_kst()
+    start = end - timedelta(days=6)
+    dates = [str(start + timedelta(days=i)) for i in range(7)]
+
+    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = rows or []
+
+    unclassified_days = set()
+    count_by_date = {d: 0 for d in dates}
+    for r in rows:
+        d = r.get("날짜")
+        if d not in count_by_date:
+            continue
+        if r.get("콜유형") == "합계":
+            unclassified_days.add(d)
+            continue
+        if r.get("콜유형") != "카카오T":
+            continue
+        if r.get("verify_status") == "invalidated_duplicate":
+            continue
+        count_by_date[d] += 1
+
+    total_count = sum(count_by_date.values())
+    daily_average = round(total_count / 7, 2)
+
+    if daily_average >= 10:
+        status = "SAFE"
+    elif daily_average >= 7:
+        status = "WARNING"
+    else:
+        status = "CRITICAL"
+
+    snapshot = {
+        "calc_date": str(end),
+        "window_start": str(start),
+        "window_end": str(end),
+        "total_count": total_count,
+        "daily_average": daily_average,
+        "unclassified_days": sorted(unclassified_days) or None,
+        "status": status,
+    }
+    await sb_insert("kpi_7day_snapshot", snapshot)
+    logger.info(f"7일평균 스냅샷 저장: {daily_average}건/일 ({status}), 미분류일 {sorted(unclassified_days)}")
+
+    if status in ("WARNING", "CRITICAL"):
+        msg = (
+            f"{'🟡' if status=='WARNING' else '🔴'} 7일 이동평균 {status}\n"
+            f"기간: {start}~{end}\n"
+            f"합계 {total_count}건, 일평균 {daily_average}건"
+        )
+        if unclassified_days:
+            msg += f"\n⚠️ 이 숫자는 {len(unclassified_days)}일 미분류(콜유형='합계') 상태를 제외한 값입니다: {sorted(unclassified_days)}"
+        try:
+            await send_all(msg)
+        except Exception as e:
+            logger.error(f"7일평균 알림 발송 실패: {e}")
+
+    return snapshot
+
+
+async def calc_daily_snapshot(calc_date_str: str = None):
+    """명령서#036: 축A(영업일) 기준 일별 5종 계산 — 시간대별/지역별 콜수, 평균단가,
+    콜간격, 공차시간. ARGOS_인수인계[3][5] 규칙: 자정(00:00~05:59대) 이후 콜은 전날
+    영업일 소속으로 재배정. 원본 raw_calls 필터링은 #035와 동일(verify_status,
+    콜유형='합계' 처리)."""
+    calc_date = calc_date_str or str(today_kst() - timedelta(days=1))  # 기본: 어제 영업일(당일 새벽 04시 실행 기준)
+    next_date = str(datetime.strptime(calc_date, "%Y-%m-%d").date() + timedelta(days=1))
+
+    same_day = await sb_select("raw_calls", {"날짜": f"eq.{calc_date}"}) or []
+    next_day = await sb_select("raw_calls", {"날짜": f"eq.{next_date}"}) or []
+
+    def hour_of(r):
+        bt = r.get("배차시각")
+        if not bt: return None
+        try: return int(str(bt).split(":")[0])
+        except Exception: return None
+
+    biz_rows = [r for r in same_day if (hour_of(r) or 0) >= 6]
+    biz_rows += [r for r in next_day if hour_of(r) is not None and hour_of(r) < 6]
+
+    unclassified = False
+    unclassified_note_parts = []
+    valid_rows = []
+    for r in biz_rows:
+        if r.get("콜유형") == "합계":
+            unclassified = True
+            unclassified_note_parts.append(f"{r.get('날짜')}(id={r.get('id')})")
+            continue
+        if r.get("콜유형") != "카카오T":
+            continue
+        if r.get("verify_status") == "invalidated_duplicate":
+            continue
+        valid_rows.append(r)
+
+    hourly_counts = {}
+    regional_counts = {}
+    fares = []
+    times_sorted = []
+    for r in valid_rows:
+        h = hour_of(r)
+        if h is not None:
+            hourly_counts[str(h)] = hourly_counts.get(str(h), 0) + 1
+        dest = r.get("도착지") or "미상"
+        # "대구 OO구 OO동" → "OO구"만 추출(지역별 집계는 구 단위가 실용적)
+        parts = str(dest).replace("대구 ", "").split(" ")
+        gu = parts[0] if parts else dest
+        regional_counts[gu] = regional_counts.get(gu, 0) + 1
+        fare = r.get("요금")
+        if fare: fares.append(fare)
+        bt = r.get("배차시각")
+        if bt and h is not None:
+            mm = int(str(bt).split(":")[1]) if ":" in str(bt) else 0
+            minutes_from_18 = ((h - 18) % 24) * 60 + mm  # 18시 기준 상대분(자정넘김 순서보정)
+            times_sorted.append(minutes_from_18)
+
+    times_sorted.sort()
+    intervals = [times_sorted[i] - times_sorted[i-1] for i in range(1, len(times_sorted))]
+    avg_interval = round(sum(intervals) / len(intervals), 2) if intervals else None
+    max_interval = round(max(intervals), 2) if intervals else None
+    avg_fare = round(sum(fares) / len(fares), 2) if fares else None
+    call_count = len(valid_rows)
+
+    # 공차시간(근사치): gpx_sessions 구속시간을 "영업거리/총거리" 비율로 분배.
+    # 원본 GPX 포인트가 DB에 없어 정밀계산 불가 — 근사치임을 명시.
+    avg_idle_min = total_idle_min = None
+    try:
+        gpx = await sb_select("gpx_sessions", {"날짜": f"eq.{calc_date}"})
+        if gpx:
+            g = gpx[0]
+            총거리 = g.get("총주행거리_km")
+            구속시간_h = g.get("구속시간_h")
+            영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
+            if 총거리 and 구속시간_h and 총거리 > 0:
+                공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
+                total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
+                avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
+    except Exception as e:
+        logger.error(f"공차시간(근사) 계산 실패 {calc_date}: {e}")
+
+    if unclassified:
+        unclassified_note_parts.append("(근거: GPX원본포인트 미보존으로 공차시간은 거리비율 기반 근사치)")
+    elif total_idle_min is not None:
+        unclassified_note_parts.append("공차시간은 GPX원본포인트 미보존으로 거리비율 기반 근사치")
+
+    snapshot = {
+        "calc_date": calc_date,
+        "axis": "A",
+        "hourly_counts": hourly_counts,
+        "regional_counts": regional_counts,
+        "avg_fare": avg_fare,
+        "call_count": call_count,
+        "avg_interval_min": avg_interval,
+        "max_interval_min": max_interval,
+        "avg_idle_min": avg_idle_min,
+        "total_idle_min": total_idle_min,
+        "unclassified_flag": unclassified,
+        "unclassified_note": " | ".join(unclassified_note_parts) if unclassified_note_parts else None,
+    }
+    result = await sb_insert("daily_calc_snapshot", snapshot)
+    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분")
+    return result
+
+
 async def dual_verify_7day_average() -> dict:
     """7일 이동평균을 raw_calls 직접집계(A)와 daily_summary(B) 두 방식으로 계산해 대조.
     반환: {"match": bool, "method_a": {...}, "method_b": {...}, "diff": 숫자, "dates": [...]}"""
@@ -4184,6 +4352,7 @@ def fish_scheduler(app):
     last_reset_day = -1
     last_recalc_day = -1
     last_dualverify_day = -1
+    last_kpi7day = -1
 
     # 최초 기동 시 1회 즉시 재계산 (테이블이 비어있으면 폴백값으로 작동하다가 여기서 채워짐)
     try:
@@ -4194,6 +4363,18 @@ def fish_scheduler(app):
     while True:
         try:
             now = datetime.now(KST)
+
+            # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산
+            if now.hour == 4 and now.day != last_kpi7day:
+                try:
+                    loop.run_until_complete(recalc_7day_average())
+                except Exception as e:
+                    logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
+                try:
+                    loop.run_until_complete(calc_daily_snapshot())
+                except Exception as e:
+                    logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
+                last_kpi7day = now.day
 
             # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
             if now.hour == 8 and now.day != last_dualverify_day:
