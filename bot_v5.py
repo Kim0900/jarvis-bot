@@ -522,6 +522,13 @@ async def sb_select(table: str, params: dict = None) -> list:
 # 캐스퍼 수정 2026-08-05 (명령서#024 검증 중 발견): 아르고스 재삽입 데이터는 비고가 아니라
 # 콜유형='합계'로 요약행을 표시함(비고는 null). 두 컨벤션 다 인식하도록 확대.
 def _is_receipt_summary_row(r: dict) -> bool:
+    # 캐스퍼 긴급수정 2026-08-13: 기존 비고텍스트 패턴("OCR 추출:"으로 시작) 판정은
+    # id1207이 confirmed 처리되며 비고가 바뀌자 패턴이 깨져서 요약행을 못 거르고
+    # 실제 이중집계(개별콜148,200원+요약행162,200원=310,400원 오산정)를 일으키던 중이었음
+    # — 대표님 GPX027 재확인 요청으로 발견. 명령서#030 data_source 컬럼 기반으로 교체,
+    # 텍스트 변경에 안 흔들리게 함. 구버전 데이터 호환을 위해 텍스트패턴도 폴백 유지.
+    if r.get("data_source") == "app_ocr_summary":
+        return True
     return str(r.get("비고") or "").startswith("OCR 추출:") or r.get("콜유형") == "합계"
 
 # 캐스퍼 긴급수정 2026-08-10: _safe_int가 /ocr_history 핸들러 안에 지역함수로만 있어서
