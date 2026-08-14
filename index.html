@@ -922,6 +922,7 @@ select.inp{padding:10px 13px}
       배차시각: gv('f-st')||'00:00',
       요금: total,
       콜유형: kk>0 ? '카카오T' : '배회',
+      data_source: 'manual_entry',
       비고: [kk?`카카오${fmt(kk)}`:'', cd?`카드${fmt(cd)}`:'' , cs?`현금${fmt(cs)}`:'' , ot?`기타${fmt(ot)}`:'' , gv('f-memo')].filter(Boolean).join(' / ')
     };
     const rec = {
