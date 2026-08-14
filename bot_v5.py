@@ -2456,6 +2456,7 @@ async def handle_manual_call(update: Update, parsed: dict):
         "요금": parsed["요금"],
         "콜유형": parsed["콜유형"],
         "도착지": parsed.get("도착지힌트"),
+        "data_source": "manual_entry",
     }
     r = await sb_insert("raw_calls", payload)
     if r:
@@ -3197,6 +3198,7 @@ async def handle_manual_full_call(update, text: str):
         "요금":     data["요금"],
         "콜유형":   data["콜유형"],
         "비고":     "수동입력",
+        "data_source": "manual_entry",
     })
 
     if result:
@@ -3624,6 +3626,7 @@ async def handle_excel_import(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "도착지": row[col.get("도착지", 4)],
                     "요금": 요금,
                     "콜유형": row[col.get("콜유형", 6)] or "카카오T",
+                    "data_source": "manual_entry",
                 }
                 r = await sb_insert("raw_calls", payload)
                 if r:
@@ -4759,6 +4762,7 @@ async def _process_single_command(update, context, text: str) -> str | None:
             "요금": parsed_call["요금"],
             "콜유형": parsed_call["콜유형"],
             "도착지": parsed_call.get("도착지힌트"),
+            "data_source": "manual_entry",
         }
         r = await sb_insert("raw_calls", payload)
         return f"✅ {parsed_call['콜유형']} {fmt(parsed_call['요금'])} 입력" if r else "❌ 저장 실패"
