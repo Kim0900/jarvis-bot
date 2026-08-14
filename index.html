@@ -1515,19 +1515,32 @@ select.inp{padding:10px 13px}
   async function findDuplicateOcrRecord(data){
     const date = data?.date;
     const amount = Number(data?.total_sales)||0;
-    if(!date || !amount) return false;
+    if(!date || !amount) return [];
     if(sbUrl && sbKey){
-      const rows = await sbSelect('raw_calls', {'날짜':'eq.'+date, '요금':'eq.'+amount, 'limit':'1'});
-      return !!(rows && rows.length);
+      const rows = await sbSelect('raw_calls', {'날짜':'eq.'+date, '요금':'eq.'+amount});
+      return rows || [];
     }
-    return (lload(KLO)||[]).some(r=>r.날짜===date && Number(r.요금)===amount);
+    return (lload(KLO)||[]).filter(r=>r.날짜===date && Number(r.요금)===amount);
   }
 
   async function saveOcr() {
     if (!ocrData) { toast('추출된 OCR 데이터가 없습니다.', 'err'); return; }
     const issues = validateOcrData(ocrData);
     if(issues.length){ toast('OCR 검증 실패: '+issues[0], 'err'); return; }
-    if(await findDuplicateOcrRecord(ocrData)){ toast('이미 저장된 OCR 기록으로 보입니다.', 'err'); return; }
+
+    // 캐스퍼 수정 2026-08-14: 중복이면 무조건 막고 끝나버려서, 잘못 올린 영수증을
+    // 정정하려고 다시 올려도 방법이 없던 문제(대표님 지적). 다른 두 저장경로
+    // (일별이력·결제내역)처럼 확인 후 진행 가능하게 통일. "교체" 선택 시 기존
+    // 매칭행을 지우고 새로 저장 — DELETE는 오늘 만든 트리거로 correction_log에
+    // 자동기록되니 안전하게 되돌아볼 수 있음.
+    const dupRows = await findDuplicateOcrRecord(ocrData);
+    let replaceIds = [];
+    if(dupRows.length){
+      const list = dupRows.map(r=>`· ${r.날짜} ${fmt(r.요금)}원 (id:${r.id||'로컬'})`).join('\n');
+      const choice = confirm(`⚠️ 같은 날짜·금액의 기존 기록이 ${dupRows.length}건 있습니다:\n${list}\n\n[확인] = 기존 기록 지우고 이걸로 교체\n[취소] = 저장 취소(기존 유지)`);
+      if(!choice) { toast('저장을 취소했습니다. 기존 기록은 그대로입니다.'); return; }
+      replaceIds = dupRows.map(r=>r.id).filter(Boolean);
+    }
 
     const rec = {
       날짜: ocrData.date,
@@ -1543,6 +1556,10 @@ select.inp{padding:10px 13px}
     showLoading(true);
     try {
       if(sbUrl && sbKey){
+        // 교체 선택 시 기존 매칭행 먼저 삭제(트리거가 correction_log에 자동기록)
+        for(const rid of replaceIds){
+          await sbReq('DELETE', `raw_calls?id=eq.${rid}`);
+        }
         let ins;
         try { ins = await sbInsert('raw_calls', rec); }
         catch(e){
@@ -1555,6 +1572,7 @@ select.inp{padding:10px 13px}
         toast('OCR 데이터 저장 완료!');
       } else {
         let all = lload(KLO)||[];
+        if(replaceIds.length) all = all.filter(r => !replaceIds.includes(r.id));
         all.push({...rec,id:Date.now()});
         lsave(KLO,all);
         toast('OCR 데이터 저장 완료! (로컬 저장)', 'warn');
