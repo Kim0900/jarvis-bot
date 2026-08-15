@@ -96,6 +96,63 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # 영실 MCP안정화 제안서 §3,4 P0 대응
+        if self.path == '/health':
+            try:
+                supa_ok = True
+                supa_detail = "OK"
+                try:
+                    asyncio.run(sb_select("db_manifest", {"limit": "1"}))
+                except Exception as e:
+                    supa_ok = False
+                    supa_detail = f"FAIL: {e}"
+
+                last_db_sync = None
+                try:
+                    rows = asyncio.run(sb_select("correction_log", {"order": "changed_at.desc", "limit": "1"}))
+                    if rows: last_db_sync = rows[0].get("changed_at")
+                except Exception as e:
+                    logger.error(f"health: last_db_sync 조회 실패: {e}")
+
+                scheduler_rows = []
+                try:
+                    scheduler_rows = asyncio.run(sb_select("scheduler_status", {"order": "last_run_at.desc"})) or []
+                except Exception as e:
+                    logger.error(f"health: scheduler_status 조회 실패: {e}")
+
+                body = json.dumps({
+                    "render": "OK",
+                    "supabase": "OK" if supa_ok else supa_detail,
+                    "mcp": "OK",
+                    "telegram": "미구현(라이브러리 내부폴링이라 추적불가, 정직히 표기)",
+                    "last_db_sync": last_db_sync,
+                    "scheduler_jobs": {r["job_name"]: {"last_run_at": r.get("last_run_at"), "last_result": r.get("last_result")} for r in scheduler_rows},
+                }, ensure_ascii=False).encode('utf-8')
+                self.send_response(200)
+                self._cors_headers()
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self.send_response(500)
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(str(e).encode('utf-8'))
+            return
+
+        if self.path == '/version':
+            body = json.dumps({
+                "bot_version": "v5",
+                "github_commit": os.getenv("RENDER_GIT_COMMIT", "unknown(로컬실행 또는 Render 미배포)"),
+                "render_service_id": os.getenv("RENDER_SERVICE_ID", "unknown"),
+            }, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self._cors_headers()
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         self.send_response(200)
         self._cors_headers()
         self.end_headers()
@@ -103,7 +160,8 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """API 엔드포인트 — OCR / 마기분석 / 아틀라스보고"""
-        import json as _j, re as _re
+        import json as _j, re as _re, time as _time
+        _req_start = _time.time()
         length = int(self.headers.get('Content-Length', 0))
         raw_body = self.rfile.read(length)
         try:
@@ -112,6 +170,16 @@ class HealthHandler(BaseHTTPRequestHandler):
             payload = {}
 
         def send_json(code, data):
+            # 영실 MCP안정화 제안서 §5: Action호출 표준로그(처리시간·반환건수) —
+            # 전체 POST 엔드포인트(MCP 7종 포함)에 공용함수 통해 일괄 적용
+            duration_ms = round((_time.time() - _req_start) * 1000)
+            rows_count = None
+            if isinstance(data, dict):
+                for k in ("tasks", "task", "events", "corrections", "task_events"):
+                    v = data.get(k)
+                    if isinstance(v, list):
+                        rows_count = len(v); break
+            logger.info(f"[ActionLog] {self.path} | HTTP {code} | {duration_ms}ms | rows={rows_count}")
             body = _j.dumps(data, ensure_ascii=False).encode('utf-8')
             self.send_response(code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -3727,6 +3795,20 @@ def get_fish_report(custom_hour: int = None) -> str | None:
 # 의존했음. raw_calls 직접집계(방식A)와 daily_summary(방식B) 두 방식으로 각각 계산해서
 # 서로 다르면 즉시 경고한다. 자기검증시스템 갭분석(2026-08-09) 후속.
 # ──────────────────────────────────────────────
+async def mark_scheduler_run(job_name: str, result: str = "OK"):
+    """영실 MCP안정화 제안서 §3(/health) 대응 — 각 스케줄러 작업 실행시각을
+    DB(scheduler_status)에 기록. 프로세스 메모리 변수(last_kpi7day 등)는 재시작시
+    사라지지만 이건 영구 기록되어 /health가 신뢰성 있게 참조 가능."""
+    try:
+        await sb_upsert("scheduler_status", {
+            "job_name": job_name,
+            "last_run_at": datetime.now(KST).isoformat(),
+            "last_result": result,
+        }, on_conflict="job_name")
+    except Exception as e:
+        logger.error(f"scheduler_status 기록 실패({job_name}): {e}")
+
+
 async def recalc_daily_summary_totals(days_back: int = 14):
     """daily_summary가 GPX업로드/영수증OCR 시점에만 갱신되는 구조라, 그 액션을
     안 하면 운행을 해도 daily_summary가 그 날짜 자체가 안 만들어지는 문제
@@ -4402,16 +4484,22 @@ def fish_scheduler(app):
             if now.hour == 4 and now.day != last_kpi7day:
                 try:
                     loop.run_until_complete(recalc_daily_summary_totals())
+                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals"))
                 except Exception as e:
                     logger.error(f"daily_summary 자동갱신 실패: {e}")
+                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {e}"))
                 try:
                     loop.run_until_complete(recalc_7day_average())
+                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average"))
                 except Exception as e:
                     logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
+                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average", f"FAIL: {e}"))
                 try:
                     loop.run_until_complete(calc_daily_snapshot())
+                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot"))
                 except Exception as e:
                     logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
+                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot", f"FAIL: {e}"))
                 last_kpi7day = now.day
 
             # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
@@ -4419,6 +4507,7 @@ def fish_scheduler(app):
                 try:
                     dv = loop.run_until_complete(dual_verify_7day_average())
                     last_dualverify_day = now.day
+                    loop.run_until_complete(mark_scheduler_run("dual_verify_7day_average", "OK" if dv["match"] else "MISMATCH"))
                     if not dv["match"]:
                         msg = (
                             f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
