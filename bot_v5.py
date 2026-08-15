@@ -3910,7 +3910,7 @@ async def recalc_7day_average():
         "unclassified_days": sorted(unclassified_days) or None,
         "status": status,
     }
-    await sb_insert("kpi_7day_snapshot", snapshot)
+    await sb_upsert("kpi_7day_snapshot", snapshot, on_conflict="calc_date")
     logger.info(f"7일평균 스냅샷 저장: {daily_average}건/일 ({status}), 미분류일 {sorted(unclassified_days)}")
 
     if status in ("WARNING", "CRITICAL"):
@@ -4027,7 +4027,7 @@ async def calc_daily_snapshot(calc_date_str: str = None):
         "unclassified_flag": unclassified,
         "unclassified_note": " | ".join(unclassified_note_parts) if unclassified_note_parts else None,
     }
-    result = await sb_insert("daily_calc_snapshot", snapshot)
+    result = await sb_upsert("daily_calc_snapshot", snapshot, on_conflict="calc_date,axis")
     logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분")
     return result
 
