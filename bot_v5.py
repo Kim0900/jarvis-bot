@@ -3727,6 +3727,37 @@ def get_fish_report(custom_hour: int = None) -> str | None:
 # 의존했음. raw_calls 직접집계(방식A)와 daily_summary(방식B) 두 방식으로 각각 계산해서
 # 서로 다르면 즉시 경고한다. 자기검증시스템 갭분석(2026-08-09) 후속.
 # ──────────────────────────────────────────────
+async def recalc_daily_summary_totals(days_back: int = 14):
+    """daily_summary가 GPX업로드/영수증OCR 시점에만 갱신되는 구조라, 그 액션을
+    안 하면 운행을 해도 daily_summary가 그 날짜 자체가 안 만들어지는 문제
+    (2026-08-15 명령서#028 갭3 텔레그램 경고로 실제 발견: 08-09~08-12 raw_calls엔
+    데이터 있는데 daily_summary는 전부 0원).
+    raw_calls 요약행제외 직접집계로 총매출·총건수만 매일 자동 UPSERT — 공차율 등
+    GPX전용 필드는 PostgREST upsert 특성상 미지정시 기존값 그대로 유지됨."""
+    end = today_kst()
+    start = end - timedelta(days=days_back-1)
+    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = exclude_summary_rows(rows or [])
+
+    by_date = {}
+    for r in rows:
+        d = r.get("날짜")
+        if not d: continue
+        by_date.setdefault(d, {"총매출": 0, "총건수": 0})
+        by_date[d]["총매출"] += _safe_int(r.get("요금")) or 0
+        by_date[d]["총건수"] += 1
+
+    updated = []
+    for d, v in by_date.items():
+        try:
+            await sb_upsert("daily_summary", {"날짜": d, "총매출": v["총매출"], "총건수": v["총건수"]}, on_conflict="날짜")
+            updated.append(d)
+        except Exception as e:
+            logger.error(f"daily_summary 자동갱신 실패({d}): {e}")
+    logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일 ({start}~{end})")
+    return updated
+
+
 async def recalc_7day_average():
     """명령서#035: 7일 이동평균(콜건수 기준, 축B 캘린더일) 자동 재계산.
     필수 필터링: 콜유형='카카오T'만, verify_status != 'invalidated_duplicate'.
@@ -4367,8 +4398,12 @@ def fish_scheduler(app):
         try:
             now = datetime.now(KST)
 
-            # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산
+            # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산 + daily_summary 자동갱신
             if now.hour == 4 and now.day != last_kpi7day:
+                try:
+                    loop.run_until_complete(recalc_daily_summary_totals())
+                except Exception as e:
+                    logger.error(f"daily_summary 자동갱신 실패: {e}")
                 try:
                     loop.run_until_complete(recalc_7day_average())
                 except Exception as e:
