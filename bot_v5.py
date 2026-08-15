@@ -3809,6 +3809,30 @@ async def mark_scheduler_run(job_name: str, result: str = "OK"):
         logger.error(f"scheduler_status 기록 실패({job_name}): {e}")
 
 
+async def check_ingestion_gap():
+    """task_id=31 긴급대응: OCR→raw_calls 인입 중단을 조기 감지.
+    최근 3일 연속 신규 raw_calls가 0건이면 텔레그램 경고 — 08-13~15 사흘간
+    조용히 멈췄던 걸 아무도 몰랐던 사고 재발방지. 매일 08시 갭3 검증에 편승."""
+    today = today_kst()
+    gap_days = []
+    for i in range(3):
+        d = str(today - timedelta(days=i+1))  # 어제, 그제, 그그제
+        rows = await sb_select("raw_calls", {"날짜": f"eq.{d}", "limit": "1"})
+        if not rows:
+            gap_days.append(d)
+    if len(gap_days) == 3:
+        msg = (
+            f"🔴 인입 중단 경고: 최근 3일({', '.join(sorted(gap_days))}) raw_calls "
+            f"신규데이터 0건입니다.\n실제 운행이 있었다면 OCR 업로드를 확인해주세요."
+        )
+        logger.warning(f"인입중단 감지: {gap_days}")
+        try:
+            await send_all(msg)
+        except Exception as e:
+            logger.error(f"인입중단 경고 발송 실패: {e}")
+    return gap_days
+
+
 async def recalc_daily_summary_totals(days_back: int = 14):
     """daily_summary가 GPX업로드/영수증OCR 시점에만 갱신되는 구조라, 그 액션을
     안 하면 운행을 해도 daily_summary가 그 날짜 자체가 안 만들어지는 문제
@@ -4501,6 +4525,14 @@ def fish_scheduler(app):
                     logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
                     loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot", f"FAIL: {e}"))
                 last_kpi7day = now.day
+
+            # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
+            if now.hour == 8 and now.day != last_dualverify_day:
+                try:
+                    loop.run_until_complete(check_ingestion_gap())
+                    loop.run_until_complete(mark_scheduler_run("check_ingestion_gap"))
+                except Exception as e:
+                    logger.error(f"인입중단 감지 실패: {e}")
 
             # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
             if now.hour == 8 and now.day != last_dualverify_day:
