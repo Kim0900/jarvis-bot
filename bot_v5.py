@@ -1404,11 +1404,9 @@ async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
     window_calls_all = await sb_select_calls( {
         "and": f"(날짜.gte.{window_start},날짜.lte.{날짜})"
     }) or []
-    # task_id=33 STEP1 임시조치(2026-08-16): axisA/A(155건)가 명령서#012 잔재로
-    # date_axis='B' 단일조건에서 실계산 누락 중이던 것 확인 → 즉시구제.
-    # daily_total(15건)은 성격불명(이중집계 위험 있어 별도조사) 제외.
-    # ※ STEP2에서 axisA/A를 'B'로 정규화 UPDATE 후 이 IN절은 'B' 단일로 되돌릴 예정.
-    window_calls = [c for c in window_calls_all if (c.get("date_axis") or "B") in ("B", "axisA", "A")]
+    # task_id=33 STEP2 완료(2026-08-16): axisA/A 155건을 raw_calls.date_axis='B'로
+    # 정규화 완료(correction_log 기록). STEP1의 IN절 임시확장을 원래 단일조건으로 원복.
+    window_calls = [c for c in window_calls_all if (c.get("date_axis") or "B") == "B"]
 
     # 명령서 #009 재검증(2026-07-08) 결과 반영: 자동 +1일 보정 제거.
     # 이지스가 업로드하는 raw_calls는 아르고스가 명령서#020·#021-rev1 자정분리
