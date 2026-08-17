@@ -4274,14 +4274,32 @@ async def get_fish_report_db(hour=None, tag_filter=None):
     h   = hour if hour is not None else now.hour
     day = DOW_KOR[now.weekday()]
 
+    # 대표님 요청(2026-08-17): 요일×시간대 데이터(fish_hour_data_dow) 우선사용.
+    # "8시간환산" 관례를 없애고, 그 요일 관측일수로 직접 나눈 평균을 그대로 씀
+    # (예: 22건÷14일=1.57건 → 반올림 약2건). 없으면 기존 요일무관 통계로 폴백.
+    dow_rows = await sb_select("fish_hour_data_dow", {"요일": f"eq.{day}", "hour": f"eq.{h}"})
+    hd_dow = dow_rows[0] if dow_rows else None
+
     HOUR_DATA = await load_fish_hour_data()
     _fallback = {"kakao": 0, "baehoe": 0, "b_pct": 0, "avg_fare_kakao": None, "avg_fare_baehoe": None}
     hd_raw = HOUR_DATA.get(h) or _fallback
 
-    # 캐스퍼 수정 2026-07-13: 실제 운행 데이터가 거의 없는 시간대(예: 낮 시간대)에
-    # 억지로 최소 1건으로 채워서 "콜 간격 480분" 같은 비현실적 수치가 나오던 문제 수정.
-    # 관측일당 카카오+배회 합계가 0.05건 미만(48일 기준 대략 2~3건 미만)이면 데이터 부족으로 간주.
-    total_obs = (hd_raw.get("kakao") or 0) + (hd_raw.get("baehoe") or 0)
+    if hd_dow:
+        kakao_avg = float(hd_dow.get("kakao_avg") or 0)
+        baehoe_avg = float(hd_dow.get("baehoe_avg") or 0)
+        sample_days = hd_dow.get("sample_days") or 0
+        fare_kakao = hd_dow.get("avg_fare_kakao") or 9000
+        fare_baehoe = hd_dow.get("avg_fare_baehoe") or 10500
+        data_note = f"{day}요일 {sample_days}일 관측"
+    else:
+        kakao_avg = float(hd_raw.get("kakao") or 0)
+        baehoe_avg = float(hd_raw.get("baehoe") or 0)
+        sample_days = 0
+        fare_kakao = hd_raw.get("avg_fare_kakao") or 9000
+        fare_baehoe = hd_raw.get("avg_fare_baehoe") or 10500
+        data_note = "요일무관 전체평균(요일축 데이터 없음)"
+
+    total_obs = kakao_avg + baehoe_avg
     if total_obs < 0.05:
         return (
             f"🐟 어군 브리핑 v3 — {str(h).zfill(2)}시 {day}요일 (실데이터 기반)\n"
@@ -4290,21 +4308,16 @@ async def get_fish_report_db(hour=None, tag_filter=None):
             f"(19~21시/21~24시/00~02시 운영시간대에 데이터가 집중되어 있습니다)"
         )
 
-    # kakao/baehoe는 "관측일당 평균"이므로, 기존 표기(8시간당 건수)에 맞춰 근사 환산
-    hd = {
-        "kakao": max(round(hd_raw["kakao"] * 8), 1) if hd_raw["kakao"] else 1,
-        "baehoe": round(hd_raw["baehoe"] * 8, 1),
-        "b_pct": round(hd_raw["b_pct"], 1),
-    }
-    fare_kakao = hd_raw.get("avg_fare_kakao") or 9000
-    fare_baehoe = hd_raw.get("avg_fare_baehoe") or 10500
-    k_pct = 100 - hd["b_pct"]
-    k_int = round(60 / (hd["kakao"] / 8)) if hd["kakao"] > 0 else 99
-    b_per = round(hd["baehoe"] / 8 * 10) / 10
+    kakao_disp = round(kakao_avg)
+    baehoe_disp = round(baehoe_avg, 1)
+    total_disp = kakao_avg + baehoe_avg
+    b_pct = round(baehoe_avg / total_disp * 100, 1) if total_disp > 0 else 0.0
+    k_pct = 100 - b_pct
 
-    def stars(n):
-        if n >= 5: return "★★★"
-        if n >= 3: return "★★"
+    def stars(days):
+        # 표본일수(관측 신뢰도) 기준 — 데이터가 며칠치인지가 진짜 신뢰도 지표
+        if days >= 10: return "★★★"
+        if days >= 5: return "★★"
         return "★"
 
     # 캐스퍼 수정 2026-08-12: "핵심 동선" 하드코딩을 실데이터 기반으로 교체.
@@ -4363,13 +4376,13 @@ async def get_fish_report_db(hour=None, tag_filter=None):
 
     if 19 <= h <= 21:
         decision   = "카카오 우선 대기"
-        rec_detail = "배회 " + str(hd["b_pct"]) + "% 미만 — 콜 대기 합리적\n수락률 100% 유지"
+        rec_detail = "배회 " + str(b_pct) + "% 미만 — 콜 대기 합리적\n수락률 100% 유지"
     elif 22 <= h <= 23:
         decision   = "카카오 우선 + 배회 수용"
-        rec_detail = "배회 " + str(hd["b_pct"]) + "% — 앵커 위치면 적극 수용\n" + anchor.split("/")[0].strip()
+        rec_detail = "배회 " + str(b_pct) + "% — 앵커 위치면 적극 수용\n" + anchor.split("/")[0].strip()
     elif 0 <= h <= 2:
         decision   = "★ 배회 적극 수용 (황금시간)"
-        rec_detail = "배회 " + str(hd["b_pct"]) + "% — 자정후 황금구간\n핵심 동선: " + anchor
+        rec_detail = "배회 " + str(b_pct) + "% — 자정후 황금구간\n핵심 동선: " + anchor
     elif 3 <= h <= 4:
         decision   = "마감 단계"
         rec_detail = "02시 종료 검토" if day in ["화", "목"] else "끝까지 사수"
@@ -4377,7 +4390,7 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         decision   = "운행 준비 / 대기"
         rec_detail = "19시 이후 카카오 골든타임 준비"
 
-    est_h = round((fare_kakao * k_pct / 100 + fare_baehoe * hd["b_pct"] / 100) * (hd["kakao"] + hd["baehoe"]) / 8)
+    est_h = round(fare_kakao * kakao_avg + fare_baehoe * baehoe_avg)
 
     db_zones = []
     try:
@@ -4402,9 +4415,9 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         chr(0x2501) * 22,
         "",
         "🟢 카카오 콜 어군",
-        "  콜 간격: 약 " + str(k_int) + "분 (" + stars(hd["kakao"]) + ")",
+        "  예상 건수: 약 " + str(kakao_disp) + "건 (" + stars(sample_days) + ", " + data_note + ")",
         "  평균 단가: " + fmt(fare_kakao) + "대",
-        "  비중: " + str(k_pct) + "%  (" + str(hd["kakao"]) + "건/8h 기준)",
+        "  비중: " + str(k_pct) + "%",
     ]
     if db_zones:
         lines.append("  DB 핫존: " + " / ".join(db_zones))
@@ -4412,7 +4425,7 @@ async def get_fish_report_db(hour=None, tag_filter=None):
     lines += [
         "",
         "🟠 배회 어군",
-        "  만남 확률: 시간당 " + str(b_per) + "건 (" + stars(hd["baehoe"]) + ", " + str(hd["b_pct"]) + "%)",
+        "  예상 건수: 약 " + str(baehoe_disp) + "건 (" + stars(sample_days) + ", " + str(b_pct) + "%)",
         "  평균 단가: " + fmt(fare_baehoe) + " (수수료 0%)",
         "  핵심 동선: " + anchor,
         "",
