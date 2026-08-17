@@ -343,6 +343,28 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e)})
                 return
 
+            # ──────────────────────────────────────────────
+            # task_id=27(로드맵6) 지원: 아르고스 브리핑 자동화용 READ 엔드포인트.
+            # calc_date 지정시 그 날짜(축A) 단건, 없으면 최근 limit개(기본 7) 반환.
+            # ──────────────────────────────────────────────
+            if self.path == '/mcp/get_daily_calc_snapshot':
+                try:
+                    calc_date = payload.get("calc_date")
+                    if calc_date:
+                        rows = asyncio.run(sb_select("daily_calc_snapshot", {
+                            "calc_date": f"eq.{calc_date}", "axis": "eq.A"
+                        }))
+                    else:
+                        n = int(payload.get("limit", 7))
+                        rows = asyncio.run(sb_select("daily_calc_snapshot", {
+                            "axis": "eq.A", "order": "calc_date.desc", "limit": str(n)
+                        }))
+                    send_json(200, {"success": True, "snapshots": rows})
+                except Exception as e:
+                    logger.error(f"MCP get_daily_calc_snapshot 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             send_json(404, {"success": False, "error": f"알 수 없는 MCP 엔드포인트: {self.path}"})
             return
 
