@@ -4177,6 +4177,74 @@ async def recalc_fish_hour_data():
     logger.info(f"fish_hour_data 재계산 완료 (관측일수={total_days}, 총 {len(all_rows)}건)")
 
 
+async def recalc_fish_hour_data_dow():
+    """대표님 직접요청(2026-08-17): 요일×시간대 조합별 콜빈도 재계산.
+    기존 fish_hour_data(시간대만, 8시간환산)와 달리 '8시간 기준'이라는 근거없는
+    관례적 상수를 없애고, "그 요일이 실제 관측된 일수"로 직접 나눈 평균건수를
+    그대로 사용 — 예: 월요일21시 22건÷14일=1.57→반올림2건, 이게 최종 표시값."""
+    try:
+        raw = await sb_select_calls({}) or []
+    except Exception as e:
+        logger.error(f"fish_hour_data_dow 재계산 - raw_calls 조회 실패: {e}")
+        raw = []
+    if not raw:
+        logger.warning("fish_hour_data_dow 재계산 - 데이터 없음, 건너뜀")
+        return
+
+    from collections import defaultdict
+    # 요일별 관측일수(그 요일이 실제 몇 번 있었는지, 고유 날짜 기준)
+    dow_days = defaultdict(set)
+    for r in raw:
+        d, w = r.get("날짜"), r.get("요일")
+        if d and w:
+            dow_days[w].add(d)
+    dow_day_count = {w: len(s) for w, s in dow_days.items()}
+
+    cnt = defaultdict(float)       # (요일,hour,콜유형) -> 건수합
+    fare = defaultdict(list)       # (요일,hour,콜유형) -> 요금리스트
+    for r in raw:
+        w = r.get("요일")
+        bt = r.get("배차시각")
+        if not w or not bt:
+            continue
+        try:
+            h = int(str(bt).split(":")[0])
+        except Exception:
+            continue
+        ct = r.get("콜유형") or ""
+        if ct not in ("카카오T", "배회"):
+            continue
+        c = _extract_count(r)
+        cnt[(w, h, ct)] += c
+        f = r.get("요금")
+        if f: fare[(w, h, ct)].append(f)
+
+    saved = 0
+    for w, days in dow_day_count.items():
+        if days < 1:
+            continue
+        for h in range(24):
+            k_cnt = cnt.get((w, h, "카카오T"), 0)
+            b_cnt = cnt.get((w, h, "배회"), 0)
+            if k_cnt == 0 and b_cnt == 0:
+                continue  # 데이터 자체가 없는 슬롯은 행을 안 만듦(빈슬롯과 0건 구분)
+            kf = fare.get((w, h, "카카오T"), [])
+            bf = fare.get((w, h, "배회"), [])
+            try:
+                await sb_upsert("fish_hour_data_dow", {
+                    "요일": w, "hour": h,
+                    "kakao_count": round(k_cnt), "kakao_avg": round(k_cnt / days, 2),
+                    "avg_fare_kakao": round(sum(kf) / len(kf)) if kf else None,
+                    "baehoe_count": round(b_cnt), "baehoe_avg": round(b_cnt / days, 2),
+                    "avg_fare_baehoe": round(sum(bf) / len(bf)) if bf else None,
+                    "sample_days": days,
+                }, on_conflict="요일,hour")
+                saved += 1
+            except Exception as e:
+                logger.error(f"fish_hour_data_dow {w}{h}시 저장 오류: {e}")
+    logger.info(f"fish_hour_data_dow 재계산 완료 ({saved}개 슬롯)")
+
+
 _FISH_HOUR_CACHE = {}
 
 async def load_fish_hour_data():
