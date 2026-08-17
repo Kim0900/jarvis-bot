@@ -4663,6 +4663,11 @@ def fish_scheduler(app):
                     logger.info("fish_hour_data 일일 재계산 완료")
                 except Exception as e:
                     logger.error(f"fish_hour_data 일일 재계산 실패: {e}")
+                try:
+                    loop.run_until_complete(recalc_fish_hour_data_dow())
+                    logger.info("fish_hour_data_dow 일일 재계산 완료")
+                except Exception as e:
+                    logger.error(f"fish_hour_data_dow 일일 재계산 실패: {e}")
                 last_recalc_day = now.day
 
             # ── 18:50 영업 준비 브리핑
