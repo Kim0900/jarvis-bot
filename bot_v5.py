@@ -4326,6 +4326,61 @@ async def recalc_fish_hour_data_dow():
     logger.info(f"fish_hour_data_dow 재계산 완료 ({saved}개 슬롯)")
 
 
+async def recalc_fish_week_stats():
+    """task#37: 요일×시간대×주차 원본관측치를 축A(영업일) 기준으로 저장.
+    마기추가1 지시대로 축A로 명시통일 — hour<6인 콜은 전날 영업일로 재배정하고,
+    그 영업일의 요일/ISO주차를 다시 계산(단순 raw_calls.요일=축B와 다름)."""
+    try:
+        raw = await sb_select_calls({}) or []
+    except Exception as e:
+        logger.error(f"fish_week_stats 재계산 - raw_calls 조회 실패: {e}")
+        return
+    if not raw:
+        return
+
+    from collections import defaultdict
+    import datetime as _dt
+    DOW_KR = ['월','화','수','목','금','토','일']
+
+    agg = defaultdict(lambda: {"kakao": 0, "baehoe": 0, "fares": []})
+    for r in raw:
+        d_str, bt, ct = r.get("날짜"), r.get("배차시각"), r.get("콜유형") or ""
+        if not d_str or not bt or ct not in ("카카오T", "배회"):
+            continue
+        try:
+            d = _dt.date.fromisoformat(d_str)
+            h = int(str(bt).split(":")[0])
+        except Exception:
+            continue
+        # 축A 재배정: hour<6이면 전날 영업일 소속(명령서#036 원칙 그대로)
+        biz_date = d - _dt.timedelta(days=1) if h < 6 else d
+        iso = biz_date.isocalendar()
+        week_key = f"{iso[0]}-W{iso[1]:02d}"
+        dow = DOW_KR[biz_date.weekday()]
+        key = (week_key, dow, h)
+        if ct == "카카오T":
+            agg[key]["kakao"] += 1
+        else:
+            agg[key]["baehoe"] += 1
+        fare = r.get("요금")
+        if fare: agg[key]["fares"].append(fare)
+
+    saved = 0
+    for (week_key, dow, h), v in agg.items():
+        total = v["kakao"] + v["baehoe"]
+        avg_fare = round(sum(v["fares"]) / len(v["fares"])) if v["fares"] else None
+        try:
+            await sb_upsert("fish_week_stats", {
+                "week_key": week_key, "요일": dow, "hour": h, "axis": "A",
+                "kakao_calls": v["kakao"], "baehoe_calls": v["baehoe"],
+                "total_calls": total, "avg_fare": avg_fare,
+            }, on_conflict="week_key,요일,hour")
+            saved += 1
+        except Exception as e:
+            logger.error(f"fish_week_stats {week_key}/{dow}/{h}시 저장 오류: {e}")
+    logger.info(f"fish_week_stats 재계산 완료 ({saved}개 슬롯, 축A)")
+
+
 _FISH_HOUR_CACHE = {}
 
 async def load_fish_hour_data():
