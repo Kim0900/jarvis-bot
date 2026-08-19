@@ -373,100 +373,82 @@ class HealthHandler(BaseHTTPRequestHandler):
                 import anthropic as _ant, re as _re, json as _j, base64 as _b64mod
                 b64 = payload.get('image_b64', '')
                 mt  = payload.get('media_type', 'image/jpeg')
-                # 캐스퍼 수정 2026-08-07(6차): 이전 캐스퍼(07-15)가 텔레그램 경로에만 넣어둔
-                # resize_image_if_needed()가 앱이 쓰는 이 엔드포인트엔 빠져있었음 — 재사용.
-                # 참고: Claude 비전은 긴 쪽 약 1568px 이상은 내부적으로 어차피 다운스케일해서
-                # 처리하므로, 여기서 미리 줄여도 "그 이상으로 더 나빠지진" 않음. 다만 이 화면
-                # (일별운행이력, 세로로 긴 목록)은 원래도 정보밀도가 높아서, 리사이즈만으로
-                # 완전히 해결 안 될 수 있음 — 그 경우 화면을 나눠 찍는 게 더 근본적인 해법.
                 try:
                     raw_bytes = _b64mod.b64decode(b64)
                     resized_bytes = resize_image_if_needed(raw_bytes)
-                    b64 = _b64mod.b64encode(resized_bytes).decode('utf-8')
-                    mt = 'image/jpeg'
                 except Exception as _rez_err:
                     logger.warning(f"OCR 이미지 리사이즈 실패, 원본 사용: {_rez_err}")
+                    resized_bytes = _b64mod.b64decode(b64)
+
+                # 대표님요청(2026-08-18): 세로분할 2회호출. 상단(헤더+상반부)/하단(하반부)
+                # 각각 OCR해서 정보밀도를 낮춰 세부동이름 인식률 향상. 비용증가 최소화를
+                # 위해 4분할이 아닌 2분할(10%겹침)로 설계.
+                try:
+                    top_bytes, bottom_bytes = split_image_vertically(resized_bytes)
+                except Exception as _split_err:
+                    logger.error(f"이미지 분할 실패, 단일호출로 폴백: {_split_err}")
+                    top_bytes, bottom_bytes = resized_bytes, None
+
+                top_b64 = _b64mod.b64encode(top_bytes).decode('utf-8')
+                bottom_b64 = _b64mod.b64encode(bottom_bytes).decode('utf-8') if bottom_bytes else None
+                mt = 'image/jpeg'
                 client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
                 _today_str = str(today_kst())
 
-                # 캐스퍼 수정 2026-07-25(4차): "손으로 대조하겠다"는 임시방편 대신,
-                # 카카오T 화면 상단에 항상 표시되는 큰 글씨 합계(건수/금액)를 개별항목 합계와
-                # 코드로 직접 대조하는 자체검증을 추가. 화면 상단 합계는 작은 줄줄이 항목보다
-                # 훨씬 읽기 쉬워서 신뢰도 기준으로 쓸 만함. 불일치 시 상위모델(sonnet)로 1회
-                # 자동 재시도하고, 그래도 안 맞으면 "인식완료"로 속이지 않고 불일치 사실을 그대로
-                # 반환해서 앱이 사용자에게 경고하도록 한다.
-                def _run_ocr_history(model):
-                    # 캐스퍼 수정 2026-07-25(5차, 긴급): Claude Sonnet 5는 temperature 등
-                    # 샘플링 파라미터를 기본값이 아닌 값으로 주면 400 에러를 반환함(적응형 사고
-                    # 방식이라 수동 파라미터 자체를 거부). 재시도 때 sonnet에도 무조건
-                    # temperature=0을 넣고 있어서 재시도가 걸릴 때마다 400으로 끊기고,
-                    # 그 결과 서버가 success:false를 반환 → 앱이 클라이언트 폴백(API키 없음
-                    # 에러)으로 떨어지던 것이 이번 장애의 실제 원인. 모델별로 파라미터를 분리.
-                    # 캐스퍼 긴급수정 2026-08-07: Claude Sonnet 5는 적응형 사고(adaptive thinking)가
-                    # 기본 켜져 있고, 사고에 쓴 토큰도 max_tokens 예산에서 차감됨. 분류 호출
-                    # (max_tokens=20)처럼 예산이 작으면 사고만 하다 끝나서 실제 텍스트가
-                    # 하나도 안 나와 "Expecting value"(빈 문자열 JSON파싱 실패)로 이어짐.
-                    # 구조화 추출은 추론이 필요 없는 작업이라 사고 자체를 꺼서 예산을 답변에 전부 쓰게 한다.
-                    # 캐스퍼 수정 2026-08-08: 유형분류(일별운행이력/결제내역) API 호출이
-                    # 반복적으로 흔들려서(같은 화면이 매번 다르게 분류됨) 주소정보가 통째로
-                    # 빠지는 사고가 계속 재발함. 실사용 기록 전부(오늘까지) 일별운행이력
-                    # 화면만 업로드됐음을 확인 — 분류 호출 자체를 없애고 기본값 고정.
-                    # (결제내역 화면을 실제로 올릴 일이 생기면 이 값을 되돌리거나 수동 선택
-                    # 옵션을 추가해야 함.)
+                def _run_ocr_history(model, image_b64, is_bottom_half=False):
                     is_daily = True
                     extra_kwargs = {"temperature": 0} if model.startswith("claude-haiku") else {"thinking": {"type": "disabled"}}
                     if is_daily:
-                        prompt = (
-                            f'오늘 날짜는 {_today_str}입니다. 이 카카오T 일별운행이력 화면에서 모든 운행 건을 추출해서 JSON만 반환해줘.\n'
-                            '{"type":"daily_history","date":"YYYY-MM-DD","표시건수":숫자,"표시금액":숫자,"calls":['
-                            '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
-                            f'날짜: 화면에 연도가 없으면 오늘({_today_str}) 기준 연도 사용. 상단 YYYY년 M월 D일 있으면 그것 우선. 결제방식: 직접결제 있으면 직접, 없으면 자동.\n'
-                            '⚠️ "표시건수"/"표시금액"은 화면 맨 위에 큰 글씨로 적힌 "OO건", "OOO원" 합계를 그대로 옮겨라(개별항목과 별개로, 화면에 인쇄된 숫자 그대로).\n'
-                            '⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 절대로 지명을 지어내거나 비슷하게 짐작하지 마라. '
-                            '흐리거나 잘려서 확신이 안 서면 "미확인"으로 반환해라. 화면에 보이는 모든 운행 건을 빠짐없이 포함해라(스크롤로 이어지는 항목도 전부).\n'
-                            '⚠️ "요금"은 반드시 숫자만 반환해라("미확인" 같은 텍스트 절대 금지 — JSON 문법이 깨진다). 요금이 흐리거나 안 보이면 0을 반환해라. JSON만 반환.'
-                        )
-                    else:
-                        prompt = (
-                            f'오늘 날짜는 {_today_str}입니다. 이 결제내역 화면에서 모든 결제 건을 추출해서 JSON만 반환해줘.\n'
-                            '{"type":"payment","date":"YYYY-MM-DD","표시건수":숫자,"표시금액":숫자,"items":['
-                            '{"시각":"HH:MM","요금":숫자,"카드":"카드사명"}]}\n'
-                            f'날짜: 조회일/거래일, 연도 없으면 오늘({_today_str}) 기준 연도 사용. 취소건 제외. 숫자만(원제외).\n'
-                            '⚠️ "표시건수"/"표시금액"은 화면 맨 위에 큰 글씨로 적힌 "OO건", "OOO원" 합계를 그대로 옮겨라.\n'
-                            '⚠️ "카드"는 반드시 결제내역 목록 안에 개별 건마다 표시된 카드사/결제수단만 사용해라. '
-                            '화면 맨 위 상태바(통신사명·시간·배터리 등 휴대폰 UI)는 절대 참고하지 마라. '
-                            '개별 건에 카드사 표시가 없으면 빈 문자열("")로 반환해라. 추측하거나 "미상" 같은 임의 텍스트를 채우지 마라. JSON만 반환.'
-                        )
+                        if is_bottom_half:
+                            # 하단조각 전용 프롬프트: 헤더(날짜/합계)가 없을 수 있으므로 요구 안 함
+                            prompt = (
+                                '이 이미지는 카카오T 일별운행이력 화면의 아래쪽 절반(스크롤 하단부)이다. '
+                                '화면 상단(날짜·합계 헤더)은 이 조각에 없을 수 있다 — 없으면 무시하고, '
+                                '이 조각에 보이는 운행 건만 추출해서 JSON만 반환해줘.\n'
+                                '{"type":"daily_history","calls":['
+                                '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
+                                '⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 특히 동 이름 끝의 숫자(1동/2동/3동/4동 등)를 '
+                                '놓치지 말고 반드시 확인해라 — 숫자가 흐려서 안 보이면 지어내지 말고 "OO?동"처럼 표시해라. '
+                                '절대로 지명을 지어내거나 비슷하게 짐작하지 마라. 화면 맨 위/아래가 항목 중간에서 잘렸으면 그 잘린 항목은 건너뛰어라(다른 조각에서 온전히 잡힘).\n'
+                                '⚠️ "요금"은 반드시 숫자만 반환해라. 흐리면 0. JSON만 반환.'
+                            )
+                        else:
+                            prompt = (
+                                f'오늘 날짜는 {_today_str}입니다. 이 이미지는 카카오T 일별운행이력 화면의 위쪽 절반(헤더+상반부)이다. '
+                                '화면이 아래로 더 이어질 수 있으니, 이 조각에 보이는 운행 건까지만 추출해서 JSON만 반환해줘.\n'
+                                '{"type":"daily_history","date":"YYYY-MM-DD","표시건수":숫자,"표시금액":숫자,"calls":['
+                                '{"배차시각":"HH:MM","하차시각":"HH:MM","출발지":"대구 OO구 OO동","도착지":"대구 OO구 OO동","요금":숫자,"결제방식":"자동 또는 직접"}]}\n'
+                                f'날짜: 화면에 연도가 없으면 오늘({_today_str}) 기준 연도 사용. 상단 YYYY년 M월 D일 있으면 그것 우선. 결제방식: 직접결제 있으면 직접, 없으면 자동.\n'
+                                '⚠️ "표시건수"/"표시금액"은 화면 맨 위에 큰 글씨로 적힌 "OO건", "OOO원" 합계를 그대로 옮겨라 — 이 값은 화면 전체(하단 조각 포함) 기준이니 이 조각에 보이는 건수와 달라도 그대로 옮겨라.\n'
+                                '⚠️ 출발지/도착지는 화면에 실제로 인쇄된 글자를 정확히 그대로 옮겨라. 특히 동 이름 끝의 숫자(1동/2동/3동/4동 등)를 '
+                                '놓치지 말고 반드시 확인해라 — 숫자가 흐려서 안 보이면 지어내지 말고 "OO?동"처럼 표시해라. '
+                                '절대로 지명을 지어내거나 비슷하게 짐작하지 마라. 화면 아래쪽이 항목 중간에서 잘렸으면 그 잘린 항목은 건너뛰어라(다른 조각에서 온전히 잡힘).\n'
+                                '⚠️ "요금"은 반드시 숫자만 반환해라. 흐리면 0. JSON만 반환.'
+                            )
                     ocr_msg = client.messages.create(
-                        # 캐스퍼 긴급수정 2026-08-07(2차): thinking 끄니 실제 응답이 나오기
-                        # 시작했는데, 항목 많은 화면(20건 이상)은 2000토큰으로 JSON을 다 못
-                        # 채우고 중간에 잘림(로그 확인: "line 84 column 13"에서 끊김,
-                        # 즉 응답은 정상 진행되다 max_tokens 한도에 걸린 것). 여유있게 상향.
                         model=model, max_tokens=8000, **extra_kwargs,
                         messages=[{"role":"user","content":[
-                            {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
+                            {"type":"image","source":{"type":"base64","media_type":mt,"data":image_b64}},
                             {"type":"text","text":prompt}
                         ]}]
                     )
                     txt = _re.sub(r"```[a-z]*","",_extract_claude_text(ocr_msg).strip()).strip()
-                    # 캐스퍼 수정 2026-08-07(4차, 근본원인 확정): 모델이 숫자 필드(요금/표시금액)에
-                    # 따옴표 없이 "미확인" 등 텍스트를 넣어 JSON 문법이 깨지는 경우 방어적으로 치환.
-                    # (실제 로그로 확인된 패턴: '"요금": 미확인,' → end_turn까지 정상 완료됐지만
-                    # 이 한 줄 때문에 파싱 전체가 실패했었음. 프롬프트 지시를 추가했지만 모델이
-                    # 또 놓칠 경우를 대비한 안전망.)
                     txt = _re.sub(r'("(?:요금|표시금액|표시건수)"\s*:\s*)(?!["\d\-])[^\s,}\]]+', r'\g<1>0', txt)
                     if not txt:
                         raise ValueError(f"모델({model}) 응답에 텍스트가 없음 (stop_reason={getattr(ocr_msg,'stop_reason',None)}) — 사고예산 소진 또는 응답거부 의심")
-                    # 캐스퍼 수정 2026-08-07(3차): max_tokens를 8000으로 올려도 정확히 같은
-                    # 지점(char 1557)에서 실패 — 토큰부족이 아니라 모델이 그 지점에 실제
-                    # JSON 문법오류를 내고 있다는 뜻(전 진단 정정). 다음번엔 추측 안 하고
-                    # 바로 보이도록, 파싱 실패 시 에러지점 앞뒤 원문을 로그에 남긴다.
                     try:
                         return _j.loads(txt)
                     except _j.JSONDecodeError as je:
                         ctx = txt[max(0,je.pos-150):je.pos+150]
                         logger.error(f"OCR JSON 파싱 실패 상세 — stop_reason={getattr(ocr_msg,'stop_reason',None)}, 전체길이={len(txt)}자, 에러지점 앞뒤 300자:\n{ctx}")
                         raise
+
+                def _run_ocr_split(model):
+                    top_result = _run_ocr_history(model, top_b64, is_bottom_half=False)
+                    if bottom_b64:
+                        bottom_result = _run_ocr_history(model, bottom_b64, is_bottom_half=True)
+                        return merge_split_ocr_results(top_result, bottom_result)
+                    return top_result
 
                 def _safe_int(v):
                     if v is None: return None
@@ -509,18 +491,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                     ok = totals_ok and addr_ok
                     return ok, actual_count, actual_sum, header_count, header_total, bad_addr_count
 
-                data = _run_ocr_history("claude-haiku-4-5-20251001")
+                data = _run_ocr_split("claude-haiku-4-5-20251001")
                 verified, a_cnt, a_sum, h_cnt, h_sum, bad_addr = _verify(data)
                 model_used = "claude-haiku-4-5-20251001"
                 if not verified:
                     logger.warning(f"OCR 검증 실패 — haiku 결과 재시도(sonnet): 실제 {a_cnt}건/{a_sum}원 vs 화면표시 {h_cnt}건/{h_sum}원, 무효주소 {bad_addr}건")
-                    data2 = _run_ocr_history("claude-sonnet-5")
+                    data2 = _run_ocr_split("claude-sonnet-5")
                     verified2, a_cnt2, a_sum2, h_cnt2, h_sum2, bad_addr2 = _verify(data2)
-                    # 캐스퍼(전임) 지적 반영 2026-07-25: 기존 `verified2 or (다르면 교체)` 조건은
-                    # sonnet도 검증 실패했는데 haiku랑 결과만 다르면 무조건 교체해버리는 허점이 있었음
-                    # (sonnet이 haiku보다 더 틀렸을 가능성을 못 거름). 재시도했으면 상위모델 결과를
-                    # 항상 채택하되, verified 플래그는 실제 재검증 결과를 정직하게 반영한다
-                    # (재시도 후에도 불일치면 verified=False로 남아 화면에 경고가 그대로 뜬다).
                     data, verified, a_cnt, a_sum, h_cnt, h_sum, bad_addr = data2, verified2, a_cnt2, a_sum2, h_cnt2, h_sum2, bad_addr2
                     model_used = "claude-sonnet-5"
 
@@ -909,6 +886,39 @@ async def claude_vision(image_bytes: bytes, prompt: str, max_tokens: int = 500) 
         return _extract_claude_text(msg).strip()
 
     return await asyncio.to_thread(_sync_call)
+
+
+def split_image_vertically(image_bytes: bytes):
+    """대표님요청(2026-08-18): 세로로 긴 일별운행이력 화면을 상/하단으로 나눠 각각
+    OCR — 정보밀도를 낮춰 세부동이름(침산3동 등) 인식률 향상 목적. 경계선에 걸친
+    항목 유실 방지를 위해 10% 겹치게 자름(상단 0~55%, 하단 45~100%)."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.width, img.height
+    top = img.crop((0, 0, w, int(h * 0.55)))
+    bottom = img.crop((0, int(h * 0.45), w, h))
+
+    def _to_jpeg(im):
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+
+    return _to_jpeg(top), _to_jpeg(bottom)
+
+
+def merge_split_ocr_results(top_data: dict, bottom_data: dict) -> dict:
+    """상/하단 OCR 결과 병합. date/표시건수/표시금액은 상단(헤더 포함) 우선.
+    calls는 (배차시각,요금) 조합으로 중복제거 후 합침 — 10%겹침구간 대응."""
+    merged = dict(top_data)
+    top_calls = top_data.get('calls') or top_data.get('items') or []
+    bottom_calls = bottom_data.get('calls') or bottom_data.get('items') or []
+    seen = set((c.get('배차시각'), c.get('요금')) for c in top_calls)
+    dedup_bottom = [c for c in bottom_calls if (c.get('배차시각'), c.get('요금')) not in seen]
+    key = 'calls' if top_data.get('type') == 'daily_history' else 'items'
+    merged[key] = top_calls + dedup_bottom
+    return merged
 
 
 def resize_image_if_needed(image_bytes: bytes) -> bytes:
