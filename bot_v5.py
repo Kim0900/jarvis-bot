@@ -3843,6 +3843,77 @@ async def mark_scheduler_run(job_name: str, result: str = "OK"):
         logger.error(f"scheduler_status 기록 실패({job_name}): {e}")
 
 
+async def sync_operated_status(days_back: int = 30):
+    """task#38: 최근 N일에 대해 operated_status를 3단계 소스로 자동채움.
+    confirmed(raw_calls존재)/gpx_proxy(raw_calls없음+GPX있음)는 자동확정,
+    둘다없는 날짜만 미확인(pending)으로 남겨 질문 대상이 됨."""
+    today = today_kst()
+    dates = [str(today - timedelta(days=i)) for i in range(1, days_back+1)]
+
+    raw_dates = set()
+    try:
+        rows = await sb_select("raw_calls", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        for r in (rows or []):
+            if r.get("날짜"): raw_dates.add(r["날짜"])
+    except Exception as e:
+        logger.error(f"operated_status 동기화 - raw_calls 조회 실패: {e}")
+
+    gpx_dates = set()
+    try:
+        rows = await sb_select("gpx_sessions", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        for r in (rows or []):
+            if r.get("날짜"): gpx_dates.add(r["날짜"])
+    except Exception as e:
+        logger.error(f"operated_status 동기화 - gpx_sessions 조회 실패: {e}")
+
+    try:
+        existing_rows = await sb_select("operated_status", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        existing = {r["날짜"]: r for r in (existing_rows or [])}
+    except Exception as e:
+        logger.error(f"operated_status 동기화 - 기존행 조회 실패: {e}")
+        existing = {}
+
+    pending = []
+    for d in dates:
+        cur = existing.get(d)
+        if d in raw_dates:
+            if not cur or cur.get("source") != "confirmed":
+                await sb_upsert("operated_status", {"날짜": d, "operated": True, "source": "confirmed"}, on_conflict="날짜")
+        elif d in gpx_dates:
+            if not cur or cur.get("source") != "gpx_proxy":
+                await sb_upsert("operated_status", {"날짜": d, "operated": True, "source": "gpx_proxy"}, on_conflict="날짜")
+        else:
+            # raw_calls도 GPX도 없음 — 이미 질문했으면(asked_at 있음) 재질문 안 함
+            if not cur:
+                await sb_upsert("operated_status", {"날짜": d, "operated": None, "source": None}, on_conflict="날짜")
+                pending.append(d)
+            elif cur.get("source") is None and not cur.get("asked_at"):
+                pending.append(d)
+    return sorted(pending)
+
+
+async def ask_operated_status_telegram():
+    """task#38: 미확인 날짜(질문 안 한 것만) 텔레그램으로 한번에 묶어 질문.
+    이미 질문한 날짜(asked_at 있음)는 재질문 안 함 — 스팸 방지."""
+    pending = await sync_operated_status()
+    if not pending:
+        return []
+    msg = (
+        "❓ 아래 날짜는 운행기록(콜/GPX)이 없어 휴무인지 데이터누락인지 확인이 필요합니다.\n"
+        + "\n".join(f"· {d}" for d in pending)
+        + "\n\n휴무였던 날짜만 답장으로 알려주세요 (예: '8/13 8/15 휴무')."
+    )
+    try:
+        await send_all(msg)
+        now_iso = datetime.now(KST).isoformat()
+        for d in pending:
+            await sb_upsert("operated_status", {"날짜": d, "asked_at": now_iso}, on_conflict="날짜")
+        logger.info(f"operated_status 질문 발송 완료: {pending}")
+    except Exception as e:
+        logger.error(f"operated_status 질문 발송 실패: {e}")
+    return pending
+
+
 async def check_ingestion_gap():
     """task_id=31 긴급대응: OCR→raw_calls 인입 중단을 조기 감지.
     최근 3일 연속 신규 raw_calls가 0건이면 텔레그램 경고 — 08-13~15 사흘간
@@ -4649,6 +4720,14 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"인입중단 감지 실패: {e}")
 
+            # ── task_id=38: 매일 08:00 operated_status 동기화 + 미확인날짜 질문발송
+            if now.hour == 8 and now.day != last_dualverify_day:
+                try:
+                    asked = loop.run_until_complete(ask_operated_status_telegram())
+                    loop.run_until_complete(mark_scheduler_run("ask_operated_status_telegram", f"asked={len(asked)}"))
+                except Exception as e:
+                    logger.error(f"operated_status 질문발송 실패: {e}")
+
             # ── 명령서#028 갭3: 매일 08:00 7일평균 이중검증 (raw_calls 직접집계 vs daily_summary)
             if now.hour == 8 and now.day != last_dualverify_day:
                 try:
@@ -4984,6 +5063,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_single_command(update, context, text: str) -> str | None:
     """단일 명령어 처리. 줄바꿈 다중 명령어 시 각 줄 처리용."""
+
+    # task#38: operated_status 질문에 대한 답변("8/13 8/15 휴무" 형식)
+    if text.strip().endswith("휴무") and any(ch.isdigit() for ch in text):
+        import re as _re_op
+        date_tokens = _re_op.findall(r'(\d{1,2})[/\-](\d{1,2})', text)
+        if date_tokens:
+            year = today_kst().year
+            confirmed_dates = []
+            now_iso = datetime.now(KST).isoformat()
+            for mo, da in date_tokens:
+                try:
+                    d = f"{year}-{int(mo):02d}-{int(da):02d}"
+                    await sb_upsert("operated_status", {
+                        "날짜": d, "operated": False, "source": "user_confirmed", "answered_at": now_iso
+                    }, on_conflict="날짜")
+                    confirmed_dates.append(d)
+                except Exception as e:
+                    logger.error(f"휴무답변 처리 실패({mo}/{da}): {e}")
+            if confirmed_dates:
+                return "✅ 휴무 확인 등록: " + ", ".join(confirmed_dates)
 
     # 결제삭제
     if text.startswith("결제삭제 "):
