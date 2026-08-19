@@ -3914,6 +3914,153 @@ async def ask_operated_status_telegram():
     return pending
 
 
+# ──────────────────────────────────────────────
+# task#40 문제2 (2026-08-20): Haiku 기반 태스크 오케스트레이션.
+# 마기 최종확정: APScheduler잡(폴링)+Haiku+OCR(Sonnet)과 완전분리+캐스퍼&SIMPLE만.
+# tool 화이트리스트 4개뿐 — 파괴적작업(DELETE/UPDATE, GitHub커밋, Drive쓰기)은
+# 이번 1단계에서 API경로로 완전히 배제. 완료해도 자동승인 없음(evidence PENDING).
+# ──────────────────────────────────────────────
+_ORCH_TOOLS = [
+    {
+        "name": "query_supabase",
+        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. INSERT/UPDATE/DELETE는 거부된다.",
+        "input_schema": {"type": "object", "properties": {
+            "sql": {"type": "string", "description": "SELECT로 시작하는 SQL문"}
+        }, "required": ["sql"]},
+    },
+    {
+        "name": "record_event",
+        "description": "이 태스크의 magi_task_events에 진행상황을 기록한다. 의미있는 단계마다 즉시 호출할 것.",
+        "input_schema": {"type": "object", "properties": {
+            "detail": {"type": "string", "description": "무엇을 확인/발견했는지 구체적으로"}
+        }, "required": ["detail"]},
+    },
+    {
+        "name": "write_correction_log",
+        "description": "correction_log에 정정/발견 사항을 기록한다.",
+        "input_schema": {"type": "object", "properties": {
+            "table_name": {"type": "string"}, "reason": {"type": "string"}
+        }, "required": ["table_name", "reason"]},
+    },
+    {
+        "name": "finish_task",
+        "description": "작업을 완료로 선언한다. 이 태스크에서 최종적으로 한 번만 호출.",
+        "input_schema": {"type": "object", "properties": {
+            "summary": {"type": "string", "description": "무엇을 확인/완료했는지 정직한 요약"}
+        }, "required": ["summary"]},
+    },
+]
+
+_ORCH_SYSTEM_PROMPT = (
+    "당신은 캐스퍼(MAGI 시스템의 코드/DB 담당 에이전트)의 자동실행 모드입니다. "
+    "핵심원칙: ①모르는 건 지어내지 않는다 ②확인 안 된 것을 확인됐다고 말하지 않는다 "
+    "③이 세션에서는 조회(query_supabase)와 기록(record_event, write_correction_log)만 "
+    "가능하며 데이터 수정(UPDATE/DELETE/INSERT)이나 코드 배포는 절대 할 수 없다 — "
+    "그런 조치가 필요하면 finish_task에 '사람 세션 필요'라고 명시하고 종료한다. "
+    "④의미있는 확인을 할 때마다 즉시 record_event를 호출한다(끝에 몰아서 하지 않는다). "
+    "⑤작업이 끝나면 반드시 finish_task를 호출해서 마친다."
+)
+
+async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
+    if name == "query_supabase":
+        sql = (tool_input.get("sql") or "").strip()
+        if not sql.lower().startswith("select"):
+            return "거부: SELECT 쿼리만 허용됩니다."
+        try:
+            result = await sb_h("POST", "rpc/exec_readonly_sql", json={"query": sql})
+            return json.dumps(result, ensure_ascii=False, default=str)[:4000]
+        except Exception as e:
+            return f"쿼리 실패: {e}"
+    elif name == "record_event":
+        await sb_insert("magi_task_events", {
+            "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "캐스퍼(Haiku자동)",
+            "detail": tool_input.get("detail", "")
+        })
+        return "기록 완료"
+    elif name == "write_correction_log":
+        await sb_insert("correction_log", {
+            "table_name": tool_input.get("table_name", ""), "field_changed": "자동오케스트레이션발견",
+            "old_value": "", "new_value": "", "changed_by": "캐스퍼(Haiku자동)",
+            "reason": tool_input.get("reason", "")
+        })
+        return "기록 완료"
+    elif name == "finish_task":
+        return "__FINISH__" + (tool_input.get("summary") or "")
+    return "알 수 없는 tool"
+
+
+async def run_haiku_orchestration_once():
+    """task#40: ASSIGNED+캐스퍼+SIMPLE 태스크 1건을 찾아 Haiku로 처리 시도.
+    최대 10회 tool호출 제한(무한루프방지). 완료시 evidence_registry에 PENDING
+    등록(자동승인 없음), 매 tool호출마다 record_event로 즉시기록(중단복구용)."""
+    try:
+        rows = await sb_select("magi_tasks", {
+            "status": "eq.ASSIGNED", "owner_agent": "eq.캐스퍼", "task_type": "eq.SIMPLE",
+            "order": "created_at.asc", "limit": "1"
+        })
+    except Exception as e:
+        logger.error(f"Haiku오케스트레이션 - magi_tasks 조회 실패: {e}")
+        return None
+    if not rows:
+        return None
+    task = rows[0]
+    task_id = task["task_id"]
+
+    if not ANTHROPIC_API_KEY:
+        logger.error("Haiku오케스트레이션 - ANTHROPIC_API_KEY 없음")
+        return None
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+    messages = [{"role": "user", "content": (
+        f"태스크#{task_id}: {task.get('title','')}\n"
+        f"문제: {task.get('problem','') or '(없음)'}\n"
+        f"목표: {task.get('target','') or '(없음)'}"
+    )}]
+
+    await sb_insert("magi_task_events", {
+        "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "캐스퍼(Haiku자동)",
+        "detail": "Haiku 자동오케스트레이션 착수"
+    })
+
+    final_summary = None
+    for turn in range(10):
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=2000,
+                system=_ORCH_SYSTEM_PROMPT, tools=_ORCH_TOOLS, messages=messages,
+            )
+        except Exception as e:
+            logger.error(f"Haiku오케스트레이션 API 호출 실패(turn {turn}): {e}")
+            break
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:
+            break
+        tool_results = []
+        finished = False
+        for tu in tool_uses:
+            result_text = await _orch_execute_tool(tu.name, tu.input, task_id)
+            if result_text.startswith("__FINISH__"):
+                final_summary = result_text[len("__FINISH__"):]
+                finished = True
+                result_text = "작업 종료 처리됨"
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result_text})
+        messages.append({"role": "user", "content": tool_results})
+        if finished:
+            break
+
+    if final_summary is not None:
+        await sb_upsert("magi_tasks", {"task_id": task_id, "status": "VERIFICATION", "updated_at": datetime.now(KST).isoformat()}, on_conflict="task_id")
+        await sb_insert("evidence_registry", {
+            "task_id": task_id, "evidence_type": "AGENT_RESULT", "document_type": "AUTO_ORCHESTRATION_RESULT",
+            "agent": "캐스퍼(Haiku자동)", "verification_status": "PENDING",
+            "summary": final_summary, "created_by": "캐스퍼(Haiku자동)"
+        })
+        logger.info(f"Haiku오케스트레이션 완료(task#{task_id}): {final_summary[:100]}")
+    else:
+        logger.warning(f"Haiku오케스트레이션 미완료(task#{task_id}) — 다음 폴링에서 재시도(진행상황은 이벤트로 남음)")
+    return task_id
+
+
 async def check_ingestion_gap():
     """task_id=31 긴급대응: OCR→raw_calls 인입 중단을 조기 감지.
     최근 3일 연속 신규 raw_calls가 0건이면 텔레그램 경고 — 08-13~15 사흘간
@@ -4326,61 +4473,6 @@ async def recalc_fish_hour_data_dow():
     logger.info(f"fish_hour_data_dow 재계산 완료 ({saved}개 슬롯)")
 
 
-async def recalc_fish_week_stats():
-    """task#37: 요일×시간대×주차 원본관측치를 축A(영업일) 기준으로 저장.
-    마기추가1 지시대로 축A로 명시통일 — hour<6인 콜은 전날 영업일로 재배정하고,
-    그 영업일의 요일/ISO주차를 다시 계산(단순 raw_calls.요일=축B와 다름)."""
-    try:
-        raw = await sb_select_calls({}) or []
-    except Exception as e:
-        logger.error(f"fish_week_stats 재계산 - raw_calls 조회 실패: {e}")
-        return
-    if not raw:
-        return
-
-    from collections import defaultdict
-    import datetime as _dt
-    DOW_KR = ['월','화','수','목','금','토','일']
-
-    agg = defaultdict(lambda: {"kakao": 0, "baehoe": 0, "fares": []})
-    for r in raw:
-        d_str, bt, ct = r.get("날짜"), r.get("배차시각"), r.get("콜유형") or ""
-        if not d_str or not bt or ct not in ("카카오T", "배회"):
-            continue
-        try:
-            d = _dt.date.fromisoformat(d_str)
-            h = int(str(bt).split(":")[0])
-        except Exception:
-            continue
-        # 축A 재배정: hour<6이면 전날 영업일 소속(명령서#036 원칙 그대로)
-        biz_date = d - _dt.timedelta(days=1) if h < 6 else d
-        iso = biz_date.isocalendar()
-        week_key = f"{iso[0]}-W{iso[1]:02d}"
-        dow = DOW_KR[biz_date.weekday()]
-        key = (week_key, dow, h)
-        if ct == "카카오T":
-            agg[key]["kakao"] += 1
-        else:
-            agg[key]["baehoe"] += 1
-        fare = r.get("요금")
-        if fare: agg[key]["fares"].append(fare)
-
-    saved = 0
-    for (week_key, dow, h), v in agg.items():
-        total = v["kakao"] + v["baehoe"]
-        avg_fare = round(sum(v["fares"]) / len(v["fares"])) if v["fares"] else None
-        try:
-            await sb_upsert("fish_week_stats", {
-                "week_key": week_key, "요일": dow, "hour": h, "axis": "A",
-                "kakao_calls": v["kakao"], "baehoe_calls": v["baehoe"],
-                "total_calls": total, "avg_fare": avg_fare,
-            }, on_conflict="week_key,요일,hour")
-            saved += 1
-        except Exception as e:
-            logger.error(f"fish_week_stats {week_key}/{dow}/{h}시 저장 오류: {e}")
-    logger.info(f"fish_week_stats 재계산 완료 ({saved}개 슬롯, 축A)")
-
-
 _FISH_HOUR_CACHE = {}
 
 async def load_fish_hour_data():
@@ -4734,6 +4826,7 @@ def fish_scheduler(app):
     last_recalc_day = -1
     last_dualverify_day = -1
     last_kpi7day = -1
+    last_orch_run_ts = 0.0
 
     # 최초 기동 시 1회 즉시 재계산 (테이블이 비어있으면 폴백값으로 작동하다가 여기서 채워짐)
     try:
@@ -4744,6 +4837,15 @@ def fish_scheduler(app):
     while True:
         try:
             now = datetime.now(KST)
+
+            # ── task#40 문제2: 5분마다 Haiku 오케스트레이션(ASSIGNED+캐스퍼+SIMPLE)
+            if time.time() - last_orch_run_ts >= 300:
+                last_orch_run_ts = time.time()
+                try:
+                    tid = loop.run_until_complete(run_haiku_orchestration_once())
+                    loop.run_until_complete(mark_scheduler_run("run_haiku_orchestration_once", f"task_id={tid}" if tid else "no_task"))
+                except Exception as e:
+                    logger.error(f"Haiku오케스트레이션 실행 실패: {e}")
 
             # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산 + daily_summary 자동갱신
             if now.hour == 4 and now.day != last_kpi7day:
