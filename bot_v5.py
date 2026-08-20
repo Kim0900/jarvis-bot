@@ -4260,10 +4260,46 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     except Exception as e:
         logger.error(f"공차시간(근사) 계산 실패 {calc_date}: {e}")
 
+    # task#42: 패턴지표 3종(경산루프/연속콜/배회) — 마기 지시(2026-08-20).
+    # 경산루프: 명령서#015 정의 그대로(요금≥15,000원 + 출발지/도착지에 "경산" 포함).
+    # 배회: 콜유형='배회'(valid_rows엔 카카오T만 있어 biz_rows에서 별도 집계).
+    # 연속콜: 명시적 임계값 정의문서를 못 찾아 "하차~다음배차 10분이내"로 가정
+    # (기존 공차분석 인프라와 일관된 값) — unclassified_note에 가정임을 명시.
+    gyeongsan_loop_count = sum(
+        1 for r in valid_rows
+        if (r.get("요금") or 0) >= 15000
+        and ("경산" in str(r.get("출발지") or "") or "경산" in str(r.get("도착지") or ""))
+    )
+    baehoe_count = sum(1 for r in biz_rows if r.get("콜유형") == "배회")
+
+    def _to_min(t):
+        if not t: return None
+        try:
+            hh, mm = str(t).split(":")[:2]
+            hh, mm = int(hh), int(mm)
+            return ((hh - 18) % 24) * 60 + mm
+        except Exception:
+            return None
+
+    sorted_by_dispatch = sorted(
+        (r for r in valid_rows if r.get("배차시각")),
+        key=lambda r: _to_min(r.get("배차시각")) or 0
+    )
+    CONSECUTIVE_THRESHOLD_MIN = 10  # 가정치, 명시적 정의 없어 공차분석과 일관된 값 채택
+    consecutive_call_count = 0
+    for i in range(1, len(sorted_by_dispatch)):
+        prev_drop = _to_min(sorted_by_dispatch[i-1].get("하차시각"))
+        cur_dispatch = _to_min(sorted_by_dispatch[i].get("배차시각"))
+        if prev_drop is not None and cur_dispatch is not None:
+            gap = cur_dispatch - prev_drop
+            if 0 <= gap <= CONSECUTIVE_THRESHOLD_MIN:
+                consecutive_call_count += 1
+
     if unclassified:
         unclassified_note_parts.append("(근거: GPX원본포인트 미보존으로 공차시간은 거리비율 기반 근사치)")
     elif total_idle_min is not None:
         unclassified_note_parts.append("공차시간은 GPX원본포인트 미보존으로 거리비율 기반 근사치")
+    unclassified_note_parts.append(f"연속콜 판정기준: 하차~다음배차 {CONSECUTIVE_THRESHOLD_MIN}분이내(가정치, 명시적 정의문서 없음)")
 
     snapshot = {
         "calc_date": calc_date,
@@ -4278,9 +4314,12 @@ async def calc_daily_snapshot(calc_date_str: str = None):
         "total_idle_min": total_idle_min,
         "unclassified_flag": unclassified,
         "unclassified_note": " | ".join(unclassified_note_parts) if unclassified_note_parts else None,
+        "gyeongsan_loop_count": gyeongsan_loop_count,
+        "consecutive_call_count": consecutive_call_count,
+        "baehoe_count": baehoe_count,
     }
     result = await sb_upsert("daily_calc_snapshot", snapshot, on_conflict="calc_date,axis")
-    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분")
+    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}")
     return result
 
 
