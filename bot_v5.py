@@ -4049,7 +4049,7 @@ async def run_haiku_orchestration_once():
             break
 
     if final_summary is not None:
-        await sb_upsert("magi_tasks", {"task_id": task_id, "status": "VERIFICATION", "updated_at": datetime.now(KST).isoformat()}, on_conflict="task_id")
+        await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}", json={"status": "VERIFICATION", "updated_at": datetime.now(KST).isoformat()}, headers={**HEADERS_SB, "Prefer": "return=minimal"})
         await sb_insert("evidence_registry", {
             "task_id": task_id, "evidence_type": "AGENT_RESULT", "document_type": "AUTO_ORCHESTRATION_RESULT",
             "agent": "캐스퍼(Haiku자동)", "verification_status": "PENDING",
