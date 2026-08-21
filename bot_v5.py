@@ -5489,6 +5489,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_receipt_delete(update, text)
         return
 
+    # task#27: 주간브리핑(단일줄 경로) — 캐스퍼 수정 2026-08-21: 어제 이 코드를
+    # _process_single_command에만 넣었는데, 그 함수는 "여러 줄 동시입력"일 때만
+    # 호출되는 경로라 "주간브리핑" 한 줄 입력시엔 전혀 도달 못 하던 배치실수 수정.
+    if text.strip() in ("주간브리핑", "/주간브리핑", "weekly"):
+        try:
+            result = await build_weekly_briefing()
+            await update.message.reply_text(result)
+        except Exception as e:
+            logger.error(f"주간브리핑 조립 실패: {e}")
+            await update.message.reply_text(f"주간브리핑 생성 실패: {e}")
+        return
+
     # 대조 확정 (배회후보 raw_calls 추가)
     if text.startswith("대조 확정 "):
         _ds = text[6:].strip()
