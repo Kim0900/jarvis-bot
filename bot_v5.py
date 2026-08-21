@@ -4996,7 +4996,13 @@ def fish_scheduler(app):
                     logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
                     loop.run_until_complete(mark_scheduler_run("recalc_7day_average", f"FAIL: {e}"))
                 try:
-                    loop.run_until_complete(calc_daily_snapshot())
+                    # task#46: 하루치("어제")만 계산하면 사후에 소급업로드(GAS등)된
+                    # 데이터가 있어도 그 과거 스냅샷은 영영 안 갱신되는 문제 확인
+                    # (8/14,15가 실제로 계산은 됐으나 그 시점 raw_calls가 비어있어
+                    # 0건으로 굳어있던 것). 최근 3일을 매번 재계산해서 자동보정.
+                    for _back in range(3):
+                        _d = str(today_kst() - timedelta(days=1 + _back))
+                        loop.run_until_complete(calc_daily_snapshot(_d))
                     loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot"))
                 except Exception as e:
                     logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
