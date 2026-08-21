@@ -4061,6 +4061,91 @@ async def run_haiku_orchestration_once():
     return task_id
 
 
+async def build_weekly_briefing():
+    """task#27: ARG-CMD-20260820-02(아르고스) 필드매핑 그대로 구현.
+    계산 로직 재구현 금지 원칙 — daily_calc_snapshot/kpi_7day_snapshot이
+    이미 계산해둔 값만 형식에 맞게 "조립"만 한다. 축A(영업일) 기준."""
+    today = today_kst()
+    week_start = str(today - timedelta(days=6))
+    week_end = str(today)
+    last_week_end = str(today - timedelta(days=7))
+
+    kpi_rows = await sb_select("kpi_7day_snapshot", {"order": "calc_date.desc", "limit": "10"}) or []
+    this_week = next((r for r in kpi_rows if r["calc_date"] == week_end), None)
+    last_week = next((r for r in kpi_rows if r["calc_date"] == last_week_end), None)
+
+    dcs_rows = await sb_select("daily_calc_snapshot", {
+        "axis": "eq.A", "calc_date": [f"gte.{week_start}", f"lte.{week_end}"], "order": "calc_date.asc"
+    }) or []
+
+    lines = ["📅 주간 브리핑 (축A 영업일 기준)", f"기간: {week_start} ~ {week_end}", ""]
+
+    # ① 주간실적
+    weighted_fare_sum = sum((r.get("avg_fare") or 0) * (r.get("call_count") or 0) for r in dcs_rows)
+    calls_with_fare = sum(r.get("call_count") or 0 for r in dcs_rows if r.get("avg_fare"))
+    avg_fare_week = round(weighted_fare_sum / calls_with_fare) if calls_with_fare else None
+    revenue_est = round(weighted_fare_sum)
+    lines += [
+        "① 주간실적",
+        f"  총 콜수: {this_week['total_count'] if this_week else '미집계'}건",
+        f"  일평균: {this_week['daily_average'] if this_week else '미집계'}건",
+        f"  건당 평균요금: {fmt(avg_fare_week)+'원' if avg_fare_week else '데이터부족'}",
+        f"  매출 추정: {fmt(revenue_est)}원", "",
+    ]
+
+    # ② 전주비교
+    if this_week and last_week:
+        diff_cnt = this_week["total_count"] - last_week["total_count"]
+        diff_avg = round(float(this_week["daily_average"]) - float(last_week["daily_average"]), 2)
+        pct = round(diff_cnt / last_week["total_count"] * 100, 1) if last_week["total_count"] else None
+        lines += ["② 전주비교",
+            f"  콜수 증감: {'+' if diff_cnt>=0 else ''}{diff_cnt}건" + (f" ({'+' if pct>=0 else ''}{pct}%)" if pct is not None else ""),
+            f"  일평균 증감: {'+' if diff_avg>=0 else ''}{diff_avg}건", ""]
+    else:
+        lines += ["② 전주비교", "  지난주 데이터 없음(비교불가)", ""]
+
+    # ③ 요일별 실적
+    DOW_KR = ['월','화','수','목','금','토','일']
+    lines.append("③ 요일별 실적(영업일/축A 기준)")
+    for r in dcs_rows:
+        d = datetime.strptime(r["calc_date"], "%Y-%m-%d").date()
+        dow = DOW_KR[d.weekday()]
+        cc = r.get("call_count") or 0
+        af = r.get("avg_fare")
+        lines.append(f"  {r['calc_date']}({dow}): {cc}건" + (f", 평균{fmt(af)}원" if af else ""))
+    lines.append("")
+
+    # ④ 시간대 효율
+    hourly_sum = {}
+    for r in dcs_rows:
+        for h, c in (r.get("hourly_counts") or {}).items():
+            hourly_sum[h] = hourly_sum.get(h, 0) + c
+    if hourly_sum:
+        peak_h, peak_c = max(hourly_sum.items(), key=lambda x: x[1])
+        lines += ["④ 시간대 효율", f"  피크: {peak_h}시대 ({peak_c}건, 7일합산)", ""]
+    else:
+        lines += ["④ 시간대 효율", "  데이터부족", ""]
+
+    # ⑤ 패턴 업데이트 (ARG-CMD-20260820-02)
+    gyeongsan_sum = sum(r.get("gyeongsan_loop_count") or 0 for r in dcs_rows)
+    baehoe_sum = sum(r.get("baehoe_count") or 0 for r in dcs_rows)
+    consecutive_sum = sum(r.get("consecutive_call_count") or 0 for r in dcs_rows)
+    lines += ["⑤ 패턴 업데이트",
+        f"  경산루프: {gyeongsan_sum}건", f"  배회: {baehoe_sum}건",
+        f"  연속콜: {consecutive_sum}건(하차~다음배차 10분이내 기준)", ""]
+
+    # ⑧ 미업로드 알림
+    expected_dates = {str(today - timedelta(days=i)) for i in range(7)}
+    covered_dates = {r["calc_date"] for r in dcs_rows}
+    missing = sorted(expected_dates - covered_dates)
+    if missing:
+        lines += ["⑧ 미업로드 알림", "  미집계: " + ", ".join(missing)]
+    else:
+        lines += ["⑧ 미업로드 알림", "  전체 집계 완료"]
+
+    return "\n".join(lines)
+
+
 async def check_ingestion_gap():
     """task_id=31 긴급대응: OCR→raw_calls 인입 중단을 조기 감지.
     최근 3일 연속 신규 raw_calls가 0건이면 텔레그램 경고 — 08-13~15 사흘간
@@ -5269,6 +5354,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_single_command(update, context, text: str) -> str | None:
     """단일 명령어 처리. 줄바꿈 다중 명령어 시 각 줄 처리용."""
+
+    # task#27: 주간브리핑 조립(ARG-CMD-20260820-02)
+    if text.strip() in ("주간브리핑", "/주간브리핑", "weekly"):
+        try:
+            return await build_weekly_briefing()
+        except Exception as e:
+            logger.error(f"주간브리핑 조립 실패: {e}")
+            return f"주간브리핑 생성 실패: {e}"
 
     # task#38: operated_status 질문에 대한 답변("8/13 8/15 휴무" 형식)
     if text.strip().endswith("휴무") and any(ch.isdigit() for ch in text):
