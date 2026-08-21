@@ -4205,7 +4205,17 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     unclassified_note_parts = []
     valid_rows = []
     for r in biz_rows:
-        if r.get("콜유형") == "합계":
+        # 캐스퍼 긴급수정 2026-08-20: 기존엔 콜유형='합계'만 요약행으로 판정해서,
+        # id1384(콜유형='카카오T'인데 data_source='app_ocr_summary'인 요약행,
+        # 230,900원/25건 OCR합계)가 개별콜처럼 avg_fare 계산에 섞여들어갈 뻔했던
+        # 버그 발견·수정. exclude_summary_rows()/_is_receipt_summary_row()와
+        # 동일한 기준(data_source 우선판정)으로 통일.
+        is_summary = (
+            r.get("data_source") == "app_ocr_summary"
+            or str(r.get("비고") or "").startswith("OCR 추출:")
+            or r.get("콜유형") == "합계"
+        )
+        if is_summary:
             unclassified = True
             unclassified_note_parts.append(f"{r.get('날짜')}(id={r.get('id')})")
             continue
