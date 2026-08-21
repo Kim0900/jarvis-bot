@@ -4063,41 +4063,55 @@ async def run_haiku_orchestration_once():
 
 async def build_weekly_briefing():
     """task#27: ARG-CMD-20260820-02(아르고스) 필드매핑 그대로 구현.
-    계산 로직 재구현 금지 원칙 — daily_calc_snapshot/kpi_7day_snapshot이
-    이미 계산해둔 값만 형식에 맞게 "조립"만 한다. 축A(영업일) 기준."""
+    계산 로직 재구현 금지 원칙 — daily_calc_snapshot이 이미 계산해둔 값만
+    형식에 맞게 "조립"만 한다. 축A(영업일) 기준으로 전체 통일(대표님 지시,
+    2026-08-21) — 기존 ①②는 kpi_7day_snapshot(축B)을 썼으나 ③④⑤⑧과
+    기준이 달라 "총콜수3건"vs"요일별 전부0건" 같은 모순된 표시가 났던
+    문제를 해소."""
     today = today_kst()
     week_start = str(today - timedelta(days=6))
     week_end = str(today)
+    last_week_start = str(today - timedelta(days=13))
     last_week_end = str(today - timedelta(days=7))
-
-    kpi_rows = await sb_select("kpi_7day_snapshot", {"order": "calc_date.desc", "limit": "10"}) or []
-    this_week = next((r for r in kpi_rows if r["calc_date"] == week_end), None)
-    last_week = next((r for r in kpi_rows if r["calc_date"] == last_week_end), None)
 
     dcs_rows = await sb_select("daily_calc_snapshot", {
         "axis": "eq.A", "calc_date": [f"gte.{week_start}", f"lte.{week_end}"], "order": "calc_date.asc"
     }) or []
+    last_week_rows = await sb_select("daily_calc_snapshot", {
+        "axis": "eq.A", "calc_date": [f"gte.{last_week_start}", f"lte.{last_week_end}"]
+    }) or []
 
     lines = ["📅 주간 브리핑 (축A 영업일 기준)", f"기간: {week_start} ~ {week_end}", ""]
 
-    # ① 주간실적
+    # ① 주간실적 (축A로 통일: daily_calc_snapshot 7일 합산)
+    total_calls = sum(r.get("call_count") or 0 for r in dcs_rows)
+    daily_avg = round(total_calls / 7, 2)
     weighted_fare_sum = sum((r.get("avg_fare") or 0) * (r.get("call_count") or 0) for r in dcs_rows)
     calls_with_fare = sum(r.get("call_count") or 0 for r in dcs_rows if r.get("avg_fare"))
     avg_fare_week = round(weighted_fare_sum / calls_with_fare) if calls_with_fare else None
-    revenue_est = round(weighted_fare_sum)
+    confirmed_revenue = round(weighted_fare_sum)
+    # 매출추정 로직수정(대표님지시 2026-08-21): 미분류(요약행) 매출은 개별콜이
+    # 아니라 avg_fare/call_count 계산엔 안 섞이지만, 실제 매출 자체는 있었으므로
+    # "확정매출+미분류매출"을 분리 표시 — 8/16처럼 실매출이 통째로 안 보이던
+    # 문제(task#46에서 발견) 해결.
+    unclassified_revenue = sum(r.get("unclassified_amount") or 0 for r in dcs_rows)
+    revenue_total = confirmed_revenue + unclassified_revenue
     lines += [
         "① 주간실적",
-        f"  총 콜수: {this_week['total_count'] if this_week else '미집계'}건",
-        f"  일평균: {this_week['daily_average'] if this_week else '미집계'}건",
+        f"  총 콜수: {total_calls}건(확정)",
+        f"  일평균: {daily_avg}건",
         f"  건당 평균요금: {fmt(avg_fare_week) if avg_fare_week else '데이터부족'}",
-        f"  매출 추정: {fmt(revenue_est)}", "",
+        f"  매출 추정: {fmt(revenue_total)}" + (f" (확정 {fmt(confirmed_revenue)} + 미분류 {fmt(round(unclassified_revenue))})" if unclassified_revenue else ""),
+        "",
     ]
 
-    # ② 전주비교
-    if this_week and last_week:
-        diff_cnt = this_week["total_count"] - last_week["total_count"]
-        diff_avg = round(float(this_week["daily_average"]) - float(last_week["daily_average"]), 2)
-        pct = round(diff_cnt / last_week["total_count"] * 100, 1) if last_week["total_count"] else None
+    # ② 전주비교 (축A로 통일)
+    last_week_calls = sum(r.get("call_count") or 0 for r in last_week_rows)
+    if last_week_rows:
+        last_week_avg = round(last_week_calls / 7, 2)
+        diff_cnt = total_calls - last_week_calls
+        diff_avg = round(daily_avg - last_week_avg, 2)
+        pct = round(diff_cnt / last_week_calls * 100, 1) if last_week_calls else None
         lines += ["② 전주비교",
             f"  콜수 증감: {'+' if diff_cnt>=0 else ''}{diff_cnt}건" + (f" ({'+' if pct>=0 else ''}{pct}%)" if pct is not None else ""),
             f"  일평균 증감: {'+' if diff_avg>=0 else ''}{diff_avg}건", ""]
@@ -4294,6 +4308,7 @@ async def calc_daily_snapshot(calc_date_str: str = None):
 
     unclassified = False
     unclassified_note_parts = []
+    unclassified_amount = 0
     valid_rows = []
     for r in biz_rows:
         # 캐스퍼 긴급수정 2026-08-20: 기존엔 콜유형='합계'만 요약행으로 판정해서,
@@ -4309,6 +4324,9 @@ async def calc_daily_snapshot(calc_date_str: str = None):
         if is_summary:
             unclassified = True
             unclassified_note_parts.append(f"{r.get('날짜')}(id={r.get('id')})")
+            # 대표님지시(task#27 재작업, 2026-08-21): 요약행 금액도 매출추정에
+            # 반영할 수 있도록 unclassified_amount로 별도 합산·저장.
+            unclassified_amount += (r.get("요금") or 0)
             continue
         if r.get("콜유형") != "카카오T":
             continue
@@ -4418,6 +4436,7 @@ async def calc_daily_snapshot(calc_date_str: str = None):
         "gyeongsan_loop_count": gyeongsan_loop_count,
         "consecutive_call_count": consecutive_call_count,
         "baehoe_count": baehoe_count,
+        "unclassified_amount": unclassified_amount if unclassified_amount else None,
     }
     result = await sb_upsert("daily_calc_snapshot", snapshot, on_conflict="calc_date,axis")
     logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}")
