@@ -4089,8 +4089,8 @@ async def build_weekly_briefing():
         "① 주간실적",
         f"  총 콜수: {this_week['total_count'] if this_week else '미집계'}건",
         f"  일평균: {this_week['daily_average'] if this_week else '미집계'}건",
-        f"  건당 평균요금: {fmt(avg_fare_week)+'원' if avg_fare_week else '데이터부족'}",
-        f"  매출 추정: {fmt(revenue_est)}원", "",
+        f"  건당 평균요금: {fmt(avg_fare_week) if avg_fare_week else '데이터부족'}",
+        f"  매출 추정: {fmt(revenue_est)}", "",
     ]
 
     # ② 전주비교
