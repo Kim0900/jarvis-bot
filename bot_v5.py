@@ -4134,14 +4134,20 @@ async def build_weekly_briefing():
         f"  경산루프: {gyeongsan_sum}건", f"  배회: {baehoe_sum}건",
         f"  연속콜: {consecutive_sum}건(하차~다음배차 10분이내 기준)", ""]
 
-    # ⑧ 미업로드 알림
+    # ⑧ 미업로드 알림 (task#46: unclassified 날짜도 별도 경고 — 8/16처럼 행은
+    # 있지만 요약행만 있어 실제매출이 call_count=0으로 가려지던 사례 노출)
     expected_dates = {str(today - timedelta(days=i)) for i in range(7)}
     covered_dates = {r["calc_date"] for r in dcs_rows}
     missing = sorted(expected_dates - covered_dates)
+    unclassified_dates = sorted(r["calc_date"] for r in dcs_rows if r.get("unclassified_flag"))
+    section8 = ["⑧ 미업로드 알림"]
     if missing:
-        lines += ["⑧ 미업로드 알림", "  미집계: " + ", ".join(missing)]
-    else:
-        lines += ["⑧ 미업로드 알림", "  전체 집계 완료"]
+        section8.append("  미집계: " + ", ".join(missing))
+    if unclassified_dates:
+        section8.append("  ⚠️ 미분류매출 있음(개별콜 미확정): " + ", ".join(unclassified_dates))
+    if not missing and not unclassified_dates:
+        section8.append("  전체 집계 완료")
+    lines += section8
 
     return "\n".join(lines)
 
@@ -4996,13 +5002,7 @@ def fish_scheduler(app):
                     logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
                     loop.run_until_complete(mark_scheduler_run("recalc_7day_average", f"FAIL: {e}"))
                 try:
-                    # task#46: 하루치("어제")만 계산하면 사후에 소급업로드(GAS등)된
-                    # 데이터가 있어도 그 과거 스냅샷은 영영 안 갱신되는 문제 확인
-                    # (8/14,15가 실제로 계산은 됐으나 그 시점 raw_calls가 비어있어
-                    # 0건으로 굳어있던 것). 최근 3일을 매번 재계산해서 자동보정.
-                    for _back in range(3):
-                        _d = str(today_kst() - timedelta(days=1 + _back))
-                        loop.run_until_complete(calc_daily_snapshot(_d))
+                    loop.run_until_complete(calc_daily_snapshot())
                     loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot"))
                 except Exception as e:
                     logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
