@@ -4700,15 +4700,18 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         kakao_avg = float(hd_dow.get("kakao_avg") or 0)
         baehoe_avg = float(hd_dow.get("baehoe_avg") or 0)
         sample_days = hd_dow.get("sample_days") or 0
-        fare_kakao = hd_dow.get("avg_fare_kakao") or 9000
-        fare_baehoe = hd_dow.get("avg_fare_baehoe") or 10500
+        # 대표님 지적(2026-08-22): "예상0.0건"인데 단가가 표시되던 문제 —
+        # 실측 없으면 폴백값(9000/10500원)을 마치 실측인 것처럼 보여주고 있었음.
+        # 지어내지 않는다 원칙대로 폴백 제거, None 유지 → 표시부에서 명시적으로 처리.
+        fare_kakao = hd_dow.get("avg_fare_kakao")
+        fare_baehoe = hd_dow.get("avg_fare_baehoe")
         data_note = f"{day}요일 {sample_days}일 관측"
     else:
         kakao_avg = float(hd_raw.get("kakao") or 0)
         baehoe_avg = float(hd_raw.get("baehoe") or 0)
         sample_days = 0
-        fare_kakao = hd_raw.get("avg_fare_kakao") or 9000
-        fare_baehoe = hd_raw.get("avg_fare_baehoe") or 10500
+        fare_kakao = hd_raw.get("avg_fare_kakao")
+        fare_baehoe = hd_raw.get("avg_fare_baehoe")
         data_note = "요일무관 전체평균(요일축 데이터 없음)"
 
     total_obs = kakao_avg + baehoe_avg
@@ -4802,7 +4805,7 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         decision   = "운행 준비 / 대기"
         rec_detail = "19시 이후 카카오 골든타임 준비"
 
-    est_h = round(fare_kakao * kakao_avg + fare_baehoe * baehoe_avg)
+    est_h = round((fare_kakao or 0) * kakao_avg + (fare_baehoe or 0) * baehoe_avg)
 
     db_zones = []
     try:
@@ -4828,7 +4831,7 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         "",
         "🟢 카카오 콜 어군",
         "  예상 건수: 약 " + str(kakao_disp) + "건 (" + stars(sample_days) + ", " + data_note + ")",
-        "  평균 단가: " + fmt(fare_kakao) + "대",
+        "  평균 단가: " + (fmt(fare_kakao) + "대" if fare_kakao else "데이터부족"),
         "  비중: " + str(k_pct) + "%",
     ]
     if db_zones:
@@ -4838,7 +4841,7 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         "",
         "🟠 배회 어군",
         "  예상 건수: 약 " + str(baehoe_disp) + "건 (" + stars(sample_days) + ", " + str(b_pct) + "%)",
-        "  평균 단가: " + fmt(fare_baehoe) + " (수수료 0%)",
+        "  평균 단가: " + (fmt(fare_baehoe) + " (수수료 0%)" if fare_baehoe else "데이터부족"),
         "  핵심 동선: " + anchor,
         "",
         "💡 종합 권고",
