@@ -575,8 +575,15 @@ async def sb_h(method: str, path: str, **kwargs) -> dict | list | None:
         logger.error(f"Supabase {method} {path} → {r.status_code}: {r.text}")
         return None
 
-async def sb_insert(table: str, data: dict) -> dict | None:
-    return await sb_h("POST", table, json=data)
+async def sb_insert(table: str, data: dict) -> dict:
+    """task#50 근본수정(2026-08-22): sb_upsert와 동일 원칙 - 실패해도 조용히
+    None을 반환해서 호출부가 무검사로 "성공"처럼 넘어가던 위험(task#47과
+    같은 종류) 원천봉쇄. 6개 호출지점(831,1600,3532,3983,4027,4061) 개별
+    수정 없이 이 함수 자체에서 일괄 보호."""
+    result = await sb_h("POST", table, json=data)
+    if result is None:
+        raise RuntimeError(f"sb_insert 실패: table={table} (RLS/네트워크 등 — sb_h가 None 반환)")
+    return result
 
 async def sb_select(table: str, params: dict = None) -> list:
     result = await sb_h("GET", table, params=params or {})
