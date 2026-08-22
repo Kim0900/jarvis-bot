@@ -4073,6 +4073,210 @@ async def run_haiku_orchestration_once():
         logger.info(f"Haiku오케스트레이션 완료(task#{task_id}): {final_summary[:100]}")
     else:
         logger.warning(f"Haiku오케스트레이션 미완료(task#{task_id}) — 다음 폴링에서 재시도(진행상황은 이벤트로 남음)")
+
+
+# ──────────────────────────────────────────────
+# task#52 (2026-08-22): 양방향 완전자동화 - "마기(자동) 검증".
+# task#40(마기지시→캐스퍼자동실행)의 반대방향: 에이전트 완료보고→마기자동검증→
+# 다음단계 자동실행. Sonnet 사용(판단비중 높아 Haiku 부적합, 마기지시 그대로).
+# 안전장치: SIMPLE만 자동승인 가능, COMPLEX/architect_decision_required=true는
+# tool레벨에서 서버가 강제차단 - Sonnet이 착각해서 approve_task를 불러도 거부됨.
+# ──────────────────────────────────────────────
+_MAGI_AUTO_TOOLS = [
+    {
+        "name": "query_supabase",
+        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. 원본대조·실제값 확인용.",
+        "input_schema": {"type": "object", "properties": {
+            "sql": {"type": "string", "description": "SELECT로 시작하는 SQL문"}
+        }, "required": ["sql"]},
+    },
+    {
+        "name": "record_event",
+        "description": "검증 진행상황을 magi_task_events에 기록한다. 의미있는 확인마다 즉시 호출.",
+        "input_schema": {"type": "object", "properties": {
+            "detail": {"type": "string"}
+        }, "required": ["detail"]},
+    },
+    {
+        "name": "approve_task",
+        "description": "검증통과시 태스크를 COMPLETED로 승인한다. task_type=SIMPLE이고 "
+                       "architect_decision_required가 아닌 경우에만 실제로 적용된다 "
+                       "(그 외엔 서버가 자동거부하고 escalate로 전환됨).",
+        "input_schema": {"type": "object", "properties": {
+            "summary": {"type": "string", "description": "검증 결과 정직한 요약"}
+        }, "required": ["summary"]},
+    },
+    {
+        "name": "escalate_to_architect",
+        "description": "자동승인하지 않고 대표님(아키텍트) 판단을 요청한다. COMPLEX/"
+                       "architect_decision_required=true/보고내용과 실제값 불일치 시 반드시 이걸 쓴다.",
+        "input_schema": {"type": "object", "properties": {
+            "reason": {"type": "string", "description": "왜 자동승인 안 하는지 구체적으로"}
+        }, "required": ["reason"]},
+    },
+    {
+        "name": "create_next_task",
+        "description": "SIMPLE 태스크 승인 후 다음 단계가 명확하면 후속 태스크를 자동생성한다. "
+                       "불확실하면 호출하지 않는다.",
+        "input_schema": {"type": "object", "properties": {
+            "title": {"type": "string"}, "problem": {"type": "string"}, "target": {"type": "string"},
+            "owner_agent": {"type": "string"}, "task_type": {"type": "string", "enum": ["SIMPLE", "COMPLEX"]},
+        }, "required": ["title", "problem", "target", "owner_agent", "task_type"]},
+    },
+    {
+        "name": "finish_review",
+        "description": "이 검증 세션을 종료한다. approve_task 또는 escalate_to_architect를 "
+                       "먼저 호출한 뒤 마지막에 반드시 호출.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+_MAGI_AUTO_SYSTEM_PROMPT = (
+    "당신은 마기(MAGI 시스템 총괄, 코드/DB담당 캐스퍼의 완료보고를 검증하는 역할)의 "
+    "자동실행 모드입니다. 지금까지 채팅에서 마기가 해온 것과 동일한 절차를 따른다: "
+    "①query_supabase로 실제 DB값을 직접 조회해서 보고내용과 대조(원본대조 없이 보고서 "
+    "텍스트만 믿고 승인하지 않는다) ②의미있는 확인마다 record_event로 즉시 기록 "
+    "③task_type=SIMPLE이고 architect_decision_required가 아니며 검증이 실제로 통과하면 "
+    "approve_task ④task_type=COMPLEX이거나 architect_decision_required=true이거나 "
+    "보고내용과 실제값이 다르면 반드시 escalate_to_architect(자동승인 절대 금지) "
+    "⑤확실한 후속단계가 있으면 create_next_task ⑥마지막엔 반드시 finish_review."
+)
+
+async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> str:
+    task_id = task["task_id"]
+    if name == "query_supabase":
+        sql = (tool_input.get("sql") or "").strip()
+        if not sql.lower().startswith(("select", "with")):
+            return "거부: SELECT/WITH 쿼리만 허용됩니다."
+        try:
+            result = await sb_h("POST", "rpc/exec_readonly_sql", json={"query": sql})
+            return json.dumps(result, ensure_ascii=False, default=str)[:4000]
+        except Exception as e:
+            return f"쿼리 실패: {e}"
+    elif name == "record_event":
+        await sb_insert("magi_task_events", {
+            "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
+            "detail": tool_input.get("detail", "")
+        })
+        return "기록 완료"
+    elif name == "approve_task":
+        # 서버측 강제 재검증 — Sonnet이 잘못 판단해도 여기서 최종 차단
+        if task.get("task_type") == "COMPLEX" or task.get("architect_decision_required"):
+            await sb_insert("magi_task_events", {
+                "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
+                "detail": f"자동승인 시도 거부됨(서버강제) - COMPLEX 또는 architect_decision_required=true. 원요청요약: {tool_input.get('summary','')[:200]}"
+            })
+            return "거부: 이 태스크는 COMPLEX 또는 architect_decision_required=true라 자동승인 불가합니다. escalate_to_architect를 사용하세요."
+        await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                   json={"status": "COMPLETED", "verification_status": "MAGI_CONFIRMED",
+                         "verified_by": "마기(자동)", "verified_at": datetime.now(KST).isoformat(),
+                         "notes": f"[마기(자동) 승인] {tool_input.get('summary','')}"},
+                   headers={**HEADERS_SB, "Prefer": "return=minimal"})
+        await sb_insert("magi_task_events", {
+            "task_id": task_id, "event_type": "TASK_COMPLETED", "old_status": "VERIFICATION",
+            "new_status": "COMPLETED", "actor": "마기(자동)", "detail": tool_input.get("summary", "")
+        })
+        return "__APPROVED__"
+    elif name == "escalate_to_architect":
+        reason = tool_input.get("reason", "")
+        try:
+            await send_all(f"🔔 마기(자동) 판단요청 — task#{task_id} ({task.get('title','')})\n{reason}")
+        except Exception as e:
+            logger.error(f"escalate 텔레그램발송 실패: {e}")
+        await sb_insert("magi_task_events", {
+            "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
+            "detail": f"자동승인 보류, 대표님 판단요청 전송: {reason[:300]}"
+        })
+        return "__ESCALATED__"
+    elif name == "create_next_task":
+        try:
+            new_task = await sb_insert("magi_tasks", {
+                "title": tool_input.get("title", ""), "problem": tool_input.get("problem", ""),
+                "target": tool_input.get("target", ""), "owner_agent": tool_input.get("owner_agent", ""),
+                "task_type": tool_input.get("task_type", "SIMPLE"), "status": "ASSIGNED",
+                "issuer": "마기(자동)", "parent_task_id": task_id,
+            })
+            new_id = new_task.get("task_id") if isinstance(new_task, dict) else (new_task[0].get("task_id") if new_task else None)
+            try:
+                await send_all(f"📋 신규 태스크 자동생성 — task#{new_id}: {tool_input.get('title','')}\n담당: {tool_input.get('owner_agent','')}")
+            except Exception:
+                pass
+            return f"생성완료: task#{new_id}"
+        except Exception as e:
+            return f"생성 실패: {e}"
+    elif name == "finish_review":
+        return "__FINISH__"
+    return "알 수 없는 tool"
+
+
+async def run_magi_auto_review_once():
+    """task#52: VERIFICATION+verified_by없음 태스크 1건을 찾아 마기(자동)가 검증.
+    Sonnet 사용, 최대 10회 tool호출 제한."""
+    try:
+        rows = await sb_select("magi_tasks", {
+            "status": "eq.VERIFICATION", "verified_by": "is.null",
+            "order": "updated_at.asc", "limit": "1"
+        })
+    except Exception as e:
+        logger.error(f"마기자동검증 - magi_tasks 조회 실패: {e}")
+        return None
+    if not rows:
+        return None
+    task = rows[0]
+    task_id = task["task_id"]
+
+    if not ANTHROPIC_API_KEY:
+        return None
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=90.0)
+
+    evid_rows = await sb_select("evidence_registry", {"task_id": f"eq.{task_id}", "order": "evidence_id.desc", "limit": "1"})
+    evid = evid_rows[0] if evid_rows else {}
+
+    messages = [{"role": "user", "content": (
+        f"태스크#{task_id}: {task.get('title','')}\n"
+        f"task_type: {task.get('task_type','미지정')}\n"
+        f"architect_decision_required: {task.get('architect_decision_required', False)}\n"
+        f"문제: {task.get('problem','') or '(없음)'}\n목표: {task.get('target','') or '(없음)'}\n"
+        f"완료보고(notes): {task.get('notes','') or '(없음)'}\n"
+        f"evidence_registry 최신건: {json.dumps(evid, ensure_ascii=False, default=str)[:2000]}"
+    )}]
+
+    await sb_insert("magi_task_events", {
+        "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
+        "detail": "마기(자동) 검증 착수"
+    })
+
+    outcome = None  # "__APPROVED__" | "__ESCALATED__" | None
+    for turn in range(10):
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-5", max_tokens=3000,
+                system=_MAGI_AUTO_SYSTEM_PROMPT, tools=_MAGI_AUTO_TOOLS, messages=messages,
+            )
+        except Exception as e:
+            logger.error(f"마기자동검증 API 호출 실패(turn {turn}): {e}")
+            break
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:
+            break
+        tool_results = []
+        finished = False
+        for tu in tool_uses:
+            result_text = await _magi_auto_execute_tool(tu.name, tu.input, task)
+            if result_text in ("__APPROVED__", "__ESCALATED__"):
+                outcome = result_text
+                result_text = "처리됨"
+            elif result_text == "__FINISH__":
+                finished = True
+                result_text = "검증세션 종료"
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result_text})
+        messages.append({"role": "user", "content": tool_results})
+        if finished:
+            break
+
+    logger.info(f"마기(자동)검증 완료(task#{task_id}): outcome={outcome}")
+    return task_id
     return task_id
 
 
@@ -5014,6 +5218,7 @@ def fish_scheduler(app):
     last_dualverify_day = -1
     last_kpi7day = -1
     last_orch_run_ts = 0.0
+    last_magi_review_ts = 0.0
 
     # 최초 기동 시 1회 즉시 재계산 (테이블이 비어있으면 폴백값으로 작동하다가 여기서 채워짐)
     try:
@@ -5033,6 +5238,15 @@ def fish_scheduler(app):
                     loop.run_until_complete(mark_scheduler_run("run_haiku_orchestration_once", f"task_id={tid}" if tid else "no_task"))
                 except Exception as e:
                     logger.error(f"Haiku오케스트레이션 실행 실패: {e}")
+
+            # ── task#52: 5분마다 마기(자동) 검증(VERIFICATION+verified_by없음)
+            if time.time() - last_magi_review_ts >= 300:
+                last_magi_review_ts = time.time()
+                try:
+                    tid2 = loop.run_until_complete(run_magi_auto_review_once())
+                    loop.run_until_complete(mark_scheduler_run("run_magi_auto_review_once", f"task_id={tid2}" if tid2 else "no_task"))
+                except Exception as e:
+                    logger.error(f"마기(자동)검증 실행 실패: {e}")
 
             # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산 + daily_summary 자동갱신
             if now.hour == 4 and now.day != last_kpi7day:
