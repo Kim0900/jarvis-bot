@@ -684,13 +684,21 @@ async def sb_select_calls(params: dict = None) -> list:
     raw = await sb_select("raw_calls", params)
     return exclude_summary_rows(raw)
 
-async def sb_upsert(table: str, data: dict, on_conflict: str) -> dict | None:
-    return await sb_h(
+async def sb_upsert(table: str, data: dict, on_conflict: str) -> dict:
+    """task#47 긴급수정(2026-08-22, 마기지적): 실패해도 조용히 넘어가 "성공"으로
+    로그가 찍히는 사례가 여러 저장함수에서 발견됨(daily_calc_snapshot,
+    kpi_7day_snapshot 등) — 관측(로그) 자체가 신뢰 안 되면 다른 모든 검증이
+    무의미해짐. 15곳 개별수정 대신 이 함수 자체에서 실패시 예외를 던져 호출부
+    전체를 일괄 보호(호출부는 대부분 이미 try/except 안에 있어 안전)."""
+    result = await sb_h(
         "POST", table,
         json=data,
         headers={**HEADERS_SB, "Prefer": f"resolution=merge-duplicates,return=representation"},
         params={"on_conflict": on_conflict}
     )
+    if result is None:
+        raise RuntimeError(f"sb_upsert 실패: table={table}, on_conflict={on_conflict} (RLS/네트워크 등 — sb_h가 None 반환)")
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -4267,7 +4275,11 @@ async def recalc_7day_average():
         "unclassified_days": sorted(unclassified_days) or None,
         "status": status,
     }
-    await sb_upsert("kpi_7day_snapshot", snapshot, on_conflict="calc_date")
+    result = await sb_upsert("kpi_7day_snapshot", snapshot, on_conflict="calc_date")
+    # task#47 긴급수정(2026-08-22): 동일 버그 - 반환값 미검사로 실패해도 성공로그.
+    if result is None:
+        logger.error(f"kpi_7day_snapshot 저장 실패(calc_date={end}) — sb_upsert가 None 반환")
+        raise RuntimeError(f"kpi_7day_snapshot 저장 실패: calc_date={end}")
     logger.info(f"7일평균 스냅샷 저장: {daily_average}건/일 ({status}), 미분류일 {sorted(unclassified_days)}")
 
     if status in ("WARNING", "CRITICAL"):
@@ -4439,6 +4451,12 @@ async def calc_daily_snapshot(calc_date_str: str = None):
         "unclassified_amount": unclassified_amount if unclassified_amount else None,
     }
     result = await sb_upsert("daily_calc_snapshot", snapshot, on_conflict="calc_date,axis")
+    # task#47 긴급수정(2026-08-22, 마기지적): sb_upsert 실패시(RLS 등) None을
+    # 반환하는데, 이 반환값을 확인 안 하고 무조건 "저장완료" 로그를 찍던 버그.
+    # 관측(로그) 자체가 신뢰 안 되면 다른 모든 검증이 무의미해짐 — 명확히 구분.
+    if result is None:
+        logger.error(f"daily_calc_snapshot 저장 실패(축A={calc_date}) — sb_upsert가 None 반환(RLS/네트워크 등)")
+        raise RuntimeError(f"daily_calc_snapshot 저장 실패: calc_date={calc_date}")
     logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}")
     return result
 
