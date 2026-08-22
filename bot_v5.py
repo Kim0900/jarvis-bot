@@ -1436,9 +1436,9 @@ async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
     window_calls_all = await sb_select_calls( {
         "and": f"(날짜.gte.{window_start},날짜.lte.{날짜})"
     }) or []
-    # task_id=33 STEP2 완료(2026-08-16): axisA/A 155건을 raw_calls.date_axis='B'로
-    # 정규화 완료(correction_log 기록). STEP1의 IN절 임시확장을 원래 단일조건으로 원복.
-    window_calls = [c for c in window_calls_all if (c.get("date_axis") or "B") == "B"]
+    # task_id=11 명명표준화 대비(2026-08-22): DB값이 'B'->'calendar_day'로
+    # 리네이밍될 예정이라, 전환기간 안전을 위해 신값/구값 둘 다 인식하도록 처리.
+    window_calls = [c for c in window_calls_all if (c.get("date_axis") or "calendar_day") in ("B", "calendar_day")]
 
     # 명령서 #009 재검증(2026-07-08) 결과 반영: 자동 +1일 보정 제거.
     # 이지스가 업로드하는 raw_calls는 아르고스가 명령서#020·#021-rev1 자정분리
