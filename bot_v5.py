@@ -4183,6 +4183,13 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
             await send_all(f"🔔 마기(자동) 판단요청 — task#{task_id} ({task.get('title','')})\n{reason}")
         except Exception as e:
             logger.error(f"escalate 텔레그램발송 실패: {e}")
+        # 긴급수정(2026-08-22, 실기기검증중 발견): verified_by를 안 채우면 폴링조건
+        # (status=VERIFICATION AND verified_by IS NULL)에 계속 걸려 같은 태스크가
+        # 무한 재시도됨(task54로 실증 확인) — escalate도 "처리완료(대표님응답대기)"
+        # 표시가 필요.
+        await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                   json={"verified_by": "마기(자동)_ESCALATED", "verified_at": datetime.now(KST).isoformat()},
+                   headers={**HEADERS_SB, "Prefer": "return=minimal"})
         await sb_insert("magi_task_events", {
             "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
             "detail": f"자동승인 보류, 대표님 판단요청 전송: {reason[:300]}"
