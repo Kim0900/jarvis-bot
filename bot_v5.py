@@ -4953,7 +4953,11 @@ async def get_fish_report_db(hour=None, tag_filter=None):
             f"(19~21시/21~24시/00~02시 운영시간대에 데이터가 집중되어 있습니다)"
         )
 
-    kakao_disp = round(kakao_avg)
+    # 대표님 지적(2026-08-23): 카카오는 정수반올림, 배회는 소수1자리로 표시
+    # 정밀도가 달라서 "예상0건인데 비중66.7%" 같은 모순된 표시가 나던 문제.
+    # (실측: kakao_avg=0.4, baehoe_avg=0.2 → round(0.4)=0으로 반올림되며 발생)
+    # 둘 다 소수1자리로 통일해 "0건인데 비중이 있다"는 모순을 제거.
+    kakao_disp = round(kakao_avg, 1)
     baehoe_disp = round(baehoe_avg, 1)
     total_disp = kakao_avg + baehoe_avg
     b_pct = round(baehoe_avg / total_disp * 100, 1) if total_disp > 0 else 0.0
