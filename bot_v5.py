@@ -552,6 +552,25 @@ def run_health_server():
 # ──────────────────────────────────────────────
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
+async def send_telegram_broadcast(text: str):
+    """긴급수정(2026-08-23): 기존 send_all()은 main() 함수 내부의 지역함수(closure)라
+    모듈레벨 함수(check_ingestion_gap, ask_operated_status_telegram, task#52 마기자동
+    검증 등)에서 호출하면 NameError로 조용히 실패하고 있었음(task#52 실기기검증중
+    "텔레그램에 아무것도 안 옴"으로 발견 — 대표님 지적). 모듈레벨에서 독립적으로
+    작동하는 전역 발송함수로 대체, app 객체 의존 없이 별도 Bot 인스턴스 사용."""
+    from telegram import Bot
+    chat_ids = [x for x in [os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")] if x]
+    if not chat_ids:
+        logger.error("send_telegram_broadcast: ALLOWED_CHAT_ID 미설정")
+        return
+    bot = Bot(token=TELEGRAM_TOKEN)
+    for cid in chat_ids:
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.error(f"텔레그램 발송 실패(chat_id={cid}): {e}")
+
+
 async def sb_h(method: str, path: str, **kwargs) -> dict | list | None:
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     # 캐스퍼 수정 2026-07-06: headers를 여기서 무조건 고정으로 넘기면서
@@ -3919,7 +3938,7 @@ async def ask_operated_status_telegram():
         + "\n\n휴무였던 날짜만 답장으로 알려주세요 (예: '8/13 8/15 휴무')."
     )
     try:
-        await send_all(msg)
+        await send_telegram_broadcast(msg)
         now_iso = datetime.now(KST).isoformat()
         for d in pending:
             await sb_upsert("operated_status", {"날짜": d, "asked_at": now_iso}, on_conflict="날짜")
@@ -4180,7 +4199,7 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
     elif name == "escalate_to_architect":
         reason = tool_input.get("reason", "")
         try:
-            await send_all(f"🔔 마기(자동) 판단요청 — task#{task_id} ({task.get('title','')})\n{reason}")
+            await send_telegram_broadcast(f"🔔 마기(자동) 판단요청 — task#{task_id} ({task.get('title','')})\n{reason}")
         except Exception as e:
             logger.error(f"escalate 텔레그램발송 실패: {e}")
         # 긴급수정(2026-08-22, 실기기검증중 발견): verified_by를 안 채우면 폴링조건
@@ -4205,7 +4224,7 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
             })
             new_id = new_task.get("task_id") if isinstance(new_task, dict) else (new_task[0].get("task_id") if new_task else None)
             try:
-                await send_all(f"📋 신규 태스크 자동생성 — task#{new_id}: {tool_input.get('title','')}\n담당: {tool_input.get('owner_agent','')}")
+                await send_telegram_broadcast(f"📋 신규 태스크 자동생성 — task#{new_id}: {tool_input.get('title','')}\n담당: {tool_input.get('owner_agent','')}")
             except Exception:
                 pass
             return f"생성완료: task#{new_id}"
@@ -4410,7 +4429,7 @@ async def check_ingestion_gap():
         )
         logger.warning(f"인입중단 감지: {gap_days}")
         try:
-            await send_all(msg)
+            await send_telegram_broadcast(msg)
         except Exception as e:
             logger.error(f"인입중단 경고 발송 실패: {e}")
     return gap_days
@@ -4509,7 +4528,7 @@ async def recalc_7day_average():
         if unclassified_days:
             msg += f"\n⚠️ 이 숫자는 {len(unclassified_days)}일 미분류(콜유형='합계') 상태를 제외한 값입니다: {sorted(unclassified_days)}"
         try:
-            await send_all(msg)
+            await send_telegram_broadcast(msg)
         except Exception as e:
             logger.error(f"7일평균 알림 발송 실패: {e}")
 
