@@ -24,6 +24,11 @@ except Exception as exc:
 
 import bot_v5_legacy
 
+try:
+    sitecustomize._install_scheduler_dispatch_patch(bot_v5_legacy)
+except Exception as exc:
+    logger.warning("MAGI scheduler dispatch patch install failed: %s", exc)
+
 
 if __name__ == "__main__":
     bot_v5_legacy.main()
