@@ -1,1 +1,1 @@
-web: gunicorn ocr_backend:app
+web: gunicorn router_app:app
