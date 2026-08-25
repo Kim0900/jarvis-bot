@@ -7,7 +7,6 @@ fall back to Gemini instead of being retried against Anthropic forever.
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 from dataclasses import dataclass
@@ -19,7 +18,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _REAL_ANTHROPIC = anthropic.Anthropic
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-flash"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-3.6-flash"))
+if GEMINI_MODEL in ("gemini-1.5-flash", "gemini-2.0-flash"):
+    GEMINI_MODEL = "gemini-3.6-flash"
 
 
 @dataclass
@@ -124,9 +125,9 @@ def _gemini_generate(*, messages: list[dict[str, Any]], system: Any = None, max_
             "maxOutputTokens": max_tokens or 1000,
         },
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     with httpx.Client(timeout=120.0) as client:
-        res = client.post(url, json=payload)
+        res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
     if res.status_code >= 400:
         raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:500]}")
 
