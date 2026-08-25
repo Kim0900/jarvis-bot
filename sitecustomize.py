@@ -216,21 +216,28 @@ def _install_ai_fallback() -> None:
     class MessagesProxy:
         def __init__(self, real_messages: Any):
             self._real_messages = real_messages
+            self._fallback_active = False
+
+        def _gemini_create(self, kwargs: dict[str, Any]) -> Any:
+            return gemini_generate(
+                messages=kwargs.get("messages") or [],
+                system=kwargs.get("system"),
+                tools=kwargs.get("tools") or [],
+                max_tokens=kwargs.get("max_tokens") or 1000,
+                temperature=kwargs.get("temperature") or 0,
+            )
 
         def create(self, *args: Any, **kwargs: Any) -> Any:
+            if self._fallback_active:
+                return self._gemini_create(kwargs)
             try:
                 return self._real_messages.create(*args, **kwargs)
             except Exception as exc:
                 if not is_provider_unavailable(exc):
                     raise
+                self._fallback_active = True
                 logger.warning("Anthropic unavailable; falling back to Gemini: %s", exc)
-                return gemini_generate(
-                    messages=kwargs.get("messages") or [],
-                    system=kwargs.get("system"),
-                    tools=kwargs.get("tools") or [],
-                    max_tokens=kwargs.get("max_tokens") or 1000,
-                    temperature=kwargs.get("temperature") or 0,
-                )
+                return self._gemini_create(kwargs)
 
     class AnthropicFallbackClient:
         _magi_fallback_wrapped = True
