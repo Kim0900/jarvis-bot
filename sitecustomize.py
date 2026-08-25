@@ -17,7 +17,29 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _truthy_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.1f", name, raw, default)
+        return default
+
+
 def _install_ai_fallback() -> None:
+    if not _truthy_env("MAGI_AI_FALLBACK_ENABLED", True):
+        logger.warning("MAGI AI fallback disabled by MAGI_AI_FALLBACK_ENABLED")
+        return
+
     try:
         import anthropic
         import httpx
@@ -36,6 +58,9 @@ def _install_ai_fallback() -> None:
     if gemini_model in ("gemini-1.5-flash", "gemini-2.0-flash"):
         gemini_model = "gemini-3.6-flash"
 
+    gemini_safe_mode = _truthy_env("MAGI_GEMINI_FREE_TIER_SAFE_MODE", True)
+    gemini_min_interval = max(_float_env("MAGI_GEMINI_MIN_INTERVAL_SECONDS", 65.0), 0.0)
+    gemini_last_call_at = 0.0
     tool_id_to_name: dict[str, str] = {}
 
     @dataclass
@@ -76,6 +101,17 @@ def _install_ai_fallback() -> None:
                 "504",
             )
         )
+
+    def wait_for_free_tier_window() -> None:
+        nonlocal gemini_last_call_at
+        if not gemini_safe_mode or gemini_min_interval <= 0:
+            return
+        elapsed = time.monotonic() - gemini_last_call_at
+        delay = gemini_min_interval - elapsed
+        if delay > 0:
+            logger.warning("Gemini free-tier safe mode; waiting %.1fs before next call", delay)
+            time.sleep(delay)
+        gemini_last_call_at = time.monotonic()
 
     def anthropic_part_to_gemini_part(part: Any) -> dict[str, Any] | None:
         if isinstance(part, str):
@@ -237,6 +273,7 @@ def _install_ai_fallback() -> None:
         with httpx.Client(timeout=120.0) as client:
             res = None
             for attempt in range(4):
+                wait_for_free_tier_window()
                 res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
                 if res.status_code != 429 or attempt == 3:
                     break
@@ -295,7 +332,13 @@ def _install_ai_fallback() -> None:
             return getattr(self._real_client, name)
 
     anthropic.Anthropic = AnthropicFallbackClient
-    logger.warning("MAGI AI fallback installed: Anthropic provider failures will route to Gemini")
+    if gemini_safe_mode:
+        logger.warning(
+            "MAGI AI fallback installed: Anthropic provider failures will route to Gemini with free-tier safe mode %.1fs",
+            gemini_min_interval,
+        )
+    else:
+        logger.warning("MAGI AI fallback installed: Anthropic provider failures will route to Gemini")
 
 
 try:
