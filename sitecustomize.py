@@ -207,8 +207,8 @@ def _install_ai_fallback() -> None:
     def retry_delay_seconds(response_text: str, attempt: int) -> float:
         match = re.search(r"retry in ([0-9.]+)s", response_text, re.IGNORECASE)
         if match:
-            return min(max(float(match.group(1)) + 1.0, 1.0), 30.0)
-        return min(2.0 ** attempt, 10.0)
+            return min(max(float(match.group(1)) + 1.0, 1.0), 90.0)
+        return min(2.0 ** attempt, 30.0)
 
     def gemini_generate(
         *,
@@ -236,9 +236,9 @@ def _install_ai_fallback() -> None:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         with httpx.Client(timeout=120.0) as client:
             res = None
-            for attempt in range(3):
+            for attempt in range(4):
                 res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
-                if res.status_code != 429 or attempt == 2:
+                if res.status_code != 429 or attempt == 3:
                     break
                 delay = retry_delay_seconds(res.text, attempt)
                 logger.warning("Gemini rate limited; retrying in %.1fs", delay)
