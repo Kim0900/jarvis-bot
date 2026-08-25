@@ -123,6 +123,12 @@ def _install_ai_fallback() -> None:
             system_text = "\n".join(
                 p.get("text", "") for p in system if isinstance(p, dict) and p.get("type") == "text"
             ).strip()
+        if system_text:
+            system_text = (
+                f"{system_text}\n\n"
+                "[Gemini fallback SQL rule]\n"
+                "When calling query_supabase, send exactly one SELECT statement, with no trailing semicolon and no second statement."
+            )
 
         for msg in messages or []:
             role = "model" if msg.get("role") == "assistant" else "user"
