@@ -46,6 +46,7 @@ def _install_ai_fallback() -> None:
         id: str
         name: str
         input: dict[str, Any]
+        thought_signature: str | None = None
         type: str = "tool_use"
 
     class FallbackMessage:
@@ -82,7 +83,11 @@ def _install_ai_fallback() -> None:
             if block_type == "text":
                 return {"text": getattr(part, "text", "")}
             if block_type == "tool_use":
-                return {"functionCall": {"name": getattr(part, "name", ""), "args": getattr(part, "input", {}) or {}}}
+                converted = {"functionCall": {"name": getattr(part, "name", ""), "args": getattr(part, "input", {}) or {}}}
+                thought_signature = getattr(part, "thought_signature", None)
+                if thought_signature:
+                    converted["thoughtSignature"] = thought_signature
+                return converted
             return None
 
         kind = part.get("type")
@@ -169,9 +174,10 @@ def _install_ai_fallback() -> None:
             if function_call:
                 name = function_call.get("name", "")
                 args = function_call.get("args") or {}
+                thought_signature = part.get("thoughtSignature") or part.get("thought_signature")
                 tool_id = f"gemini_tool_{len(tool_id_to_name) + idx + 1}"
                 tool_id_to_name[tool_id] = name
-                blocks.append(ToolUseBlock(id=tool_id, name=name, input=args))
+                blocks.append(ToolUseBlock(id=tool_id, name=name, input=args, thought_signature=thought_signature))
         return blocks
 
     def gemini_generate(
