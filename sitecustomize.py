@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -202,6 +204,12 @@ def _install_ai_fallback() -> None:
                 blocks.append(ToolUseBlock(id=tool_id, name=name, input=args, thought_signature=thought_signature))
         return blocks
 
+    def retry_delay_seconds(response_text: str, attempt: int) -> float:
+        match = re.search(r"retry in ([0-9.]+)s", response_text, re.IGNORECASE)
+        if match:
+            return min(max(float(match.group(1)) + 1.0, 1.0), 30.0)
+        return min(2.0 ** attempt, 10.0)
+
     def gemini_generate(
         *,
         messages: list[dict[str, Any]],
@@ -227,9 +235,18 @@ def _install_ai_fallback() -> None:
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         with httpx.Client(timeout=120.0) as client:
-            res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
-        if res.status_code >= 400:
-            raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:500]}")
+            res = None
+            for attempt in range(3):
+                res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
+                if res.status_code != 429 or attempt == 2:
+                    break
+                delay = retry_delay_seconds(res.text, attempt)
+                logger.warning("Gemini rate limited; retrying in %.1fs", delay)
+                time.sleep(delay)
+        if res is None or res.status_code >= 400:
+            status_code = getattr(res, "status_code", "unknown")
+            text = getattr(res, "text", "")
+            raise RuntimeError(f"Gemini HTTP {status_code}: {text[:500]}")
 
         data = res.json()
         candidate = (data.get("candidates") or [{}])[0]
