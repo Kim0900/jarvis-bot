@@ -341,6 +341,167 @@ def _install_ai_fallback() -> None:
         logger.warning("MAGI AI fallback installed: Anthropic provider failures will route to Gemini")
 
 
+def _install_scheduler_dispatch_patch(legacy: Any) -> None:
+    if getattr(legacy, "_magi_scheduler_dispatch_patched", False):
+        return
+
+    def fish_scheduler(app: Any) -> None:
+        loop = legacy.asyncio.new_event_loop()
+        legacy.asyncio.set_event_loop(loop)
+
+        chat_ids = [
+            x for x in [
+                os.getenv("ALLOWED_CHAT_ID", ""),
+                os.getenv("ALLOWED_CHAT_ID2", ""),
+            ] if x
+        ]
+
+        async def send_all(text: str) -> None:
+            for cid in chat_ids:
+                try:
+                    await app.bot.send_message(chat_id=cid, text=text)
+                except Exception as exc:
+                    legacy.logger.error(f"어군 브리핑 발송 오류 ({cid}): {exc}")
+
+        sent_hour_keys: set[str] = set()
+        sent_start_brief_key: str | None = None
+        last_reset_day = -1
+        last_recalc_day = -1
+        last_dualverify_day = -1
+        last_kpi7day = -1
+        last_orch_run_ts = 0.0
+        last_magi_review_ts = 0.0
+
+        try:
+            loop.run_until_complete(legacy.recalc_fish_hour_data())
+        except Exception as exc:
+            legacy.logger.error(f"fish_hour_data 최초 재계산 실패: {exc}")
+
+        while True:
+            try:
+                now = legacy.datetime.now(legacy.KST)
+                hour_key = f"{now.date()}:{now.hour:02d}"
+
+                if now.hour == 18 and now.minute == 50 and sent_start_brief_key != str(now.date()):
+                    try:
+                        report = loop.run_until_complete(legacy.get_fish_report_db(hour=19)) or "데이터 없음"
+                        loop.run_until_complete(send_all(f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"))
+                        sent_start_brief_key = str(now.date())
+                        legacy.logger.info("18:50 영업준비 브리핑 발송")
+                    except Exception as exc:
+                        legacy.logger.error(f"18:50 영업준비 브리핑 오류: {exc}")
+
+                # Dispatch must run before long AI jobs. Haiku/Gemini retries can block past minute 0.
+                if now.minute < 3 and hour_key not in sent_hour_keys:
+                    in_service = (19 <= now.hour <= 23) or (0 <= now.hour <= 2)
+                    if in_service:
+                        try:
+                            report = loop.run_until_complete(legacy.get_fish_report_db())
+                            if report:
+                                loop.run_until_complete(send_all(report))
+                                legacy.logger.info(f"어군 브리핑 발송: {now.hour}시")
+                        except Exception as exc:
+                            legacy.logger.error(f"{now.hour}시 정각 브리핑 오류: {exc}")
+                        finally:
+                            sent_hour_keys.add(hour_key)
+
+                if time.time() - last_orch_run_ts >= 300:
+                    last_orch_run_ts = time.time()
+                    try:
+                        tid = loop.run_until_complete(legacy.run_haiku_orchestration_once())
+                        loop.run_until_complete(legacy.mark_scheduler_run("run_haiku_orchestration_once", f"task_id={tid}" if tid else "no_task"))
+                    except Exception as exc:
+                        legacy.logger.error(f"Haiku오케스트레이션 실행 실패: {exc}")
+
+                if time.time() - last_magi_review_ts >= 300:
+                    last_magi_review_ts = time.time()
+                    try:
+                        tid2 = loop.run_until_complete(legacy.run_magi_auto_review_once())
+                        loop.run_until_complete(legacy.mark_scheduler_run("run_magi_auto_review_once", f"task_id={tid2}" if tid2 else "no_task"))
+                    except Exception as exc:
+                        legacy.logger.error(f"마기(자동)검증 실행 실패: {exc}")
+
+                if now.hour == 4 and now.day != last_kpi7day:
+                    try:
+                        loop.run_until_complete(legacy.recalc_daily_summary_totals())
+                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
+                    except Exception as exc:
+                        legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
+                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {exc}"))
+                    try:
+                        loop.run_until_complete(legacy.recalc_7day_average())
+                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
+                    except Exception as exc:
+                        legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
+                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {exc}"))
+                    try:
+                        loop.run_until_complete(legacy.calc_daily_snapshot())
+                        loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
+                    except Exception as exc:
+                        legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
+                        loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
+                    last_kpi7day = now.day
+
+                if now.hour == 8 and now.day != last_dualverify_day:
+                    try:
+                        loop.run_until_complete(legacy.check_ingestion_gap())
+                        loop.run_until_complete(legacy.mark_scheduler_run("check_ingestion_gap"))
+                    except Exception as exc:
+                        legacy.logger.error(f"인입중단 감지 실패: {exc}")
+                    try:
+                        asked = loop.run_until_complete(legacy.ask_operated_status_telegram())
+                        loop.run_until_complete(legacy.mark_scheduler_run("ask_operated_status_telegram", f"asked={len(asked)}"))
+                    except Exception as exc:
+                        legacy.logger.error(f"operated_status 질문발송 실패: {exc}")
+                    try:
+                        dv = loop.run_until_complete(legacy.dual_verify_7day_average())
+                        last_dualverify_day = now.day
+                        loop.run_until_complete(legacy.mark_scheduler_run("dual_verify_7day_average", "OK" if dv["match"] else "MISMATCH"))
+                        if not dv["match"]:
+                            msg = (
+                                f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
+                                f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
+                                f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
+                                f"차이: {dv['diff']:+,}원\n"
+                                + "\n".join(dv.get("detail", []))
+                            )
+                            legacy.logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
+                            loop.run_until_complete(send_all(msg))
+                        else:
+                            legacy.logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
+                    except Exception as exc:
+                        legacy.logger.error(f"7일평균 이중검증 실행 오류: {exc}")
+
+                if now.hour == 3 and now.day != last_reset_day:
+                    sent_start_brief_key = None
+                    sent_hour_keys = {key for key in sent_hour_keys if not key.startswith(str(now.date()))}
+                    last_reset_day = now.day
+                    legacy.logger.info("어군 스케줄러 일간 리셋")
+
+                if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
+                    try:
+                        loop.run_until_complete(legacy.recalc_fish_hour_data())
+                        legacy._FISH_HOUR_CACHE = {}
+                        legacy.logger.info("fish_hour_data 일일 재계산 완료")
+                    except Exception as exc:
+                        legacy.logger.error(f"fish_hour_data 일일 재계산 실패: {exc}")
+                    try:
+                        loop.run_until_complete(legacy.recalc_fish_hour_data_dow())
+                        legacy.logger.info("fish_hour_data_dow 일일 재계산 완료")
+                    except Exception as exc:
+                        legacy.logger.error(f"fish_hour_data_dow 일일 재계산 실패: {exc}")
+                    last_recalc_day = now.day
+
+            except Exception as exc:
+                legacy.logger.error(f"fish_scheduler 최외곽 예외 포착(스레드 생존): {exc}")
+
+            time.sleep(30)
+
+    legacy.fish_scheduler = fish_scheduler
+    legacy._magi_scheduler_dispatch_patched = True
+    logger.warning("MAGI fish scheduler dispatch patch installed: hourly briefing runs before long AI jobs")
+
+
 try:
     _install_ai_fallback()
 except Exception as exc:
