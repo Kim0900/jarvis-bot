@@ -30,7 +30,9 @@ def _install_ai_fallback() -> None:
     if getattr(real_anthropic, "_magi_fallback_wrapped", False):
         return
 
-    gemini_model = os.getenv("GEMINI_MODEL", os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-flash"))
+    gemini_model = os.getenv("GEMINI_MODEL") or os.getenv("GEMINI_TEXT_MODEL") or "gemini-2.0-flash"
+    if gemini_model == "gemini-1.5-flash":
+        gemini_model = "gemini-2.0-flash"
 
     @dataclass
     class TextBlock:
@@ -129,9 +131,9 @@ def _install_ai_fallback() -> None:
                 "maxOutputTokens": max_tokens or 1000,
             },
         }
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         with httpx.Client(timeout=120.0) as client:
-            res = client.post(url, json=payload)
+            res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
         if res.status_code >= 400:
             raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:500]}")
 
