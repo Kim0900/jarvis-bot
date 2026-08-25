@@ -34,15 +34,24 @@ def _install_ai_fallback() -> None:
     if gemini_model in ("gemini-1.5-flash", "gemini-2.0-flash"):
         gemini_model = "gemini-3.6-flash"
 
+    tool_id_to_name: dict[str, str] = {}
+
     @dataclass
     class TextBlock:
         text: str
         type: str = "text"
 
+    @dataclass
+    class ToolUseBlock:
+        id: str
+        name: str
+        input: dict[str, Any]
+        type: str = "tool_use"
+
     class FallbackMessage:
-        def __init__(self, text: str):
-            self.content = [TextBlock(text=text)]
-            self.stop_reason = "end_turn"
+        def __init__(self, blocks: list[Any], stop_reason: str = "end_turn"):
+            self.content = blocks
+            self.stop_reason = stop_reason
 
     def is_provider_unavailable(exc: Exception) -> bool:
         msg = str(exc).lower()
@@ -69,18 +78,31 @@ def _install_ai_fallback() -> None:
         if isinstance(part, str):
             return {"text": part}
         if not isinstance(part, dict):
+            block_type = getattr(part, "type", None)
+            if block_type == "text":
+                return {"text": getattr(part, "text", "")}
+            if block_type == "tool_use":
+                return {"functionCall": {"name": getattr(part, "name", ""), "args": getattr(part, "input", {}) or {}}}
             return None
 
         kind = part.get("type")
         if kind == "text":
             return {"text": part.get("text", "")}
+        if kind == "tool_result":
+            tool_name = tool_id_to_name.get(part.get("tool_use_id", "")) or "tool_result"
+            return {
+                "functionResponse": {
+                    "name": tool_name,
+                    "response": {"content": part.get("content", "")},
+                }
+            }
         if kind == "image":
             source = part.get("source") or {}
             if source.get("type") != "base64":
                 return None
             return {
-                "inline_data": {
-                    "mime_type": source.get("media_type") or "image/jpeg",
+                "inlineData": {
+                    "mimeType": source.get("media_type") or "image/jpeg",
                     "data": source.get("data") or "",
                 }
             }
@@ -119,18 +141,62 @@ def _install_ai_fallback() -> None:
             contents = [{"role": "user", "parts": [{"text": ""}]}]
         return contents
 
-    def gemini_generate(*, messages: list[dict[str, Any]], system: Any = None, max_tokens: int = 1000, temperature: float = 0) -> FallbackMessage:
+    def anthropic_tools_to_gemini(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        declarations = []
+        for tool in tools or []:
+            name = tool.get("name")
+            if not name:
+                continue
+            declaration = {
+                "name": name,
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            }
+            declarations.append(declaration)
+        if not declarations:
+            return None
+        return [{"functionDeclarations": declarations}]
+
+    def gemini_parts_to_blocks(parts: list[dict[str, Any]]) -> list[Any]:
+        blocks: list[Any] = []
+        for idx, part in enumerate(parts or []):
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if text:
+                blocks.append(TextBlock(text=text))
+            function_call = part.get("functionCall") or part.get("function_call")
+            if function_call:
+                name = function_call.get("name", "")
+                args = function_call.get("args") or {}
+                tool_id = f"gemini_tool_{len(tool_id_to_name) + idx + 1}"
+                tool_id_to_name[tool_id] = name
+                blocks.append(ToolUseBlock(id=tool_id, name=name, input=args))
+        return blocks
+
+    def gemini_generate(
+        *,
+        messages: list[dict[str, Any]],
+        system: Any = None,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 1000,
+        temperature: float = 0,
+    ) -> FallbackMessage:
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
-        payload = {
+        payload: dict[str, Any] = {
             "contents": anthropic_messages_to_gemini(messages, system),
             "generationConfig": {
                 "temperature": temperature or 0,
                 "maxOutputTokens": max_tokens or 1000,
             },
         }
+        gemini_tools = anthropic_tools_to_gemini(tools)
+        if gemini_tools:
+            payload["tools"] = gemini_tools
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         with httpx.Client(timeout=120.0) as client:
             res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
@@ -138,11 +204,14 @@ def _install_ai_fallback() -> None:
             raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:500]}")
 
         data = res.json()
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        text = "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
-        if not text:
-            raise RuntimeError("Gemini returned an empty text response")
-        return FallbackMessage(text)
+        candidate = (data.get("candidates") or [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        blocks = gemini_parts_to_blocks(parts)
+        if not blocks:
+            finish_reason = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
+            raise RuntimeError(f"Gemini returned no text/tool blocks; finish_reason={finish_reason}")
+        stop_reason = "tool_use" if any(getattr(block, "type", None) == "tool_use" for block in blocks) else "end_turn"
+        return FallbackMessage(blocks, stop_reason=stop_reason)
 
     class MessagesProxy:
         def __init__(self, real_messages: Any):
@@ -158,6 +227,7 @@ def _install_ai_fallback() -> None:
                 return gemini_generate(
                     messages=kwargs.get("messages") or [],
                     system=kwargs.get("system"),
+                    tools=kwargs.get("tools") or [],
                     max_tokens=kwargs.get("max_tokens") or 1000,
                     temperature=kwargs.get("temperature") or 0,
                 )
