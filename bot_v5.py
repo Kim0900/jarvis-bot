@@ -5030,8 +5030,15 @@ async def get_fish_report_db(hour=None, tag_filter=None):
         decision   = "카카오 우선 + 배회 수용"
         rec_detail = "배회 " + str(b_pct) + "% — 앵커 위치면 적극 수용\n" + anchor.split("/")[0].strip()
     elif 0 <= h <= 2:
-        decision   = "★ 배회 적극 수용 (황금시간)"
-        rec_detail = "배회 " + str(b_pct) + "% — 자정후 황금구간\n핵심 동선: " + anchor
+        # 대표님 지적(2026-08-24): "00-02시는 항상 배회황금시간"으로 시간대만
+        # 보고 하드코딩돼있어서, 실제 그 요일·시간대 배회데이터가 0건이어도
+        # "★배회적극수용"이 그대로 나오던 모순 수정. 실측(baehoe_avg)을 확인.
+        if baehoe_avg < 0.05:
+            decision   = "카카오 우선 대기 (배회data부족)"
+            rec_detail = f"이 시간대는 통상 배회 황금구간이나, {day}요일 {sample_days}일 관측상 배회실적 없음\n카카오 대기 권장"
+        else:
+            decision   = "★ 배회 적극 수용 (황금시간)"
+            rec_detail = "배회 " + str(b_pct) + "% — 자정후 황금구간\n핵심 동선: " + anchor
     elif 3 <= h <= 4:
         decision   = "마감 단계"
         rec_detail = "02시 종료 검토" if day in ["화", "목"] else "끝까지 사수"
