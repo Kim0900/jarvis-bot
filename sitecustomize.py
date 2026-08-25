@@ -30,9 +30,9 @@ def _install_ai_fallback() -> None:
     if getattr(real_anthropic, "_magi_fallback_wrapped", False):
         return
 
-    gemini_model = os.getenv("GEMINI_MODEL") or os.getenv("GEMINI_TEXT_MODEL") or "gemini-2.0-flash"
-    if gemini_model == "gemini-1.5-flash":
-        gemini_model = "gemini-2.0-flash"
+    gemini_model = os.getenv("GEMINI_MODEL") or os.getenv("GEMINI_TEXT_MODEL") or "gemini-3.6-flash"
+    if gemini_model in ("gemini-1.5-flash", "gemini-2.0-flash"):
+        gemini_model = "gemini-3.6-flash"
 
     @dataclass
     class TextBlock:
