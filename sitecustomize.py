@@ -127,7 +127,8 @@ def _install_ai_fallback() -> None:
             system_text = (
                 f"{system_text}\n\n"
                 "[Gemini fallback SQL rule]\n"
-                "When calling query_supabase, send exactly one SELECT statement, with no trailing semicolon and no second statement."
+                "When calling query_supabase, send exactly one SELECT statement, with no trailing semicolon and no second statement. "
+                "Use real schema names from errors/results. For bot_briefings, the type column is briefing_type, not brief_type."
             )
 
         for msg in messages or []:
@@ -168,6 +169,21 @@ def _install_ai_fallback() -> None:
             return None
         return [{"functionDeclarations": declarations}]
 
+    def normalize_tool_args(name: str, args: Any) -> dict[str, Any]:
+        if not isinstance(args, dict):
+            return {}
+        if name != "query_supabase":
+            return args
+
+        normalized = dict(args)
+        sql = normalized.get("sql")
+        if isinstance(sql, str):
+            sql = sql.strip().replace("brief_type", "briefing_type")
+            if ";" in sql:
+                sql = sql.split(";", 1)[0].strip()
+            normalized["sql"] = sql
+        return normalized
+
     def gemini_parts_to_blocks(parts: list[dict[str, Any]]) -> list[Any]:
         blocks: list[Any] = []
         for idx, part in enumerate(parts or []):
@@ -179,7 +195,7 @@ def _install_ai_fallback() -> None:
             function_call = part.get("functionCall") or part.get("function_call")
             if function_call:
                 name = function_call.get("name", "")
-                args = function_call.get("args") or {}
+                args = normalize_tool_args(name, function_call.get("args") or {})
                 thought_signature = part.get("thoughtSignature") or part.get("thought_signature")
                 tool_id = f"gemini_tool_{len(tool_id_to_name) + idx + 1}"
                 tool_id_to_name[tool_id] = name
