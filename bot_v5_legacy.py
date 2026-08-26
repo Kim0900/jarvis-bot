@@ -1620,17 +1620,10 @@ async def handle_briefing(update, date_str: str = None):
 
     briefing_text = "\n".join(lines)
 
-    # 캐스퍼 명령서 #004/#006 반영 (2026-07-06) — 이지스 연동용 bot_briefings 저장
-    # atlas_reports는 아틀라스→앱 파이프라인 전용이라 재사용 시 충돌하므로 별도 테이블 사용
-    try:
-        await sb_insert("bot_briefings", {
-            "briefing_type": "daily_close",
-            "content": briefing_text,
-            "run_date": 날짜,
-            "status": "pending"
-        })
-    except Exception as e:
-        logger.error(f"bot_briefings 저장 오류: {e}")
+    # task#63(2026-08-26): 이지스 폐기 확정(correction_log 기록, 8/25 대표님 확인 —
+    # 역할은 아르고스가 흡수)에 따라, "이지스 연동용"(명령서#004/#006, 7/6)이던
+    # bot_briefings INSERT를 제거. 소비자(컨슈머) 로직 자체가 처음부터 없었던
+    # 죽은 큐였음(task#59에서 확인).
 
     # 캐스퍼 명령서 #008 §3 — KPI 4종 (봇 자체 계산, 축B 필수)
     kpi = {}
