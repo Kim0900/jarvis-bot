@@ -4202,9 +4202,11 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
         await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
                    json={"verified_by": "마기(자동)_ESCALATED", "verified_at": datetime.now(KST).isoformat()},
                    headers={**HEADERS_SB, "Prefer": "return=minimal"})
+        # task#64(2026-08-26): 이지스 관련 질문이 최소 2회 반복됐던 사례(마기가
+        # 과거 답변에 접근 못해 재질문) 재발방지 — 명확한 event_type으로 구분.
         await sb_insert("magi_task_events", {
-            "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "마기(자동)",
-            "detail": f"자동승인 보류, 대표님 판단요청 전송: {reason[:300]}"
+            "task_id": task_id, "event_type": "ARCHITECT_QUESTION_SENT", "actor": "마기(자동)",
+            "detail": f"질문: {reason[:500]}"
         })
         return "__ESCALATED__"
     elif name == "create_next_task":
@@ -5988,6 +5990,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if parsed_exp:
         await handle_expense(update, parsed_exp)
         return
+
+    # task#64(2026-08-26): 이지스 관련 질문이 최소 2회 반복됐던 사례(마기가
+    # 과거 답변에 접근 못해 재질문) 재발방지. 다른 명령어에 전혀 안 걸린 자유
+    # 텍스트만 여기 도달하므로, 최근 미답변 마기(자동) 질문이 있으면 이 텍스트를
+    # 답변으로 매칭해 질문+답변 전문을 보존한다(기존 안내메시지는 그대로 유지).
+    try:
+        recent_q = await sb_select("magi_task_events", {
+            "event_type": "eq.ARCHITECT_QUESTION_SENT",
+            "order": "created_at.desc", "limit": "1"
+        })
+        if recent_q:
+            q = recent_q[0]
+            answered = await sb_select("magi_task_events", {
+                "task_id": f"eq.{q['task_id']}", "event_type": "eq.ARCHITECT_QUESTION_ANSWERED",
+                "created_at": f"gte.{q['created_at']}", "limit": "1"
+            })
+            if not answered:
+                await sb_insert("magi_task_events", {
+                    "task_id": q["task_id"], "event_type": "ARCHITECT_QUESTION_ANSWERED", "actor": "대표님",
+                    "detail": f"질문: {(q.get('detail') or '')[:300]}\n답변: {text[:500]}"
+                })
+    except Exception as e:
+        logger.error(f"질문-답변 매칭 실패: {e}")
 
     # 미인식
     await update.message.reply_text("❓ 명령어를 인식하지 못했습니다. /help 로 확인해주세요.")
