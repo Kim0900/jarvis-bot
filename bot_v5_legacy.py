@@ -4259,6 +4259,25 @@ async def run_magi_auto_review_once():
     evid_rows = await sb_select("evidence_registry", {"task_id": f"eq.{task_id}", "order": "evidence_id.desc", "limit": "1"})
     evid = evid_rows[0] if evid_rows else {}
 
+    # task#68(2026-08-27): agent_rules의 Golden Test를 실제로 프롬프트에 연결.
+    # target_task_type이 이 태스크의 task_type과 일치하거나 NULL(전체적용)인
+    # rule_type='GOLDEN_TEST' 규칙을 조회 — 문서화만 하지 말라는 지시 반영.
+    try:
+        golden_tests = await sb_select("agent_rules", {
+            "rule_type": "eq.GOLDEN_TEST",
+            "or": f"(target_task_type.eq.{task.get('task_type','SIMPLE')},target_task_type.is.null)"
+        })
+    except Exception as e:
+        logger.error(f"agent_rules(Golden Test) 조회 실패: {e}")
+        golden_tests = []
+    golden_test_block = ""
+    if golden_tests:
+        gt_lines = "\n".join(f"- {g.get('rule_content','')}" for g in golden_tests)
+        golden_test_block = (
+            f"\n\n⚠️ Golden Test(반드시 통과해야 자동승인 가능, agent_rules 실데이터):\n{gt_lines}\n"
+            "이 중 하나라도 통과 못 하면 approve_task를 호출하지 말고 반드시 escalate_to_architect를 호출할 것."
+        )
+
     messages = [{"role": "user", "content": (
         f"태스크#{task_id}: {task.get('title','')}\n"
         f"task_type: {task.get('task_type','미지정')}\n"
@@ -4266,6 +4285,7 @@ async def run_magi_auto_review_once():
         f"문제: {task.get('problem','') or '(없음)'}\n목표: {task.get('target','') or '(없음)'}\n"
         f"완료보고(notes): {task.get('notes','') or '(없음)'}\n"
         f"evidence_registry 최신건: {json.dumps(evid, ensure_ascii=False, default=str)[:2000]}"
+        f"{golden_test_block}"
     )}]
 
     await sb_insert("magi_task_events", {
