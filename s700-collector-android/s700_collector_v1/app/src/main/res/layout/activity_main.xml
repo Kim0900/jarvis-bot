@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="vertical" android:padding="24dp"
+    android:layout_width="match_parent" android:layout_height="match_parent">
+    <TextView android:id="@+id/status" android:text="S700 Collector 준비" android:textSize="20sp"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <Button android:id="@+id/startButton" android:text="수집 시작"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <Button android:id="@+id/stopButton" android:text="수집 중지"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <TextView android:text="로그: Android/data/com.example.s700collector/files/S700/"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+</LinearLayout>
