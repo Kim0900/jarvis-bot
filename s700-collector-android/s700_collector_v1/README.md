@@ -19,3 +19,4 @@ Android/data/com.example.s700collector/files/S700/s700_YYYYMMDD.jsonl
 4. app/build/outputs/apk/debug/app-debug.apk 설치
 
 <!-- build trigger 1787861342 -->
+<!-- retry 1787861549 -->
