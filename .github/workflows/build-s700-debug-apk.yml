@@ -31,7 +31,7 @@ jobs:
         working-directory: s700-collector-android/s700_collector_v1
         continue-on-error: true
         run: |
-          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
+          gradle clean assembleDebug --no-daemon --stacktrace --rerun-tasks 2>&1 | tee /tmp/build.log
           echo "===FIND APK===" | tee -a /tmp/build.log
           find . -name "*.apk" 2>&1 | tee -a /tmp/build.log
           echo "===FIND BUILD DIR===" | tee -a /tmp/build.log
