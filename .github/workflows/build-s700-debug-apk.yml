@@ -47,6 +47,17 @@ jobs:
           git commit -m "CI: save build log [skip ci]" || echo "nothing to commit"
           git push
 
+      - name: Commit APK to repo (on success)
+        if: steps.build.outcome == 'success'
+        run: |
+          mkdir -p build-artifacts
+          cp s700-collector-android/s700_collector_v1/app/build/outputs/apk/debug/app-debug.apk build-artifacts/s700-collector-app-debug.apk
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build-artifacts/s700-collector-app-debug.apk
+          git commit -m "CI: publish debug APK [skip ci]" || echo "nothing to commit"
+          git push
+
       - name: Upload Debug APK artifact
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
