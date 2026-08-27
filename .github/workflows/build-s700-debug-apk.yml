@@ -6,12 +6,12 @@ on:
     paths:
       - 's700-collector-android/**'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: s700-collector-android/s700_collector_v1
     steps:
       - uses: actions/checkout@v4
 
@@ -27,20 +27,30 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        id: build
+        working-directory: s700-collector-android/s700_collector_v1
+        continue-on-error: true
+        run: gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
+
+      - name: Save build log to repo on failure
+        if: steps.build.outcome == 'failure'
+        run: |
+          mkdir -p build-logs
+          cp /tmp/build.log "build-logs/latest-build-log.txt"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build-logs/latest-build-log.txt
+          git commit -m "CI: save build failure log [skip ci]" || echo "nothing to commit"
+          git push
 
       - name: Upload Debug APK artifact
-        if: always()
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: s700-collector-debug-apk
           path: s700-collector-android/s700_collector_v1/app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
 
-      - name: Upload build logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            s700-collector-android/s700_collector_v1/**/build/reports/**
+      - name: Fail job if build failed
+        if: steps.build.outcome == 'failure'
+        run: exit 1
