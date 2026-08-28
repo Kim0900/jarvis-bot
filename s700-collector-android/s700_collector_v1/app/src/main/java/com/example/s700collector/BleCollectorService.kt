@@ -30,6 +30,17 @@ class BleCollectorService : Service() {
     private var scanning = false
     private val frameBuffer = mutableListOf<Byte>()
     private var inFrame = false
+    // CASPER 조사(2026-08-29): onCharacteristicChanged가 레거시(2-param)/신규
+    // (3-param, ByteArray) 두 오버로드로 구현돼 있는데, 일부 기기/OS 조합에서
+    // 동일 notify 이벤트에 대해 시스템이 둘 다 호출하는 사례가 보고되어 있음.
+    // frameBuffer가 동기화 없는 단일 공유 버퍼라, 두 콜백이 겹쳐 실행되면
+    // 서로 다른 청크의 바이트가 뒤섞여 저장되는 것을 실제 로그(§5 손상사례)
+    // 재현분석으로 확인 — bufferLock으로 handleChunk 실행을 직렬화.
+    private val bufferLock = Any()
+    // 완전동일 프레임 반복(§7 중복notify)에 대한 dedup — raw notify_chunk
+    // 로깅(append 첫줄)은 dedup 없이 원본 그대로 전부 보존, "frame"(파싱결과)
+    // 레코드에만 적용.
+    private var lastSavedFrameHex: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -115,26 +126,32 @@ class BleCollectorService : Service() {
     }
 
     private fun handleChunk(bytes: ByteArray) {
+        // raw notify_chunk 로깅은 원본 그대로, dedup/락 없이 전부 보존(절대원칙 §14)
         append("""{"type":"notify_chunk","received_at":"${now()}","hex":"${bytes.hex()}"}""")
-        for (b in bytes) {
-            val u = b.toInt() and 0xff
-            if (u == 0x02) { frameBuffer.clear(); frameBuffer.add(b); inFrame = true }
-            else if (inFrame) frameBuffer.add(b)
-            if (inFrame && u == 0x03) {
-                val frame = ByteArray(frameBuffer.size) { frameBuffer[it] }
-                saveFrame(frame)
-                frameBuffer.clear()
-                inFrame = false
+        synchronized(bufferLock) {
+            for (b in bytes) {
+                val u = b.toInt() and 0xff
+                if (u == 0x02) { frameBuffer.clear(); frameBuffer.add(b); inFrame = true }
+                else if (inFrame) frameBuffer.add(b)
+                if (inFrame && u == 0x03) {
+                    val frame = ByteArray(frameBuffer.size) { frameBuffer[it] }
+                    saveFrame(frame)
+                    frameBuffer.clear()
+                    inFrame = false
+                }
             }
         }
     }
 
     private fun saveFrame(frame: ByteArray) {
+        val hexFull = frame.hex()
+        if (hexFull == lastSavedFrameHex) return  // 완전동일 프레임(§7 중복notify) 저장 스킵
+        lastSavedFrameHex = hexFull
         val start = if (frame.firstOrNull()?.toInt() == 0x02) 1 else 0
         val end = if (frame.lastOrNull()?.toInt() == 0x03) frame.size - 1 else frame.size
         val ascii = frame.copyOfRange(start, end).toString(Charsets.US_ASCII).replace("\"", "\\\"")
         val meterTime = Regex("""^(\d{12})""").find(ascii)?.groupValues?.get(1)
-        append("""{"type":"frame","received_at":"${now()}","meter_time_raw":${meterTime?.let { "\"$it\"" } ?: "null"},"ascii":"$ascii","hex":"${frame.hex()}"}""")
+        append("""{"type":"frame","received_at":"${now()}","meter_time_raw":${meterTime?.let { "\"$it\"" } ?: "null"},"ascii":"$ascii","hex":"$hexFull"}""")
     }
 
     private fun append(line: String) {
