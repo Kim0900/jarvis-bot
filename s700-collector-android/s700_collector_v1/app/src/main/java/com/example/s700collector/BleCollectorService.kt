@@ -42,10 +42,32 @@ class BleCollectorService : Service() {
     // 레코드에만 적용.
     private var lastSavedFrameHex: String? = null
 
+    // CASPER v2(2026-08-29): Health Monitor — payload length histogram.
+    // "98자가 S700 전체 protocol의 고정길이"라는 전제가 실측(44/54자)과
+    // 안맞았던 사고 재발방지용 핵심 진단자료(§17). 실제 payload 길이
+    // 분포가 쌓여야 Decoder/checksum 구조를 안전하게 확정할 수 있음.
+    private val payloadLengthHistogram = mutableMapOf<Int, Int>()
+    private var notifyCount = 0
+    private var packetCount = 0
+    private var longBusinessFrameCount = 0
+    private var shortFrameCount = 0
+    private var checksumPassCount = 0
+    private var checksumFailCount = 0
+    private val LONG_BUSINESS_FRAME_LENGTH = 98  // 현재까지 관측된 후보값, 확정 아님(v2 §0 정정)
+
+    private val healthHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val healthRunnable = object : Runnable {
+        override fun run() {
+            logHealthSnapshot()
+            healthHandler.postDelayed(this, 180_000L)  // 3분마다
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         mgr.createNotificationChannel(NotificationChannel(CHANNEL_ID, "S700 Collector", NotificationManager.IMPORTANCE_LOW))
+        healthHandler.postDelayed(healthRunnable, 180_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -127,6 +149,7 @@ class BleCollectorService : Service() {
 
     private fun handleChunk(bytes: ByteArray) {
         // raw notify_chunk 로깅은 원본 그대로, dedup/락 없이 전부 보존(절대원칙 §14)
+        notifyCount++
         append("""{"type":"notify_chunk","received_at":"${now()}","hex":"${bytes.hex()}"}""")
         synchronized(bufferLock) {
             for (b in bytes) {
@@ -144,6 +167,7 @@ class BleCollectorService : Service() {
     }
 
     private fun saveFrame(frame: ByteArray) {
+        packetCount++
         val hexFull = frame.hex()
         if (hexFull == lastSavedFrameHex) return  // 완전동일 프레임(§7 중복notify) 저장 스킵
         lastSavedFrameHex = hexFull
@@ -151,7 +175,53 @@ class BleCollectorService : Service() {
         val end = if (frame.lastOrNull()?.toInt() == 0x03) frame.size - 1 else frame.size
         val ascii = frame.copyOfRange(start, end).toString(Charsets.US_ASCII).replace("\"", "\\\"")
         val meterTime = Regex("""^(\d{12})""").find(ascii)?.groupValues?.get(1)
-        append("""{"type":"frame","received_at":"${now()}","meter_time_raw":${meterTime?.let { "\"$it\"" } ?: "null"},"ascii":"$ascii","hex":"$hexFull"}""")
+
+        // CASPER v2(2026-08-29) Protocol Classifier — §3. "98자 = 전체 protocol
+        // 고정길이"라는 이전 전제가 실측(44/54자)과 안맞았던 것이 확인되어,
+        // 이제는 길이로 "분류"만 하고(폐기하지 않음), LONG_BUSINESS_FRAME으로
+        // 분류된 것에 한해서만 checksum을 "시도"하되 Trip 생성 등 확정처리는
+        // 하지 않음(다음 실기기 로그로 PASS율 실측 후 Decoder/Trip 단계 진행).
+        val payloadLength = ascii.length
+        val frameClass = if (payloadLength == LONG_BUSINESS_FRAME_LENGTH) "LONG_BUSINESS_FRAME" else "SHORT_FRAME"
+        payloadLengthHistogram[payloadLength] = (payloadLengthHistogram[payloadLength] ?: 0) + 1
+        if (frameClass == "LONG_BUSINESS_FRAME") longBusinessFrameCount++ else shortFrameCount++
+
+        var checksumReceived: String? = null
+        var checksumCalculated: String? = null
+        var checksumValid: Boolean? = null
+        if (frameClass == "LONG_BUSINESS_FRAME") {
+            try {
+                val sum = ascii.substring(0, 96).toByteArray(Charsets.US_ASCII).sumOf { it.toInt() and 0xFF }
+                val calculated = (-sum) and 0xFF
+                val received = ascii.substring(96, 98).toInt(16)
+                checksumCalculated = "%02X".format(calculated)
+                checksumReceived = "%02X".format(received)
+                checksumValid = calculated == received
+                if (checksumValid == true) checksumPassCount++ else checksumFailCount++
+            } catch (e: Exception) {
+                meta("checksum_calc_error", e.message ?: "unknown")
+            }
+        }
+
+        append(
+            """{"type":"frame","received_at":"${now()}","meter_time_raw":${meterTime?.let { "\"$it\"" } ?: "null"},""" +
+            """"ascii":"$ascii","hex":"$hexFull","payload_length":$payloadLength,"frame_class":"$frameClass",""" +
+            """"checksum_received":${checksumReceived?.let { "\"$it\"" } ?: "null"},""" +
+            """"checksum_calculated":${checksumCalculated?.let { "\"$it\"" } ?: "null"},""" +
+            """"checksum_valid":${checksumValid ?: "null"},"decoder_version":"s700-classifier-v0.2"}"""
+        )
+    }
+
+    // CASPER v2(2026-08-29) Health Monitor §17 — payload length histogram을
+    // 주기적으로 meta 레코드로 남김(진단용, 3분마다).
+    private fun logHealthSnapshot() {
+        val histJson = payloadLengthHistogram.entries.joinToString(",") { "\"${it.key}\":${it.value}" }
+        append(
+            """{"type":"health","received_at":"${now()}","notify_count":$notifyCount,"packet_count":$packetCount,""" +
+            """"long_business_frame_count":$longBusinessFrameCount,"short_frame_count":$shortFrameCount,""" +
+            """"checksum_pass_count":$checksumPassCount,"checksum_fail_count":$checksumFailCount,""" +
+            """"payload_length_histogram":{$histJson}}"""
+        )
     }
 
     private fun append(line: String) {
@@ -177,6 +247,8 @@ class BleCollectorService : Service() {
     }
 
     private fun cleanup() {
+        healthHandler.removeCallbacks(healthRunnable)
+        logHealthSnapshot()
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED)
             adapter.bluetoothLeScanner?.stopScan(scanCallback)
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
