@@ -4025,7 +4025,15 @@ async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
 async def run_haiku_orchestration_once():
     """task#40: ASSIGNED+캐스퍼+SIMPLE 태스크 1건을 찾아 Haiku로 처리 시도.
     최대 10회 tool호출 제한(무한루프방지). 완료시 evidence_registry에 PENDING
-    등록(자동승인 없음), 매 tool호출마다 record_event로 즉시기록(중단복구용)."""
+    등록(자동승인 없음), 매 tool호출마다 record_event로 즉시기록(중단복구용).
+
+    task#78(2026-08-29) 긴급수정: 기존엔 실패해도 status/재시도횟수가
+    전혀 안바뀌어서, 실패하는 태스크(task#68, Anthropic/Gemini 문제로
+    2일6시간 300회+ 반복)가 큐(created_at asc, 1건만) 맨앞을 영원히
+    점유 — 뒤에 있는 새 태스크(task#76/78)가 단 한번도 픽업기회를
+    못 받는 버그를 실증확인. orch_attempts 카운터+임계값(5회) 초과시
+    큐이탈+텔레그램알림으로 재발방지."""
+    ORCH_MAX_ATTEMPTS = 5
     try:
         rows = await sb_select("magi_tasks", {
             "status": "eq.ASSIGNED", "owner_agent": "eq.캐스퍼", "task_type": "eq.SIMPLE",
@@ -4038,6 +4046,7 @@ async def run_haiku_orchestration_once():
         return None
     task = rows[0]
     task_id = task["task_id"]
+    prior_attempts = task.get("orch_attempts") or 0
 
     if not ANTHROPIC_API_KEY:
         logger.error("Haiku오케스트레이션 - ANTHROPIC_API_KEY 없음")
@@ -4051,7 +4060,7 @@ async def run_haiku_orchestration_once():
 
     await sb_insert("magi_task_events", {
         "task_id": task_id, "event_type": "TASK_UPDATED", "actor": "캐스퍼(Haiku자동)",
-        "detail": "Haiku 자동오케스트레이션 착수"
+        "detail": f"Haiku 자동오케스트레이션 착수(시도 {prior_attempts + 1}/{ORCH_MAX_ATTEMPTS})"
     })
 
     final_summary = None
@@ -4090,7 +4099,27 @@ async def run_haiku_orchestration_once():
         })
         logger.info(f"Haiku오케스트레이션 완료(task#{task_id}): {final_summary[:100]}")
     else:
-        logger.warning(f"Haiku오케스트레이션 미완료(task#{task_id}) — 다음 폴링에서 재시도(진행상황은 이벤트로 남음)")
+        new_attempts = prior_attempts + 1
+        if new_attempts >= ORCH_MAX_ATTEMPTS:
+            # task#78 핵심수정: 임계값 초과시 큐에서 이탈시켜 뒤에 대기중인
+            # 다른 SIMPLE태스크가 픽업기회를 받도록 함(무한정체 방지)
+            await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                       json={"status": "VERIFICATION", "orch_attempts": new_attempts, "verified_by": "캐스퍼(Haiku자동)_MAX_RETRY",
+                             "verified_at": datetime.now(KST).isoformat(), "updated_at": datetime.now(KST).isoformat()},
+                       headers={**HEADERS_SB, "Prefer": "return=minimal"})
+            try:
+                await send_telegram_broadcast(
+                    f"⚠️ task#{task_id}({task.get('title','')}) 자동처리 {ORCH_MAX_ATTEMPTS}회 실패 — "
+                    f"큐 정체방지로 자동제외됨, 사람 확인 필요"
+                )
+            except Exception as e:
+                logger.error(f"task#{task_id} 재시도한도 알림 발송 실패: {e}")
+            logger.warning(f"Haiku오케스트레이션(task#{task_id}) 재시도한도({ORCH_MAX_ATTEMPTS}) 도달 — 큐이탈")
+        else:
+            await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                       json={"orch_attempts": new_attempts, "updated_at": datetime.now(KST).isoformat()},
+                       headers={**HEADERS_SB, "Prefer": "return=minimal"})
+            logger.warning(f"Haiku오케스트레이션 미완료(task#{task_id}, {new_attempts}/{ORCH_MAX_ATTEMPTS}) — 다음 폴링에서 재시도")
 
 
 # ──────────────────────────────────────────────
