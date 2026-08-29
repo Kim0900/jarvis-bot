@@ -346,6 +346,69 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         return
 
     def fish_scheduler(app: Any) -> None:
+        # CASPER 긴급수정(2026-08-29): 기존엔 "정각 브리핑을 AI작업보다 먼저
+        # 실행"하는 순서만 있었는데, 이건 "같은 루프 반복 안에서의 순서"만
+        # 해결할 뿐 — 이전 반복에서 Anthropic크레딧소진+Gemini rate limit
+        # 재시도(로그실증: 40~60초씩 반복)로 블로킹되면, 다음 반복 자체가
+        # 늦게 돌아서 00~02시 정각윈도우를 통째로 놓치는 게 재발함(대표님
+        # 8/29 지적, 8/28밤 로그로 확정). 근본해결: 브리핑(가벼움, AI호출
+        # 없음)을 완전히 별도스레드로 분리해 AI작업 블로킹의 영향을 원천
+        # 차단. 기존 로직/필드 하나도 안 지우고 그대로 옮김.
+        import threading as _threading
+
+        def briefing_loop() -> None:
+            b_loop = legacy.asyncio.new_event_loop()
+            legacy.asyncio.set_event_loop(b_loop)
+            # app.bot(python-telegram-bot Application의 공유객체)을 별도스레드의
+            # 별도 이벤트루프에서 함께 쓰면 스레드안전성 위험이 있어, 이미
+            # task#52에서 검증된 독립함수(매번 자체 Bot(token=...)인스턴스 생성)
+            # 를 재사용 — app 파라미터 자체가 이제 불필요.
+
+            sent_hour_keys: set[str] = set()
+            sent_start_brief_key: str | None = None
+            last_reset_day = -1
+
+            while True:
+                try:
+                    now = legacy.datetime.now(legacy.KST)
+                    hour_key = f"{now.date()}:{now.hour:02d}"
+
+                    if now.hour == 18 and now.minute == 50 and sent_start_brief_key != str(now.date()):
+                        try:
+                            report = b_loop.run_until_complete(legacy.get_fish_report_db(hour=19)) or "데이터 없음"
+                            b_loop.run_until_complete(legacy.send_telegram_broadcast(f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"))
+                            sent_start_brief_key = str(now.date())
+                            legacy.logger.info("18:50 영업준비 브리핑 발송")
+                        except Exception as exc:
+                            legacy.logger.error(f"18:50 영업준비 브리핑 오류: {exc}")
+
+                    if now.minute < 3 and hour_key not in sent_hour_keys:
+                        in_service = (19 <= now.hour <= 23) or (0 <= now.hour <= 2)
+                        if in_service:
+                            try:
+                                report = b_loop.run_until_complete(legacy.get_fish_report_db())
+                                if report:
+                                    b_loop.run_until_complete(legacy.send_telegram_broadcast(report))
+                                    legacy.logger.info(f"어군 브리핑 발송: {now.hour}시")
+                            except Exception as exc:
+                                legacy.logger.error(f"{now.hour}시 정각 브리핑 오류: {exc}")
+                            finally:
+                                sent_hour_keys.add(hour_key)
+
+                    if now.hour == 3 and now.day != last_reset_day:
+                        sent_start_brief_key = None
+                        sent_hour_keys = {key for key in sent_hour_keys if not key.startswith(str(now.date()))}
+                        last_reset_day = now.day
+                        legacy.logger.info("어군 스케줄러 일간 리셋")
+
+                except Exception as exc:
+                    legacy.logger.error(f"briefing_loop 최외곽 예외 포착(스레드 생존): {exc}")
+
+                time.sleep(20)
+
+        _threading.Thread(target=briefing_loop, name="fish-briefing-only", daemon=True).start()
+        legacy.logger.info("어군브리핑 전용 스레드 분리·시작(AI작업 블로킹 영향 차단)")
+
         loop = legacy.asyncio.new_event_loop()
         legacy.asyncio.set_event_loop(loop)
 
@@ -363,8 +426,6 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                 except Exception as exc:
                     legacy.logger.error(f"어군 브리핑 발송 오류 ({cid}): {exc}")
 
-        sent_hour_keys: set[str] = set()
-        sent_start_brief_key: str | None = None
         last_reset_day = -1
         last_recalc_day = -1
         last_dualverify_day = -1
@@ -380,30 +441,9 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         while True:
             try:
                 now = legacy.datetime.now(legacy.KST)
-                hour_key = f"{now.date()}:{now.hour:02d}"
 
-                if now.hour == 18 and now.minute == 50 and sent_start_brief_key != str(now.date()):
-                    try:
-                        report = loop.run_until_complete(legacy.get_fish_report_db(hour=19)) or "데이터 없음"
-                        loop.run_until_complete(send_all(f"🚀 영업준비 브리핑 (10분 후 출발)\n\n{report}"))
-                        sent_start_brief_key = str(now.date())
-                        legacy.logger.info("18:50 영업준비 브리핑 발송")
-                    except Exception as exc:
-                        legacy.logger.error(f"18:50 영업준비 브리핑 오류: {exc}")
-
-                # Dispatch must run before long AI jobs. Haiku/Gemini retries can block past minute 0.
-                if now.minute < 3 and hour_key not in sent_hour_keys:
-                    in_service = (19 <= now.hour <= 23) or (0 <= now.hour <= 2)
-                    if in_service:
-                        try:
-                            report = loop.run_until_complete(legacy.get_fish_report_db())
-                            if report:
-                                loop.run_until_complete(send_all(report))
-                                legacy.logger.info(f"어군 브리핑 발송: {now.hour}시")
-                        except Exception as exc:
-                            legacy.logger.error(f"{now.hour}시 정각 브리핑 오류: {exc}")
-                        finally:
-                            sent_hour_keys.add(hour_key)
+                # 정각/18:50 브리핑은 briefing_loop(별도스레드)로 완전이관됨(2026-08-29).
+                # 여기서는 AI작업(Haiku/마기자동검증)과 04시/08시/03시 작업만 담당.
 
                 if time.time() - last_orch_run_ts >= 300:
                     last_orch_run_ts = time.time()
@@ -472,11 +512,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                     except Exception as exc:
                         legacy.logger.error(f"7일평균 이중검증 실행 오류: {exc}")
 
-                if now.hour == 3 and now.day != last_reset_day:
-                    sent_start_brief_key = None
-                    sent_hour_keys = {key for key in sent_hour_keys if not key.startswith(str(now.date()))}
-                    last_reset_day = now.day
-                    legacy.logger.info("어군 스케줄러 일간 리셋")
+                # 03시 리셋도 briefing_loop(별도스레드)로 이관됨(2026-08-29).
 
                 if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
                     try:
