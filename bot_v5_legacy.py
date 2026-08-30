@@ -1192,6 +1192,11 @@ async def process_daily_history(update, image_bytes: bytes):
             "비고":     비고,
             "data_source": "app_ocr_individual",
         }
+        _valid, _reason = validate_call_payload(payload)
+        if not _valid:
+            payload["raw_row_type"] = "unclassified"
+            payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {_reason}]"
+            logger.warning(f"raw_calls Rule Validation 실패(일별운행이력): {_reason}")
         result = await sb_insert("raw_calls", payload)
         if result:
             saved += 1
@@ -2224,6 +2229,62 @@ async def cross_check(date_str: str) -> str:
     return "\n".join(lines_out)
 
 
+async def auto_cross_check_recent_days(days_back: int = 3) -> str:
+    """task#76(2026-08-30): 콜카드↔결제내역 교차대조가 완전수동("대조 YYYY-MM-DD"
+    사용자입력 필요)이던 것을 자동화. 최근 N일 중 raw_calls·payment_receipts가
+    둘 다 있고 cross_check_status에 기록 없는 날짜만 자동으로 cross_check() 실행.
+    기존 수동 "대조" 명령어와 중복실행 방지를 위해 cross_check_status 테이블에
+    처리완료 날짜를 기록(같은 날짜 재실행 안 함, 수동 재실행은 여전히 가능)."""
+    from datetime import date as _date, timedelta as _td
+    today = datetime.now(KST).date()
+    results = []
+    for i in range(1, days_back + 1):
+        target_date = str(today - _td(days=i))
+        try:
+            already = await sb_select("cross_check_status", {"날짜": f"eq.{target_date}", "limit": "1"})
+            if already:
+                continue
+            calls = await sb_select_calls({"날짜": f"eq.{target_date}"})
+            receipts = await sb_select("payment_receipts", {"날짜": f"eq.{target_date}", "limit": "1"})
+            if not calls or not receipts:
+                continue
+            summary = await cross_check(target_date)
+            await sb_insert("cross_check_status", {"날짜": target_date, "trigger_type": "auto"})
+            results.append(f"[{target_date}]\n{summary}")
+            logger.info(f"자동교차대조 완료: {target_date}")
+        except Exception as e:
+            logger.error(f"자동교차대조 오류({target_date}): {e}")
+    return "\n\n".join(results) if results else ""
+
+
+def validate_call_payload(payload: dict) -> tuple:
+    """task#76: raw_calls 저장 직전 최소 Rule Validation. 정형 검증 가능한
+    항목(배차≤하차, 요금>=0)만 코드로 우선 처리 — MAGI_이미지파이프라인
+    §8 MINIMUM PATCH 반영. (False, 사유) 반환시 호출부가 raw_row_type을
+    'unclassified'로 강제하고 비고에 사유를 남긴다."""
+    배차 = payload.get("배차시각")
+    하차 = payload.get("하차시각")
+    요금 = payload.get("요금")
+    if 배차 and 하차:
+        try:
+            bh, bm = map(int, str(배차).split(":"))
+            dh, dm = map(int, str(하차).split(":"))
+            b_min, d_min = bh * 60 + bm, dh * 60 + dm
+            if d_min < b_min - 60:  # 자정넘김 허용
+                d_min += 1440
+            if d_min < b_min:
+                return False, f"하차시각({하차})이 배차시각({배차})보다 이름"
+        except Exception:
+            pass
+    if 요금 is not None:
+        try:
+            if int(요금) < 0:
+                return False, f"요금이 음수({요금})"
+        except Exception:
+            pass
+    return True, ""
+
+
 async def confirm_baehoe_classification(date_str: str) -> str:
     """미매칭 콜카드를 배회영업으로 자동 분류 확정"""
     calls = await sb_select_calls( {"날짜": f"eq.{date_str}"})
@@ -2352,6 +2413,11 @@ async def process_call_card(update: Update, image_bytes: bytes):
         "비고": 비고,
         "data_source": "app_ocr_individual",
     }
+    _valid, _reason = validate_call_payload(payload)
+    if not _valid:
+        payload["raw_row_type"] = "unclassified"
+        payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {_reason}]"
+        logger.warning(f"raw_calls Rule Validation 실패(콜카드): {_reason}")
     result = await sb_insert("raw_calls", payload)
     if result:
         if is_direct:
