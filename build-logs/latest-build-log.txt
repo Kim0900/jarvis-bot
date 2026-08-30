@@ -29,11 +29,11 @@ to this project's gradle.properties.
 > Task :app:createDebugCompatibleScreenManifests
 > Task :app:extractDeepLinksDebug
 > Task :app:parseDebugLocalResources
-> Task :app:processDebugMainManifest
 > Task :app:mergeDebugResources
+> Task :app:processDebugMainManifest
 > Task :app:processDebugManifest
-> Task :app:processDebugManifestForPackage
 > Task :app:javaPreCompileDebug
+> Task :app:processDebugManifestForPackage
 > Task :app:mergeDebugShaders
 > Task :app:compileDebugShaders NO-SOURCE
 > Task :app:generateDebugAssets UP-TO-DATE
@@ -66,9 +66,9 @@ w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_co
 > Task :app:packageDebug
 > Task :app:createDebugApkListingFileRedirect
 > Task :app:assembleDebug
-gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/build-1788009751478.json
+gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/build-1788082069018.json
 
-BUILD SUCCESSFUL in 28s
+BUILD SUCCESSFUL in 23s
 35 actionable tasks: 34 executed, 1 up-to-date
 ===FIND APK===
 ./app/build/outputs/apk/debug/app-debug.apk
