@@ -189,6 +189,18 @@ class BleCollectorService : Service() {
         var checksumReceived: String? = null
         var checksumCalculated: String? = null
         var checksumValid: Boolean? = null
+        // CASPER Decoder(2026-08-30, 마기승인) — 실측검증(원본로그 실제분석,
+        // checksum 98.4% PASS, 필드매핑 22건중21건 영수증정확일치) 통과한
+        // 필드만 파싱. Trip Finalizer(요금확정 판단)는 마기지시대로 보류 —
+        // 여기서는 구조화된 값을 "보여주기"만 하고 raw_calls 등 확정저장은
+        // 하지 않음(로컬 JSONL 파싱결과 레코드로만 남김).
+        var meterFare: Int? = null
+        var tripStart: String? = null
+        var tripCloseFlag: String? = null
+        var primaryState: String? = null
+        var secondaryState: String? = null
+        var decodeWarning: String? = null
+
         if (frameClass == "LONG_BUSINESS_FRAME") {
             try {
                 val sum = ascii.substring(0, 96).toByteArray(Charsets.US_ASCII).sumOf { it.toInt() and 0xFF }
@@ -198,6 +210,26 @@ class BleCollectorService : Service() {
                 checksumReceived = "%02X".format(received)
                 checksumValid = calculated == received
                 if (checksumValid == true) checksumPassCount++ else checksumFailCount++
+
+                // checksum PASS인 것만 디코딩 시도(손상프레임 억지해석 방지)
+                if (checksumValid == true) {
+                    primaryState = ascii.substring(18, 20)
+                    secondaryState = ascii.substring(20, 22)
+                    meterFare = ascii.substring(22, 28).toIntOrNull()
+                    tripStart = ascii.substring(44, 56)
+                    tripCloseFlag = ascii.substring(82, 84)
+
+                    // 안전장치: checksum PASS해도 필드값 자체가 이상한 사례
+                    // (실측 3,003원 케이스: trip_start='002260082820', state=07/00)
+                    // 발견됨 — 관측된 정상 state 4종 외 값이면 경고 플래그.
+                    val knownStates = setOf("02/02", "0A/08", "04/04", "07/00")
+                    val stateKey = "$primaryState/$secondaryState"
+                    if (stateKey !in knownStates) {
+                        decodeWarning = "unknown_state($stateKey)"
+                    } else if (!Regex("""^\d{12}$""").matches(tripStart ?: "")) {
+                        decodeWarning = "invalid_trip_start_format"
+                    }
+                }
             } catch (e: Exception) {
                 meta("checksum_calc_error", e.message ?: "unknown")
             }
@@ -208,7 +240,14 @@ class BleCollectorService : Service() {
             """"ascii":"$ascii","hex":"$hexFull","payload_length":$payloadLength,"frame_class":"$frameClass",""" +
             """"checksum_received":${checksumReceived?.let { "\"$it\"" } ?: "null"},""" +
             """"checksum_calculated":${checksumCalculated?.let { "\"$it\"" } ?: "null"},""" +
-            """"checksum_valid":${checksumValid ?: "null"},"decoder_version":"s700-classifier-v0.2"}"""
+            """"checksum_valid":${checksumValid ?: "null"},""" +
+            """"meter_fare":${meterFare ?: "null"},""" +
+            """"trip_start":${tripStart?.let { "\"$it\"" } ?: "null"},""" +
+            """"trip_close_flag":${tripCloseFlag?.let { "\"$it\"" } ?: "null"},""" +
+            """"primary_state":${primaryState?.let { "\"$it\"" } ?: "null"},""" +
+            """"secondary_state":${secondaryState?.let { "\"$it\"" } ?: "null"},""" +
+            """"decode_warning":${decodeWarning?.let { "\"$it\"" } ?: "null"},""" +
+            """"decoder_version":"s700-decoder-v0.3"}"""
         )
     }
 
