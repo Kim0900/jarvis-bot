@@ -430,6 +430,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_recalc_day = -1
         last_dualverify_day = -1
         last_kpi7day = -1
+        last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
 
@@ -527,6 +528,18 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                     except Exception as exc:
                         legacy.logger.error(f"fish_hour_data_dow 일일 재계산 실패: {exc}")
                     last_recalc_day = now.day
+
+                # task#76(2026-08-30): 자동교차대조 - 콜카드/영수증 둘다있는
+                # 최근3일 날짜 자동감지, 사람이 매번 "대조 YYYY-MM-DD" 안 넣어도
+                # 됨. cross_check_status로 중복방지(기존수동명령어와 공존).
+                if now.hour == 4 and now.minute < 5 and now.day != last_crosscheck_day:
+                    try:
+                        summary = loop.run_until_complete(legacy.auto_cross_check_recent_days())
+                        if summary:
+                            legacy.logger.info(f"자동교차대조 완료:\n{summary[:500]}")
+                    except Exception as exc:
+                        legacy.logger.error(f"자동교차대조 스케줄 실행 실패: {exc}")
+                    last_crosscheck_day = now.day
 
             except Exception as exc:
                 legacy.logger.error(f"fish_scheduler 최외곽 예외 포착(스레드 생존): {exc}")
