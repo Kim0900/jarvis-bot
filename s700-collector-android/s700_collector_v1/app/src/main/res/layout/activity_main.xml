@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:orientation="vertical" android:padding="24dp"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent" android:layout_height="match_parent">
+<LinearLayout
+    android:orientation="vertical" android:padding="24dp"
+    android:layout_width="match_parent" android:layout_height="wrap_content">
     <TextView android:id="@+id/status" android:text="S700 Collector 준비" android:textSize="20sp"
         android:layout_width="match_parent" android:layout_height="wrap_content"/>
     <Button android:id="@+id/startButton" android:text="수집 시작"
@@ -9,5 +11,25 @@
     <Button android:id="@+id/stopButton" android:text="수집 중지"
         android:layout_width="match_parent" android:layout_height="wrap_content"/>
     <TextView android:text="로그: Android/data/com.example.s700collector/files/S700/"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:paddingTop="8dp"/>
+
+    <!-- CASPER 대시보드(2026-08-31, 대표님요청): 수집상태/에러여부 실시간표시 -->
+    <View android:layout_width="match_parent" android:layout_height="1dp"
+        android:background="#CCCCCC" android:layout_marginTop="16dp" android:layout_marginBottom="16dp"/>
+    <TextView android:text="대시보드" android:textSize="18sp" android:textStyle="bold"
         android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <TextView android:id="@+id/dashLastReceived" android:text="마지막 수신: -"
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+    <TextView android:id="@+id/dashCounts" android:text="수신 0건 / 프레임 0건"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <TextView android:id="@+id/dashChecksum" android:text="checksum PASS 0 / FAIL 0"
+        android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    <TextView android:id="@+id/dashTrip" android:text="확정 Trip 0건 / 0원 / 0.00km"
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:textStyle="bold"/>
+    <TextView android:text="최근 Trip" android:textSize="14sp" android:textStyle="bold"
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+    <TextView android:id="@+id/dashRecentTrips" android:text="(없음)"
+        android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp"/>
 </LinearLayout>
+</ScrollView>
