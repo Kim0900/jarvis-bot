@@ -28,24 +28,24 @@ to this project's gradle.properties.
 > Task :app:packageDebugResources
 > Task :app:createDebugCompatibleScreenManifests
 > Task :app:extractDeepLinksDebug
-> Task :app:parseDebugLocalResources
 > Task :app:mergeDebugResources
+> Task :app:parseDebugLocalResources
 > Task :app:processDebugMainManifest
 > Task :app:processDebugManifest
 > Task :app:javaPreCompileDebug
-> Task :app:processDebugManifestForPackage
 > Task :app:mergeDebugShaders
 > Task :app:compileDebugShaders NO-SOURCE
 > Task :app:generateDebugAssets UP-TO-DATE
 > Task :app:mergeDebugAssets
 > Task :app:compressDebugAssets
 > Task :app:desugarDebugFileDependencies
+> Task :app:processDebugManifestForPackage
+> Task :app:checkDebugDuplicateClasses
 > Task :app:mergeDebugStartupProfile
 > Task :app:mergeDebugJniLibFolders
-> Task :app:checkDebugDuplicateClasses
+> Task :app:mergeLibDexDebug
 > Task :app:mergeDebugNativeLibs NO-SOURCE
 > Task :app:stripDebugDebugSymbols NO-SOURCE
-> Task :app:mergeLibDexDebug
 > Task :app:processDebugResources
 > Task :app:validateSigningDebug
 > Task :app:writeDebugAppMetadata
@@ -53,9 +53,9 @@ to this project's gradle.properties.
 > Task :app:mergeExtDexDebug
 
 > Task :app:compileDebugKotlin
-w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:134:22 'var value: ByteArray!' is deprecated. Deprecated in Java.
-w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:135:19 '@Deprecated(...) fun writeDescriptor(p0: BluetoothGattDescriptor!): Boolean' is deprecated. Deprecated in Java.
-w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:142:40 'var value: ByteArray!' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:157:22 'var value: ByteArray!' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:158:19 '@Deprecated(...) fun writeDescriptor(p0: BluetoothGattDescriptor!): Boolean' is deprecated. Deprecated in Java.
+w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_collector_v1/app/src/main/java/com/example/s700collector/BleCollectorService.kt:165:40 'var value: ByteArray!' is deprecated. Deprecated in Java.
 
 > Task :app:compileDebugJavaWithJavac NO-SOURCE
 > Task :app:dexBuilderDebug
@@ -66,9 +66,9 @@ w: file:///home/runner/work/jarvis-bot/jarvis-bot/s700-collector-android/s700_co
 > Task :app:packageDebug
 > Task :app:createDebugApkListingFileRedirect
 > Task :app:assembleDebug
-gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/build-1788082069018.json
+gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/build-1788154251097.json
 
-BUILD SUCCESSFUL in 23s
+BUILD SUCCESSFUL in 28s
 35 actionable tasks: 34 executed, 1 up-to-date
 ===FIND APK===
 ./app/build/outputs/apk/debug/app-debug.apk
