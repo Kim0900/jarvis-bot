@@ -55,6 +55,29 @@ class BleCollectorService : Service() {
     private var checksumFailCount = 0
     private val LONG_BUSINESS_FRAME_LENGTH = 98  // 현재까지 관측된 후보값, 확정 아님(v2 §0 정정)
 
+    // CASPER Trip Finalizer(2026-08-31, Golden Day 검증 PASS 후 반영) — §5.
+    // trip_start별로 최신 checksum-PASS 레코드를 추적하다, CLOSED variant를
+    // 만나면 확정 Trip으로 기록. Golden Day(8/30~31) replay로 14건/131,200원/
+    // 78.374km/2:28:37 전부 정확 일치 실증(파이썬 재현검증) 완료.
+    data class TripSnapshot(
+        val fare: Int, val tripEnd: String, val distanceRaw: Int,
+        val fareCopy: Int, val primaryState: String, val secondaryState: String, val auxFlag: String
+    )
+    private val tripLatest = mutableMapOf<String, TripSnapshot>()
+    private val closedTripStarts = mutableSetOf<String>()
+    // CLOSED variant: (primaryState, secondaryState, auxFlag). 기존 0A08/01,
+    // 0C08/01에 더해 Golden Day에서 검증된 1A08/51(시외 후보, §4.2 - 개별
+    // 필드의미는 표본1건이라 확정 안 함, aux값 자체가 정상종료신호라는 것만 확정) 추가.
+    private val CLOSED_VARIANTS = setOf(
+        Triple("0A", "08", "01"),
+        Triple("0C", "08", "01"),
+        Triple("1A", "08", "51")
+    )
+    private var tripCount = 0
+    private var tripFareSum = 0L
+    private var tripDistanceSumRaw = 0L
+    private val recentTrips = ArrayDeque<String>()  // 대시보드 표시용, 최근 5건
+
     private val healthHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val healthRunnable = object : Runnable {
         override fun run() {
@@ -189,17 +212,19 @@ class BleCollectorService : Service() {
         var checksumReceived: String? = null
         var checksumCalculated: String? = null
         var checksumValid: Boolean? = null
-        // CASPER Decoder(2026-08-30, 마기승인) — 실측검증(원본로그 실제분석,
-        // checksum 98.4% PASS, 필드매핑 22건중21건 영수증정확일치) 통과한
-        // 필드만 파싱. Trip Finalizer(요금확정 판단)는 마기지시대로 보류 —
-        // 여기서는 구조화된 값을 "보여주기"만 하고 raw_calls 등 확정저장은
-        // 하지 않음(로컬 JSONL 파싱결과 레코드로만 남김).
+        // CASPER Decoder v0.4(2026-08-31, Golden Day 회귀검증 PASS) — §8.
+        // 실측검증(Golden Day 8/30~31 replay: 14건/131,200원/78.374km/2:28:37
+        // 전부 정확일치, fare==fare_copy 전건일치) 통과한 필드만 파싱.
         var meterFare: Int? = null
         var tripStart: String? = null
-        var tripCloseFlag: String? = null
+        var tripEnd: String? = null
+        var distanceRaw: Int? = null
+        var fareCopy: Int? = null
+        var auxFlag: String? = null
         var primaryState: String? = null
         var secondaryState: String? = null
         var decodeWarning: String? = null
+        var tripClosedNow = false
 
         if (frameClass == "LONG_BUSINESS_FRAME") {
             try {
@@ -217,17 +242,30 @@ class BleCollectorService : Service() {
                     secondaryState = ascii.substring(20, 22)
                     meterFare = ascii.substring(22, 28).toIntOrNull()
                     tripStart = ascii.substring(44, 56)
-                    tripCloseFlag = ascii.substring(82, 84)
+                    tripEnd = ascii.substring(56, 68)
+                    distanceRaw = ascii.substring(68, 76).toIntOrNull()
+                    auxFlag = ascii.substring(82, 84)
+                    fareCopy = ascii.substring(84, 90).toIntOrNull()
 
-                    // 안전장치: checksum PASS해도 필드값 자체가 이상한 사례
-                    // (실측 3,003원 케이스: trip_start='002260082820', state=07/00)
-                    // 발견됨 — 관측된 정상 state 4종 외 값이면 경고 플래그.
-                    val knownStates = setOf("02/02", "0A/08", "04/04", "07/00")
-                    val stateKey = "$primaryState/$secondaryState"
-                    if (stateKey !in knownStates) {
-                        decodeWarning = "unknown_state($stateKey)"
+                    // §5(Golden Day) 검증된 CLOSED variant: (state, aux) 조합.
+                    // 진행중(02/02)도 정상 — 그 외는 unknown으로 표시(억지해석 금지, §7).
+                    val stateKey = Triple(primaryState, secondaryState, auxFlag)
+                    val isProgressing = primaryState == "02" && secondaryState == "02"
+                    val isClosed = CLOSED_VARIANTS.contains(stateKey)
+
+                    if (!isProgressing && !isClosed) {
+                        decodeWarning = "unknown_state($primaryState/$secondaryState,aux=$auxFlag)"
                     } else if (!Regex("""^\d{12}$""").matches(tripStart ?: "")) {
                         decodeWarning = "invalid_trip_start_format"
+                    } else if (isClosed && !closedTripStarts.contains(tripStart)) {
+                        // Trip Finalizer: 이 trip_start를 최초로 확정(중복 방지)
+                        tripClosedNow = true
+                        closedTripStarts.add(tripStart!!)
+                        tripCount++
+                        tripFareSum += (meterFare ?: 0).toLong()
+                        tripDistanceSumRaw += (distanceRaw ?: 0).toLong()
+                        recentTrips.addFirst("${tripStart}~${tripEnd} ${meterFare}원 ${String.format("%.2f", (distanceRaw ?: 0) / 10000.0)}km")
+                        while (recentTrips.size > 5) recentTrips.removeLast()
                     }
                 }
             } catch (e: Exception) {
@@ -243,12 +281,19 @@ class BleCollectorService : Service() {
             """"checksum_valid":${checksumValid ?: "null"},""" +
             """"meter_fare":${meterFare ?: "null"},""" +
             """"trip_start":${tripStart?.let { "\"$it\"" } ?: "null"},""" +
-            """"trip_close_flag":${tripCloseFlag?.let { "\"$it\"" } ?: "null"},""" +
+            """"trip_end":${tripEnd?.let { "\"$it\"" } ?: "null"},""" +
+            """"distance_raw":${distanceRaw ?: "null"},""" +
+            """"fare_copy":${fareCopy ?: "null"},""" +
+            """"aux_flag":${auxFlag?.let { "\"$it\"" } ?: "null"},""" +
             """"primary_state":${primaryState?.let { "\"$it\"" } ?: "null"},""" +
             """"secondary_state":${secondaryState?.let { "\"$it\"" } ?: "null"},""" +
             """"decode_warning":${decodeWarning?.let { "\"$it\"" } ?: "null"},""" +
-            """"decoder_version":"s700-decoder-v0.3"}"""
+            """"trip_closed":$tripClosedNow,""" +
+            """"decoder_version":"s700-decoder-v0.4"}"""
         )
+        if (tripClosedNow) {
+            writeDashboardState()
+        }
     }
 
     // CASPER v2(2026-08-29) Health Monitor §17 — payload length histogram을
@@ -261,12 +306,38 @@ class BleCollectorService : Service() {
             """"checksum_pass_count":$checksumPassCount,"checksum_fail_count":$checksumFailCount,""" +
             """"payload_length_histogram":{$histJson}}"""
         )
+        writeDashboardState()
+    }
+
+    // CASPER 대시보드(2026-08-31, 대표님요청 "수집중인지 에러는 없는지 알수가
+    // 없다") — Service의 실시간 상태를 SharedPreferences에 기록, MainActivity가
+    // 주기적으로 읽어서 화면에 표시(Service↔Activity 통신, 가장 단순·안정적인
+    // 방식). 원본 JSONL 로깅과는 완전 별개 — 이 값이 손상돼도 원본데이터엔
+    // 영향 없음.
+    private var lastStatusText = "대기 중"
+    private var lastReceivedAt: String? = null
+    private fun writeDashboardState() {
+        val prefs = getSharedPreferences("s700_dashboard", MODE_PRIVATE)
+        prefs.edit()
+            .putString("status_text", lastStatusText)
+            .putString("last_received_at", lastReceivedAt ?: "")
+            .putInt("notify_count", notifyCount)
+            .putInt("packet_count", packetCount)
+            .putInt("checksum_pass_count", checksumPassCount)
+            .putInt("checksum_fail_count", checksumFailCount)
+            .putInt("trip_count", tripCount)
+            .putInt("trip_fare_sum", tripFareSum.toInt())
+            .putFloat("trip_distance_km", (tripDistanceSumRaw / 10000.0).toFloat())
+            .putString("recent_trips", recentTrips.joinToString("|"))
+            .putLong("updated_at_epoch", System.currentTimeMillis())
+            .apply()
     }
 
     private fun append(line: String) {
         val dir = File(getExternalFilesDir(null), "S700").apply { mkdirs() }
         val file = File(dir, "s700_${SimpleDateFormat("yyyyMMdd", Locale.KOREA).format(Date())}.jsonl")
         file.appendText(line + "\n")
+        lastReceivedAt = now()
     }
 
     private fun meta(k: String, v: String) = append("""{"type":"meta","received_at":"${now()}","$k":"$v"}""")
@@ -283,11 +354,15 @@ class BleCollectorService : Service() {
 
     private fun update(text: String) {
         (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(1, notification(text))
+        lastStatusText = text
+        writeDashboardState()
     }
 
     private fun cleanup() {
         healthHandler.removeCallbacks(healthRunnable)
         logHealthSnapshot()
+        lastStatusText = "수집 중지됨"
+        writeDashboardState()
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED)
             adapter.bluetoothLeScanner?.stopScan(scanCallback)
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED)
