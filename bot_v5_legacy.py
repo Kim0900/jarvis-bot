@@ -87,7 +87,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         """모든 응답에 CORS 허용 헤더 추가"""
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey, X-MCP-Key')
 
     def do_OPTIONS(self):
         """CORS preflight 요청 처리"""
@@ -185,7 +185,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey, X-MCP-Key')
             self.end_headers()
             self.wfile.write(body)
 
@@ -318,6 +318,52 @@ class HealthHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     logger.error(f"MCP get_task 오류: {e}")
                     send_json(400, {"success": False, "error": str(e)})
+                return
+
+            # ──────────────────────────────────────────────
+            # 검누리 1단계(2026-09-01): Drive 신규문서 → 공식 MAGI 작업 등록.
+            # DB 함수(register_drive_document_event)만 호출 — 직접 INSERT 안함.
+            # 신규 테이블 없음, 기존 magi_tasks/magi_task_events/correction_log만
+            # 사용(RPC 함수 내부에서 처리). "확인되지 않은 성공은 성공으로
+            # 처리하지 않는다" 원칙 — RPC 실패/None시 반드시 success:false.
+            # ──────────────────────────────────────────────
+            if self.path == '/mcp/events':
+                try:
+                    if payload.get("event_type") != "DOCUMENT_RECEIVED":
+                        send_json(400, {"success": False, "error": "unsupported_event_type"})
+                        return
+                    if payload.get("source_type") != "google_drive":
+                        send_json(400, {"success": False, "error": "unsupported_source_type"})
+                        return
+                    required = ["source_id", "source_uri", "source_folder", "file_name"]
+                    missing = [f for f in required if not payload.get(f)]
+                    if missing:
+                        send_json(400, {"success": False, "error": "missing_required_fields", "fields": missing})
+                        return
+
+                    result = asyncio.run(sb_h(
+                        "POST",
+                        "rpc/register_drive_document_event",
+                        json={
+                            "p_domain": payload.get("domain") or "magi",
+                            "p_source_id": payload["source_id"],
+                            "p_source_uri": payload["source_uri"],
+                            "p_source_folder": payload["source_folder"],
+                            "p_file_name": payload["file_name"],
+                            "p_created_at": payload.get("created_at"),
+                            "p_actor": "GAS",
+                            "p_owner_agent": payload.get("owner_agent"),
+                            "p_priority": payload.get("priority") or "P1",
+                        },
+                    ))
+                    if not result or not isinstance(result, dict) or not result.get("ok"):
+                        logger.error(f"MCP /mcp/events - RPC 결과 비정상: {result}")
+                        send_json(400, {"success": False, "error": "supabase_rpc_failed"})
+                        return
+                    send_json(200, {"success": True, "result": result})
+                except Exception as e:
+                    logger.error(f"MCP /mcp/events 오류: {e}")
+                    send_json(400, {"success": False, "error": "supabase_rpc_failed"})
                 return
 
             if self.path == '/mcp/get_blocked_tasks':
