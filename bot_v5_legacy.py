@@ -4909,6 +4909,24 @@ async def dual_verify_7day_average() -> dict:
     return result
 
 
+async def recalc_fish_finder():
+    """대표님 지적(2026-09-02): 어군브리핑 "DB 핫존"이 fish_finder 테이블의
+    5/15~5/17 초기시드값을 4개월째 그대로 보여주고 있어 사실상 하드코딩과
+    다름없었음(같은 time_band에 rank_overall 중복까지 있던 오염 데이터).
+    raw_calls(카카오T, trip행) 기준으로 매일 재계산하는 SQL 함수
+    (recalc_fish_finder RPC)를 호출 — 집계 로직 자체는 DB 함수에 있음."""
+    try:
+        result = await sb_h("POST", "rpc/recalc_fish_finder", json={})
+        if not result or not isinstance(result, dict) or not result.get("ok"):
+            logger.error(f"fish_finder 재계산 - RPC 결과 비정상: {result}")
+            return None
+        logger.info(f"fish_finder 재계산 완료: 삭제{result.get('deleted')}건, 신규{result.get('inserted')}건")
+        return result
+    except Exception as e:
+        logger.error(f"fish_finder 재계산 실패: {e}")
+        return None
+
+
 async def recalc_fish_hour_data():
     """어군 브리핑 시간대별 통계 재계산 (2026-07-13, 하드코딩 HOUR_DATA/FISH_DATA 제거).
     raw_calls(실시간 데이터) 기반으로 시간대별 카카오T/배회 평균 건수·비중·평균단가를
