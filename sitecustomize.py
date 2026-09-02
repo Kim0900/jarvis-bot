@@ -527,6 +527,10 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         legacy.logger.info("fish_hour_data_dow 일일 재계산 완료")
                     except Exception as exc:
                         legacy.logger.error(f"fish_hour_data_dow 일일 재계산 실패: {exc}")
+                    try:
+                        loop.run_until_complete(legacy.recalc_fish_finder())
+                    except Exception as exc:
+                        legacy.logger.error(f"fish_finder 일일 재계산 실패: {exc}")
                     last_recalc_day = now.day
 
                 # task#76(2026-08-30): 자동교차대조 - 콜카드/영수증 둘다있는
