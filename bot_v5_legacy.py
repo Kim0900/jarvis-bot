@@ -2344,10 +2344,25 @@ def validate_call_payload(payload: dict) -> tuple:
     """task#76: raw_calls 저장 직전 최소 Rule Validation. 정형 검증 가능한
     항목(배차≤하차, 요금>=0)만 코드로 우선 처리 — MAGI_이미지파이프라인
     §8 MINIMUM PATCH 반영. (False, 사유) 반환시 호출부가 raw_row_type을
-    'unclassified'로 강제하고 비고에 사유를 남긴다."""
+    'unclassified'로 강제하고 비고에 사유를 남긴다.
+
+    task93(2026-09-03) 2단계: 지시서§12 "필수시간 누락→FLAG",
+    "출발/도착 필수값 누락→FLAG" 반영. 함수 반환구조(2-tuple)를 유지하는
+    최소변경으로, 핵심정보(배차시각, 또는 출발+도착 둘다) 전무시 unclassified
+    처리 — "파싱실패 데이터를 정상 trip으로 강제저장 금지"(§23) 원칙에 부합.
+    """
     배차 = payload.get("배차시각")
     하차 = payload.get("하차시각")
     요금 = payload.get("요금")
+    출발 = payload.get("출발지")
+    도착 = payload.get("도착지")
+
+    if not 배차:
+        return False, "배차시각 누락(필수 시간정보 없음)"
+    # 수동입력(예: "콜 7800")은 원래 출발/도착 없이 요금만 축약입력하는 게
+    # 정상 사용패턴 — 이건 "파싱실패"가 아니므로 이 검사에서 제외.
+    if payload.get("data_source") != "manual_entry" and not 출발 and not 도착:
+        return False, "출발지·도착지 전부 누락"
     if 배차 and 하차:
         try:
             bh, bm = map(int, str(배차).split(":"))
