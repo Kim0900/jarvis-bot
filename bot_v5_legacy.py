@@ -1238,6 +1238,7 @@ async def process_daily_history(update, image_bytes: bytes):
             "비고":     비고,
             "data_source": "app_ocr_individual",
         }
+        payload.update(calc_service_date(save_date_str, 배차))
         _valid, _reason = validate_call_payload(payload)
         if not _valid:
             payload["raw_row_type"] = "unclassified"
@@ -2303,6 +2304,42 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
     return "\n\n".join(results) if results else ""
 
 
+def calc_service_date(날짜_str: str, 배차시각_str: str) -> dict:
+    """task93(2026-09-03) 2단계: date_axis/service_date 단일 공통함수.
+    지시서§10: "과거 calendar_day, B, daily_total 혼재 이력이 있으므로
+    저장경로에서 임의생성 못하게 한다. service_date 계산은 단일 공통함수로
+    통일하고 모든 파서/저장경로가 동일 함수를 사용한다." 반영.
+
+    이전(task#66, 8/26)까지는 이 계산을 수동 SQL 소급작업에서만 했고,
+    실제 저장경로(process_call_card 등)엔 이 로직 자체가 없어서 새로
+    들어오는 레코드는 필드가 계속 비어있었음(재확인해 확정) — 이번에
+    저장경로에 실제로 연결.
+
+    규칙: 배차시각 hour<6이면 전날 귀속(19시~익02시 영업일 통합).
+    반환: {"platform_date":..., "business_date":..., "business_session_id":...}
+    실패(파싱불가)시 platform_date만 날짜 그대로 채우고 나머지는 None.
+    """
+    result = {"platform_date": 날짜_str, "business_date": None, "business_session_id": None}
+    if not 날짜_str:
+        return result
+    try:
+        from datetime import date as _date, timedelta as _td
+        y, m, d = map(int, 날짜_str.split("-"))
+        base_date = _date(y, m, d)
+        hour = None
+        if 배차시각_str:
+            hour = int(str(배차시각_str).split(":")[0])
+        if hour is not None and hour < 6:
+            business_date = base_date - _td(days=1)
+        else:
+            business_date = base_date
+        result["business_date"] = str(business_date)
+        result["business_session_id"] = f"{business_date}-NIGHT"
+    except Exception as e:
+        logger.error(f"calc_service_date 계산 실패(날짜={날짜_str}, 배차시각={배차시각_str}): {e}")
+    return result
+
+
 def validate_call_payload(payload: dict) -> tuple:
     """task#76: raw_calls 저장 직전 최소 Rule Validation. 정형 검증 가능한
     항목(배차≤하차, 요금>=0)만 코드로 우선 처리 — MAGI_이미지파이프라인
@@ -2459,6 +2496,7 @@ async def process_call_card(update: Update, image_bytes: bytes):
         "비고": 비고,
         "data_source": "app_ocr_individual",
     }
+    payload.update(calc_service_date(today, 배차시각))
     _valid, _reason = validate_call_payload(payload)
     if not _valid:
         payload["raw_row_type"] = "unclassified"
@@ -2705,6 +2743,7 @@ async def handle_manual_call(update: Update, parsed: dict):
         "도착지": parsed.get("도착지힌트"),
         "data_source": "manual_entry",
     }
+    payload.update(calc_service_date(today, payload["배차시각"]))
     r = await sb_insert("raw_calls", payload)
     if r:
         await update.message.reply_text(
@@ -3038,6 +3077,7 @@ async def confirm_cross_check(date_str: str) -> str:
             "비고":     "결제내역 교차대조 자동추가",
             "data_source": "app_ocr_individual",
         }
+        payload.update(calc_service_date(r_date, r.get("시각")))
         result = await sb_insert("raw_calls", payload)
         if result:
             added += 1
@@ -3436,7 +3476,7 @@ async def handle_manual_full_call(update, text: str):
     if deleted:
         logger.info(f"수동입력 중복 삭제: {data['날짜']} {data['배차시각']}")
 
-    result = await sb_insert("raw_calls", {
+    _payload = {
         "날짜":     data["날짜"],
         "요일":     data["요일"],
         "배차시각": data["배차시각"],
@@ -3446,7 +3486,9 @@ async def handle_manual_full_call(update, text: str):
         "콜유형":   data["콜유형"],
         "비고":     "수동입력",
         "data_source": "manual_entry",
-    })
+    }
+    _payload.update(calc_service_date(data["날짜"], data["배차시각"]))
+    result = await sb_insert("raw_calls", _payload)
 
     if result:
         await update.message.reply_text(
@@ -3875,6 +3917,7 @@ async def handle_excel_import(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "콜유형": row[col.get("콜유형", 6)] or "카카오T",
                     "data_source": "manual_entry",
                 }
+                payload.update(calc_service_date(날짜, 배차시각))
                 r = await sb_insert("raw_calls", payload)
                 if r:
                     total_saved += 1
@@ -5922,6 +5965,7 @@ async def _process_single_command(update, context, text: str) -> str | None:
             "도착지": parsed_call.get("도착지힌트"),
             "data_source": "manual_entry",
         }
+        payload.update(calc_service_date(today, payload["배차시각"]))
         r = await sb_insert("raw_calls", payload)
         return f"✅ {parsed_call['콜유형']} {fmt(parsed_call['요금'])} 입력" if r else "❌ 저장 실패"
 
