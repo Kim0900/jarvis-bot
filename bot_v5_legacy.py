@@ -2304,6 +2304,87 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
     return "\n\n".join(results) if results else ""
 
 
+# ──────────────────────────────────────────────
+# task93(2026-09-03) 3단계: MAGI DATA CORE — 비LLM(Google Cloud Vision)
+# 결정론적 파서. 마기 결정(3단계재개 지시): Tesseract는 Render Python
+# buildpack에서 시스템패키지 설치불가로 기각, Google Cloud Vision API
+# (무료티어 월1000건)로 확정. 신규형식(콜당개별다운로드라 호출빈도
+# 낮음)은 무료한도 초과 가능성 거의없음.
+# ──────────────────────────────────────────────
+async def google_vision_ocr(image_bytes: bytes) -> str:
+    """Google Cloud Vision API(TEXT_DETECTION)로 이미지→텍스트 추출.
+    LLM Vision(Claude/Gemini) 아닌 전통적 OCR — AI 판단·해석 없이
+    순수 문자인식만 수행. GOOGLE_VISION_API_KEY 환경변수 필요."""
+    api_key = os.getenv("GOOGLE_VISION_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_VISION_API_KEY 환경변수 없음")
+    b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "requests": [{
+            "image": {"content": b64},
+            "features": [{"type": "TEXT_DETECTION"}],
+            "imageContext": {"languageHints": ["ko"]},
+        }]
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+            json=payload,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Google Vision API HTTP {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
+    if not annotations:
+        return ""
+    return annotations[0].get("description", "")
+
+
+def parse_kakao_trip_detail(text: str) -> dict:
+    """신규형식(개별운행상세, "카카오 T 택시 운행 이력") 정규식 파서.
+    task93 3단계 — 실제샘플 3건(2026-09-03, 시각/금액/지역/결제수단
+    전부 다름) 전수 재현검증 완료, 전건 정확파싱 확인.
+    "탑승"/"승차" 라벨 차이는 정규식 alternation으로 흡수."""
+    result: dict = {"format": "kakao_trip_detail", "parse_errors": []}
+
+    m = re.search(r'(\d{4})/(\d{2})/(\d{2})', text)
+    if m:
+        result["날짜"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    else:
+        result["parse_errors"].append("날짜 파싱실패")
+
+    m = re.search(r'배차\s*(\d{2}:\d{2})', text)
+    result["배차시각"] = m.group(1) if m else None
+    if not m:
+        result["parse_errors"].append("배차시각 파싱실패")
+
+    m = re.search(r'(?:승차|탑승)\s*(\d{2}:\d{2})\s+([가-힣0-9\s.]+?)(?=\n|하차)', text)
+    if m:
+        result["탑승시각"] = m.group(1)
+        result["출발지"] = m.group(2).strip()
+    else:
+        result["parse_errors"].append("승차/탑승 파싱실패")
+
+    m = re.search(r'하차\s*(\d{2}:\d{2})\s+([가-힣0-9\s.]+?)(?=\n|요금 정보|미터기)', text)
+    if m:
+        result["하차시각"] = m.group(1)
+        result["도착지"] = m.group(2).strip()
+    else:
+        result["parse_errors"].append("하차 파싱실패")
+
+    m = re.search(r'최종\s*요금[:\s]*([\d,]+)원', text)
+    if m:
+        result["요금"] = int(m.group(1).replace(",", ""))
+    else:
+        result["parse_errors"].append("요금 파싱실패")
+
+    m = re.search(r'-\s*([가-힣A-Za-z0-9]+\s*[가-힣A-Za-z]*\s*\d+)[:\s]+([\d,]+)원', text)
+    result["결제수단"] = m.group(1).strip() if m else None
+
+    result["콜유형"] = "카카오T"
+    return result
+
+
 def calc_service_date(날짜_str: str, 배차시각_str: str) -> dict:
     """task93(2026-09-03) 2단계: date_axis/service_date 단일 공통함수.
     지시서§10: "과거 calendar_day, B, daily_total 혼재 이력이 있으므로
