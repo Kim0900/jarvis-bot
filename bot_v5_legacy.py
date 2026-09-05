@@ -2305,39 +2305,33 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
 
 
 # ──────────────────────────────────────────────
-# task93(2026-09-03) 3단계: MAGI DATA CORE — 비LLM(Google Cloud Vision)
-# 결정론적 파서. 마기 결정(3단계재개 지시): Tesseract는 Render Python
-# buildpack에서 시스템패키지 설치불가로 기각, Google Cloud Vision API
-# (무료티어 월1000건)로 확정. 신규형식(콜당개별다운로드라 호출빈도
-# 낮음)은 무료한도 초과 가능성 거의없음.
+# task93(2026-09-03) 3단계: MAGI DATA CORE — 비LLM 결정론적 OCR.
+# 마기 재정정(2026-09-03): Google Cloud Vision(카드등록 필요, 비용
+# 발생가능)은 폐기. Tesseract + Render 신규 Docker서비스(무료티어)로
+# 확정 — 비용 $0, 카드등록 불필요. 신규서비스 jarvis-ocr-tesseract
+# (Dockerfile: tesseract-ocr+tesseract-ocr-kor) 배포완료·연동.
 # ──────────────────────────────────────────────
 async def google_vision_ocr(image_bytes: bytes) -> str:
-    """Google Cloud Vision API(TEXT_DETECTION)로 이미지→텍스트 추출.
-    LLM Vision(Claude/Gemini) 아닌 전통적 OCR — AI 판단·해석 없이
-    순수 문자인식만 수행. GOOGLE_VISION_API_KEY 환경변수 필요."""
-    api_key = os.getenv("GOOGLE_VISION_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_VISION_API_KEY 환경변수 없음")
+    """비LLM OCR — 순수 문자인식만 수행(AI 판단·해석 없음).
+    실제로는 자체 Tesseract Docker서비스(jarvis-ocr-tesseract)를
+    호출한다. 함수명은 호출부(3단계 파서들) 변경 최소화를 위해 유지."""
+    service_url = os.getenv("OCR_SERVICE_URL")
+    mcp_key = os.getenv("OCR_MCP_KEY")
+    if not service_url or not mcp_key:
+        raise RuntimeError("OCR_SERVICE_URL/OCR_MCP_KEY 환경변수 없음")
     b64 = base64.b64encode(image_bytes).decode()
-    payload = {
-        "requests": [{
-            "image": {"content": b64},
-            "features": [{"type": "TEXT_DETECTION"}],
-            "imageContext": {"languageHints": ["ko"]},
-        }]
-    }
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
-            json=payload,
+            f"{service_url}/ocr",
+            headers={"X-MCP-Key": mcp_key},
+            json={"image_base64": b64, "lang": "kor+eng"},
         )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Google Vision API HTTP {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Tesseract OCR서비스 HTTP {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
-    annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
-    if not annotations:
-        return ""
-    return annotations[0].get("description", "")
+    if not data.get("success"):
+        raise RuntimeError(f"Tesseract OCR 실패: {data.get('error')}")
+    return data.get("text", "")
 
 
 def parse_kakao_trip_detail(text: str) -> dict:
