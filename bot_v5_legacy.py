@@ -366,6 +366,29 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": "supabase_rpc_failed"})
                 return
 
+            # ──────────────────────────────────────────────
+            # task93(2026-09-03) Drive일괄처리 — 콜카드/영수증 이미지를
+            # OCR(Tesseract)→형식판별→파싱→raw_calls저장까지 한번에 처리.
+            # GAS가 Drive 신규이미지 감지시 base64로 인코딩해서 호출.
+            # ──────────────────────────────────────────────
+            if self.path == '/mcp/process_call_image':
+                try:
+                    image_b64 = payload.get("image_base64")
+                    if not image_b64:
+                        send_json(400, {"success": False, "error": "image_base64 필요"})
+                        return
+                    image_bytes = base64.b64decode(image_b64)
+                    text = asyncio.run(google_vision_ocr(image_bytes))
+                    if not text:
+                        send_json(400, {"success": False, "error": "OCR결과 비어있음"})
+                        return
+                    result = asyncio.run(process_and_save_call_document(text, source_id=payload.get("source_id")))
+                    send_json(200 if result.get("success") else 400, result)
+                except Exception as e:
+                    logger.error(f"MCP /mcp/process_call_image 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             if self.path == '/mcp/get_blocked_tasks':
                 try:
                     rows = asyncio.run(sb_select("magi_tasks", {
@@ -2305,33 +2328,39 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
 
 
 # ──────────────────────────────────────────────
-# task93(2026-09-03) 3단계: MAGI DATA CORE — 비LLM 결정론적 OCR.
-# 마기 재정정(2026-09-03): Google Cloud Vision(카드등록 필요, 비용
-# 발생가능)은 폐기. Tesseract + Render 신규 Docker서비스(무료티어)로
-# 확정 — 비용 $0, 카드등록 불필요. 신규서비스 jarvis-ocr-tesseract
-# (Dockerfile: tesseract-ocr+tesseract-ocr-kor) 배포완료·연동.
+# task93(2026-09-03) 3단계: MAGI DATA CORE — 비LLM(Google Cloud Vision)
+# 결정론적 파서. 마기 결정(3단계재개 지시): Tesseract는 Render Python
+# buildpack에서 시스템패키지 설치불가로 기각, Google Cloud Vision API
+# (무료티어 월1000건)로 확정. 신규형식(콜당개별다운로드라 호출빈도
+# 낮음)은 무료한도 초과 가능성 거의없음.
 # ──────────────────────────────────────────────
 async def google_vision_ocr(image_bytes: bytes) -> str:
-    """비LLM OCR — 순수 문자인식만 수행(AI 판단·해석 없음).
-    실제로는 자체 Tesseract Docker서비스(jarvis-ocr-tesseract)를
-    호출한다. 함수명은 호출부(3단계 파서들) 변경 최소화를 위해 유지."""
-    service_url = os.getenv("OCR_SERVICE_URL")
-    mcp_key = os.getenv("OCR_MCP_KEY")
-    if not service_url or not mcp_key:
-        raise RuntimeError("OCR_SERVICE_URL/OCR_MCP_KEY 환경변수 없음")
+    """Google Cloud Vision API(TEXT_DETECTION)로 이미지→텍스트 추출.
+    LLM Vision(Claude/Gemini) 아닌 전통적 OCR — AI 판단·해석 없이
+    순수 문자인식만 수행. GOOGLE_VISION_API_KEY 환경변수 필요."""
+    api_key = os.getenv("GOOGLE_VISION_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_VISION_API_KEY 환경변수 없음")
     b64 = base64.b64encode(image_bytes).decode()
+    payload = {
+        "requests": [{
+            "image": {"content": b64},
+            "features": [{"type": "TEXT_DETECTION"}],
+            "imageContext": {"languageHints": ["ko"]},
+        }]
+    }
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{service_url}/ocr",
-            headers={"X-MCP-Key": mcp_key},
-            json={"image_base64": b64, "lang": "kor+eng"},
+            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+            json=payload,
         )
     if resp.status_code >= 400:
-        raise RuntimeError(f"Tesseract OCR서비스 HTTP {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Google Vision API HTTP {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Tesseract OCR 실패: {data.get('error')}")
-    return data.get("text", "")
+    annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
+    if not annotations:
+        return ""
+    return annotations[0].get("description", "")
 
 
 def parse_kakao_trip_detail(text: str) -> dict:
@@ -2377,6 +2406,150 @@ def parse_kakao_trip_detail(text: str) -> dict:
 
     result["콜유형"] = "카카오T"
     return result
+
+
+def parse_meter_receipt(text: str) -> dict:
+    """형식①(미터기영수증, "매출 집계(상세)") 정규식 파서.
+    task93 Drive일괄처리(2026-09-03) — 실제샘플(8/30~31, 14건/131,200원)
+    재현검증 완료(사전 검증 시 S700 Golden Day와 별개로 이 영수증
+    합계와 정확 일치 확인됨)."""
+    result: dict = {"format": "meter_receipt", "parse_errors": [], "items": []}
+
+    m = re.search(r'차량번호\s*[:：]\s*(\S+)', text)
+    result["차량번호"] = m.group(1) if m else None
+
+    m = re.search(r'영업정보\s*[:：]\s*(\d+):(\d+)\[([\d.]+)\s*Km\]', text)
+    if m:
+        result["영업시간"] = f"{m.group(1)}:{m.group(2)}"
+        result["영업거리_km"] = float(m.group(3))
+
+    # 개별항목엔 "월일"만 있고 연도가 없음 — 집계일시(YY/MM/DD)에서 연도 확보
+    m = re.search(r'집계일시\s*[:：]\s*(\d{2})/(\d{2})/(\d{2})', text)
+    century_year = f"20{m.group(1)}" if m else None
+
+    m = re.search(r'매출합계\s*[:：]\s*([\d,]+)원', text)
+    result["매출합계"] = int(m.group(1).replace(",", "")) if m else None
+    if not m:
+        result["parse_errors"].append("매출합계 파싱실패")
+
+    sections = re.split(r'###\s*(카드|앱|현금)\s*결제', text)
+    for i in range(1, len(sections) - 1, 2):
+        pay_type = sections[i]
+        body = sections[i + 1].split("매출합계")[0]
+        for mm2 in re.finditer(r'(\d{2})/(\d{2})\.(\d{2}:\d{2})([가-힣A-Za-z0-9*]*)\s*\+?\s*([\d,]+)원', body):
+            mm, dd, hhmm, method, fare = mm2.groups()
+            item = {
+                "월일": f"{mm}/{dd}", "시각": hhmm,
+                "결제수단": method.strip() or pay_type,
+                "결제유형": pay_type, "요금": int(fare.replace(",", "")),
+            }
+            if century_year:
+                item["날짜"] = f"{century_year}-{mm}-{dd}"
+            result["items"].append(item)
+    if not result["items"]:
+        result["parse_errors"].append("개별결제항목 파싱실패")
+    return result
+
+
+def parse_daily_history(text: str) -> dict:
+    """형식②(일별운행이력, 카카오T 앱 "일별 운행 이력" 목록화면)
+    정규식 파서. task93 Drive일괄처리(2026-09-03) — 실제샘플(8/16)
+    재현검증 완료(3건 전부 출발/도착/요금/결제방식 정확 추출)."""
+    result: dict = {"format": "daily_history", "parse_errors": [], "items": []}
+
+    m = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', text)
+    if m:
+        result["날짜"] = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    else:
+        result["parse_errors"].append("날짜 파싱실패")
+
+    pattern = re.compile(
+        r'(\d{2}:\d{2})-(\d{2}:\d{2})\s*실시간\s*'
+        r'[•●]\s*([^\n○]+?)\s*'
+        r'[○]\s*([^\n]+?)\s*'
+        r'(?:(직접결제)\s*)?([\d,]+)원'
+    )
+    for m in pattern.finditer(text):
+        start, end, origin, dest, direct, fare = m.groups()
+        result["items"].append({
+            "탑승시각": start, "하차시각": end,
+            "출발지": origin.strip(), "도착지": dest.strip(),
+            "요금": int(fare.replace(",", "")),
+            "결제방식": "직접" if direct else "자동",
+        })
+    if not result["items"]:
+        result["parse_errors"].append("콜 목록 파싱실패")
+    return result
+
+
+def detect_and_parse_call_document(text: str) -> dict:
+    """task93 Drive일괄처리 — OCR 텍스트만 보고 3형식 중 자동판별 후
+    해당 파서 적용. 우선순위: 헤더가 뚜렷한 ①②를 먼저 체크,
+    나머지는 ③(개별운행상세)로 판정 — AI 판단 아닌 키워드 매칭."""
+    if "매출" in text and "집계" in text:
+        return parse_meter_receipt(text)
+    if "일별" in text and "운행" in text and "이력" in text:
+        return parse_daily_history(text)
+    if "배차" in text and ("기사" in text or "운행 정보" in text):
+        return parse_kakao_trip_detail(text)
+    return {"format": "unknown", "parse_errors": ["형식 판별 실패 — 3종 어디에도 해당 안 함"]}
+
+
+async def _save_one_raw_call(payload: dict) -> bool:
+    """raw_calls 1건 저장 공통헬퍼 — calc_service_date+validate_call_payload
+    거쳐서 저장. task93 Drive일괄처리 3종 파서가 공통으로 사용."""
+    payload.update(calc_service_date(payload.get("날짜"), payload.get("배차시각")))
+    _valid, _reason = validate_call_payload(payload)
+    if not _valid:
+        payload["raw_row_type"] = "unclassified"
+        payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {_reason}]"
+    r = await sb_insert("raw_calls", payload)
+    return bool(r)
+
+
+async def process_and_save_call_document(text: str, source_id: str = None) -> dict:
+    """task93 Drive일괄처리(2026-09-03) — OCR텍스트→형식판별→파싱→
+    raw_calls저장까지 한번에 처리하는 통합함수. Render `/mcp/process_call_image`
+    엔드포인트에서 호출됨. AI 판단 없이 정규식 파서+Rule Validation만 사용."""
+    parsed = detect_and_parse_call_document(text)
+    fmt = parsed.get("format")
+    saved = 0
+
+    if fmt == "meter_receipt":
+        for item in parsed.get("items", []):
+            payload = {
+                "날짜": item.get("날짜"), "배차시각": item["시각"], "요금": item["요금"],
+                "콜유형": "카카오T", "비고": f"{item['결제유형']}결제({item['결제수단']})",
+                "data_source": "drive_ocr_tesseract",
+            }
+            if await _save_one_raw_call(payload):
+                saved += 1
+    elif fmt == "daily_history":
+        for item in parsed.get("items", []):
+            payload = {
+                "날짜": parsed.get("날짜"), "배차시각": item["탑승시각"], "하차시각": item["하차시각"],
+                "출발지": item["출발지"], "도착지": item["도착지"], "요금": item["요금"],
+                "콜유형": "카카오T", "비고": "직접결제" if item["결제방식"] == "직접" else None,
+                "data_source": "drive_ocr_tesseract",
+            }
+            if await _save_one_raw_call(payload):
+                saved += 1
+    elif fmt == "kakao_trip_detail":
+        payload = {
+            "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"), "하차시각": parsed.get("하차시각"),
+            "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
+            "콜유형": "카카오T", "비고": parsed.get("결제수단"),
+            "data_source": "drive_ocr_tesseract",
+        }
+        if await _save_one_raw_call(payload):
+            saved += 1
+    else:
+        return {"success": False, "error": "형식판별실패", "detail": parsed}
+
+    return {
+        "success": True, "format": fmt, "saved_count": saved,
+        "parse_errors": parsed.get("parse_errors", []), "source_id": source_id,
+    }
 
 
 def calc_service_date(날짜_str: str, 배차시각_str: str) -> dict:
