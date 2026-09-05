@@ -4685,7 +4685,15 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
 
 async def run_magi_auto_review_once():
     """task#52: VERIFICATION+verified_by없음 태스크 1건을 찾아 마기(자동)가 검증.
-    Sonnet 사용, 최대 10회 tool호출 제한."""
+    Sonnet 사용, 최대 10회 tool호출 제한.
+
+    task#111(2026-09-05) 근본수정: 재시도 횟수 제한 추가. task#80이
+    verified_by 미기재로 8/30~9/5(6일간) 5분마다 무한재시도되며 Sonnet
+    호출 크레딧을 계속 낭비한 사실을 발견(실제로는 8/30에 이미검증완료,
+    "fish_week_stats 존폐판단"이라는 사람판단 대기항목 하나때문에 verified_by
+    미기재 상태로 방치됨). Haiku오케스트레이션(task#78)과 동일한
+    review_attempts 카운터+한도(5회) 초과시 큐이탈+텔레그램알림 적용."""
+    REVIEW_MAX_ATTEMPTS = 5
     try:
         rows = await sb_select("magi_tasks", {
             "status": "eq.VERIFICATION", "verified_by": "is.null",
@@ -4698,6 +4706,7 @@ async def run_magi_auto_review_once():
         return None
     task = rows[0]
     task_id = task["task_id"]
+    prior_attempts = task.get("review_attempts") or 0
 
     if not ANTHROPIC_API_KEY:
         return None
@@ -4770,7 +4779,28 @@ async def run_magi_auto_review_once():
             break
 
     logger.info(f"마기(자동)검증 완료(task#{task_id}): outcome={outcome}")
-    return task_id
+
+    if outcome is None:
+        new_attempts = prior_attempts + 1
+        if new_attempts >= REVIEW_MAX_ATTEMPTS:
+            await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                       json={"review_attempts": new_attempts, "verified_by": "마기(자동)_MAX_RETRY",
+                             "verified_at": datetime.now(KST).isoformat(), "updated_at": datetime.now(KST).isoformat()},
+                       headers={**HEADERS_SB, "Prefer": "return=minimal"})
+            try:
+                await send_telegram_broadcast(
+                    f"⚠️ task#{task_id}({task.get('title','')}) 마기자동검증 {REVIEW_MAX_ATTEMPTS}회 미완료 — "
+                    f"큐 정체방지로 자동제외됨, 사람 확인 필요"
+                )
+            except Exception as e:
+                logger.error(f"task#{task_id} 마기검증 재시도한도 알림 발송 실패: {e}")
+            logger.warning(f"마기자동검증(task#{task_id}) 재시도한도({REVIEW_MAX_ATTEMPTS}) 도달 — 큐이탈")
+        else:
+            await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
+                       json={"review_attempts": new_attempts, "updated_at": datetime.now(KST).isoformat()},
+                       headers={**HEADERS_SB, "Prefer": "return=minimal"})
+            logger.warning(f"마기자동검증 미완료(task#{task_id}, {new_attempts}/{REVIEW_MAX_ATTEMPTS}) — 다음 폴링에서 재시도")
+
     return task_id
 
 
