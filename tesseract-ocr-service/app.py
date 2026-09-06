@@ -7,6 +7,14 @@ task93(2026-09-03) 3단계 — MAGI DATA CORE 비LLM OCR 서비스.
 분류 없음. 이미지→텍스트 변환까지만 하고, 실제 필드 파싱(정규식)은
 jarvis-bot(bot_v5_legacy.py)의 parse_kakao_trip_detail() 등에서
 별도로 수행한다(관심사 분리).
+
+2026-09-05 실측검증 기반 개선(대표님 "완벽 구현" 지시):
+①기본 PSM(3)이 카카오T "일별운행이력" 스크린샷류 레이아웃에서 특정
+텍스트블록을 통째로 건너뛰는 문제를 실제 이미지로 재현확인(예:
+"23:34-23:48/동인동/방촌동" 항목 완전누락) → PSM 6("균일 텍스트
+블록 가정")으로 교체, 동일 이미지 재현시 전건 정확 추출 확인.
+②매우 긴 세로스크롤 이미지(세로/가로 2.5배 초과)는 안전장치로
+자동 2분할(0~55%/45~100%, 10%겹침) 후 각각 OCR, 텍스트 연결.
 """
 import base64
 import os
@@ -19,6 +27,7 @@ from PIL import Image
 app = Flask(__name__)
 
 MCP_KEY = os.getenv("OCR_MCP_KEY")
+TESSERACT_CONFIG = "--psm 6"
 
 
 def _check_auth():
@@ -28,6 +37,18 @@ def _check_auth():
     if key != MCP_KEY:
         return False, "인증 실패"
     return True, ""
+
+
+def smart_ocr(img: Image.Image, lang: str) -> str:
+    """실측검증(2026-09-05)된 OCR 전략. PSM 6 고정 + 긴 이미지 자동분할."""
+    w, h = img.width, img.height
+    if h / max(w, 1) > 2.5:
+        top = img.crop((0, 0, w, int(h * 0.55)))
+        bottom = img.crop((0, int(h * 0.45), w, h))
+        text_top = pytesseract.image_to_string(top, lang=lang, config=TESSERACT_CONFIG)
+        text_bottom = pytesseract.image_to_string(bottom, lang=lang, config=TESSERACT_CONFIG)
+        return text_top + "\n" + text_bottom
+    return pytesseract.image_to_string(img, lang=lang, config=TESSERACT_CONFIG)
 
 
 @app.route("/", methods=["GET"])
@@ -51,7 +72,7 @@ def ocr():
         image_bytes = base64.b64decode(image_b64)
         img = Image.open(BytesIO(image_bytes))
 
-        text = pytesseract.image_to_string(img, lang=lang)
+        text = smart_ocr(img, lang)
         return jsonify({"success": True, "text": text, "engine": "tesseract", "lang": lang})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
