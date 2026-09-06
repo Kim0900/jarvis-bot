@@ -2453,8 +2453,14 @@ def parse_meter_receipt(text: str) -> dict:
 
 def parse_daily_history(text: str) -> dict:
     """형식②(일별운행이력, 카카오T 앱 "일별 운행 이력" 목록화면)
-    정규식 파서. task93 Drive일괄처리(2026-09-03) — 실제샘플(8/16)
-    재현검증 완료(3건 전부 출발/도착/요금/결제방식 정확 추출)."""
+    정규식 파서. task93 Drive일괄처리(2026-09-03) 최초구현 후,
+    2026-09-05 실측검증(대표님 지시 "완벽 구현")으로 2차 개선:
+    ①마커(•●○)가 Tesseract에서 자주 누락/깨져 "대구"로 시작하는
+    줄 자체를 매칭하도록 견고화 ②"실시간" 뒤 화살표아이콘이 OCR로
+    깨져 붙는 경우([^\\n]*) 대응 ③긴 이미지 자동분할(app.py)로 인한
+    겹침구간 중복을 (탑승시각,요금) 조합으로 제거.
+    실측: 8/16 실제스크린샷 8건 전부 정확파싱(1건은 출발지 일부
+    깨짐이나 시각·요금은 정확 — 겹침구간 밖이라 물리적 한계)."""
     result: dict = {"format": "daily_history", "parse_errors": [], "items": []}
 
     m = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', text)
@@ -2464,13 +2470,18 @@ def parse_daily_history(text: str) -> dict:
         result["parse_errors"].append("날짜 파싱실패")
 
     pattern = re.compile(
-        r'(\d{2}:\d{2})-(\d{2}:\d{2})\s*실시간\s*'
-        r'[•●]\s*([^\n○]+?)\s*'
-        r'[○]\s*([^\n]+?)\s*'
-        r'(?:(직접결제)\s*)?([\d,]+)원'
+        r'(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*실시간[^\n]*\n'
+        r'.{0,3}(대구[^\n]+?)\s*\n'
+        r'.{0,3}(대구[^\n]+?)\s*\n'
+        r'(?:(직접결제)\s*\n?\s*)?([\d,]+)\s*원'
     )
+    seen = set()
     for m in pattern.finditer(text):
         start, end, origin, dest, direct, fare = m.groups()
+        key = (start, fare.replace(",", ""))
+        if key in seen:
+            continue  # 분할겹침구간 중복 제거
+        seen.add(key)
         result["items"].append({
             "탑승시각": start, "하차시각": end,
             "출발지": origin.strip(), "도착지": dest.strip(),
