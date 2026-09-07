@@ -433,6 +433,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
+        last_pending_simple_notify_day = -1
 
         try:
             loop.run_until_complete(legacy.recalc_fish_hour_data())
@@ -446,13 +447,20 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                 # 정각/18:50 브리핑은 briefing_loop(별도스레드)로 완전이관됨(2026-08-29).
                 # 여기서는 AI작업(Haiku/마기자동검증)과 04시/08시/03시 작업만 담당.
 
-                if time.time() - last_orch_run_ts >= 300:
-                    last_orch_run_ts = time.time()
-                    try:
-                        tid = loop.run_until_complete(legacy.run_haiku_orchestration_once())
-                        loop.run_until_complete(legacy.mark_scheduler_run("run_haiku_orchestration_once", f"task_id={tid}" if tid else "no_task"))
-                    except Exception as exc:
-                        legacy.logger.error(f"Haiku오케스트레이션 실행 실패: {exc}")
+                # task93후속(2026-09-07) 검누리 실행Handoff 설계지시: Haiku 자동
+                # 오케스트레이션을 신규 검누리 실행구조에서 제외·퇴역. 대표님 승인
+                # (조사보고서 확인 후 "그렇게 작업 시작해") 반영 — 1단계: scheduler
+                # 호출만 비활성화(함수 run_haiku_orchestration_once 자체는 보존,
+                # 필요시 아래 주석만 해제하면 즉시 원복 가능). 실측: SIMPLE작업
+                # 71건 중 완전자동완주는 9건뿐이었고, 반면 task#68(300회+)/80(6일)/
+                # 120(오늘아침) 등 크레딧낭비 재발이 반복 확인됨.
+                # if time.time() - last_orch_run_ts >= 300:
+                #     last_orch_run_ts = time.time()
+                #     try:
+                #         tid = loop.run_until_complete(legacy.run_haiku_orchestration_once())
+                #         loop.run_until_complete(legacy.mark_scheduler_run("run_haiku_orchestration_once", f"task_id={tid}" if tid else "no_task"))
+                #     except Exception as exc:
+                #         legacy.logger.error(f"Haiku오케스트레이션 실행 실패: {exc}")
 
                 if time.time() - last_magi_review_ts >= 300:
                     last_magi_review_ts = time.time()
@@ -514,6 +522,17 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         legacy.logger.error(f"7일평균 이중검증 실행 오류: {exc}")
 
                 # 03시 리셋도 briefing_loop(별도스레드)로 이관됨(2026-08-29).
+
+                # task93후속(2026-09-07): Haiku오케스트레이션 퇴역 대체알림.
+                # 자동실행 없이, 대기중인 SIMPLE 작업 존재만 매일 1회 안내
+                # (사람이 직접 확인·처리하도록 — 가시성 손실 방지).
+                if now.hour == 9 and now.day != last_pending_simple_notify_day:
+                    try:
+                        loop.run_until_complete(legacy.notify_pending_simple_tasks())
+                        loop.run_until_complete(legacy.mark_scheduler_run("notify_pending_simple_tasks"))
+                    except Exception as exc:
+                        legacy.logger.error(f"대기중 SIMPLE작업 알림 실패: {exc}")
+                    last_pending_simple_notify_day = now.day
 
                 if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
                     try:
