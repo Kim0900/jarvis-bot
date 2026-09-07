@@ -4450,6 +4450,31 @@ async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
     return "알 수 없는 tool"
 
 
+async def notify_pending_simple_tasks():
+    """task93후속(2026-09-07) 검누리 실행Handoff 설계지시 반영 —
+    Haiku 자동오케스트레이션 퇴역(1단계: scheduler 호출 비활성화)에
+    따른 대체 알림. 자동실행은 전혀 안 하고, ASSIGNED+SIMPLE 상태로
+    대기 중인 작업이 있다는 사실만 매일 09시 1회 텔레그램으로 안내
+    — 자동처리 통로가 없어져 생기는 가시성 손실을 최소화하기 위함.
+    대기건이 0건이면 알림 자체를 보내지 않음(불필요한 소음 방지)."""
+    try:
+        rows = await sb_select("magi_tasks", {
+            "status": "eq.ASSIGNED", "task_type": "eq.SIMPLE",
+            "order": "created_at.asc"
+        })
+    except Exception as e:
+        logger.error(f"대기중 SIMPLE작업 조회 실패: {e}")
+        return
+    if not rows:
+        return
+    lines = [f"📋 대기중인 SIMPLE 작업 {len(rows)}건 (자동처리 안 됨 — Haiku오케스트레이션 퇴역, 직접 확인 필요)"]
+    for r in rows[:10]:
+        lines.append(f"  #{r.get('task_id')} {str(r.get('title') or '')[:40]} (담당:{r.get('owner_agent','')})")
+    if len(rows) > 10:
+        lines.append(f"  ...외 {len(rows) - 10}건 더")
+    await send_telegram_broadcast("\n".join(lines))
+
+
 async def run_haiku_orchestration_once():
     """task#40: ASSIGNED+캐스퍼+SIMPLE 태스크 1건을 찾아 Haiku로 처리 시도.
     최대 10회 tool호출 제한(무한루프방지). 완료시 evidence_registry에 PENDING
