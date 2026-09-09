@@ -2492,17 +2492,63 @@ def parse_daily_history(text: str) -> dict:
     return result
 
 
+def parse_uber_trip_detail(text: str) -> dict:
+    """형식④(우버 개별운행상세, "운행 세부사항"/"순수익" 화면) 파서.
+    task93후속(2026-09-09) — 실제 우버 콜카드(1000014294.jpg) Tesseract
+    PSM6 실측 기반. 카카오T와 파일명체계가 달라(10자리 "1000"접두사
+    vs 13자리) 별도 형식으로 분리."""
+    result: dict = {"format": "uber_trip_detail", "parse_errors": [], "콜유형": "우버"}
+
+    m = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\S*\s*(AM|PM)\s*(\d{1,2}):(\d{2})', text)
+    if m:
+        y, mo, d, ampm, h, mi = m.groups()
+        h = int(h)
+        if ampm == 'PM' and h != 12:
+            h += 12
+        if ampm == 'AM' and h == 12:
+            h = 0
+        result["날짜"] = f"{y}-{int(mo):02d}-{int(d):02d}"
+        result["배차시각"] = f"{h:02d}:{mi}"
+    else:
+        result["parse_errors"].append("날짜시각 파싱실패")
+
+    m = re.search(r'(\d{1,3})분\s*(\d{1,2})초', text)
+    if m:
+        result["운행시간_분"] = round(int(m.group(1)) + int(m.group(2)) / 60, 1)
+
+    m = re.search(r'([\d.]+)\s*km', text)
+    if m:
+        result["거리_km"] = float(m.group(1))
+
+    matches = re.findall(r'(대구광역시[^\n]*?)\s*KR', text)
+    if len(matches) >= 2:
+        result["출발지"] = matches[0].strip()
+        result["도착지"] = matches[1].strip()
+    else:
+        result["parse_errors"].append(f"출발/도착 파싱실패(찾은건수:{len(matches)})")
+
+    m = re.search(r'요금[^\d\n]*([\d,]{4,})', text)
+    if m:
+        result["요금"] = int(m.group(1).replace(",", ""))
+    else:
+        result["parse_errors"].append("요금 파싱실패")
+
+    return result
+
+
 def detect_and_parse_call_document(text: str) -> dict:
-    """task93 Drive일괄처리 — OCR 텍스트만 보고 3형식 중 자동판별 후
-    해당 파서 적용. 우선순위: 헤더가 뚜렷한 ①②를 먼저 체크,
-    나머지는 ③(개별운행상세)로 판정 — AI 판단 아닌 키워드 매칭."""
+    """task93 Drive일괄처리 — OCR 텍스트만 보고 4형식 중 자동판별 후
+    해당 파서 적용. 우선순위: 헤더가 뚜렷한 ①②④를 먼저 체크,
+    나머지는 ③(카카오T 개별운행상세)로 판정 — AI 판단 아닌 키워드 매칭."""
     if "매출" in text and "집계" in text:
         return parse_meter_receipt(text)
     if "일별" in text and "운행" in text and "이력" in text:
         return parse_daily_history(text)
+    if "운행 세부사항" in text or "순수익" in text:
+        return parse_uber_trip_detail(text)
     if "배차" in text and ("기사" in text or "운행 정보" in text):
         return parse_kakao_trip_detail(text)
-    return {"format": "unknown", "parse_errors": ["형식 판별 실패 — 3종 어디에도 해당 안 함"]}
+    return {"format": "unknown", "parse_errors": ["형식 판별 실패 — 4종 어디에도 해당 안 함"]}
 
 
 async def _save_one_raw_call(payload: dict) -> bool:
@@ -2549,6 +2595,15 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"), "하차시각": parsed.get("하차시각"),
             "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
             "콜유형": "카카오T", "비고": parsed.get("결제수단"),
+            "data_source": "drive_ocr_tesseract",
+        }
+        if await _save_one_raw_call(payload):
+            saved += 1
+    elif fmt == "uber_trip_detail":
+        payload = {
+            "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"),
+            "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
+            "콜유형": "우버", "비고": f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km" if parsed.get("운행시간_분") else None,
             "data_source": "drive_ocr_tesseract",
         }
         if await _save_one_raw_call(payload):
