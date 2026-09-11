@@ -25,12 +25,18 @@ Gunicorn worker timeout(60s) 재현 확인. 자체 재현측정(빠른 CPU
 timeout→⑥gunicorn timeout→⑦자원) 중 ②④⑤를 최소변경으로 적용:
 - 폭 900px 초과시 비율유지 축소(실측: 900px까지는 핵심필드 정확도
   100% 유지 확인, 카카오 정상샘플도 동일폭 기준 회귀없음 확인)
-- pytesseract에 자체 timeout(25초, Gunicorn 60초보다 충분히 작게)
-  추가 — 무한대기 대신 명확한 OCR_TIMEOUT 오류로 종료
+- pytesseract에 자체 timeout 추가 — 무한대기 대신 명확한 OCR_TIMEOUT 오류로 종료
 - 구조화 로그(duration_ms, 입력/처리 크기, error_stage) 추가
-①불필요한 중복호출 제거는 대상없음(분할은 텍스트잘림 방지 목적의
-필요한 처리, 9/5 실측검증됨 — 그대로 유지). ⑥⑦(gunicorn timeout
-자체 증가, 서비스 유료화)은 이번 최소변경 범위 밖 — 필요시 별도 승인.
+
+2026-09-11 YOUNGSIL 운영실측 후 최소복구 패치:
+Render Free(0.15 CPU) 실제 운영에서 900px 분할 OCR이 25초 timeout을
+초과하는 것을 확인. 정상 입력의 기존 정확도 경로를 보존하기 위해
+전역 해상도를 낮추지 않고, 각 OCR 조각마다 다음의 제한된 fallback만 추가한다.
+- 1차: 기존 900px 입력, 최대 14초
+- timeout 발생 조각만: 폭 600px로 추가 축소 후 최대 12초, 1회 재시도
+- 긴 이미지 2조각 모두 1차+fallback을 소진해도 이론상 OCR 대기 상한은
+  52초(14+12)x2로 Gunicorn 60초보다 8초 작음
+- 정상적으로 14초 안에 처리되는 조각은 기존 900px 텍스트를 그대로 사용
 """
 import base64
 import os
@@ -45,8 +51,10 @@ app = Flask(__name__)
 
 MCP_KEY = os.getenv("OCR_MCP_KEY")
 TESSERACT_CONFIG = "--psm 6"
-MAX_WIDTH = 900          # 2026-09-11: 실측검증된 안전폭(정확도 유지+처리시간 단축)
-TESSERACT_TIMEOUT_SEC = 25  # 2026-09-11: Gunicorn worker timeout(60s)보다 충분히 작게
+MAX_WIDTH = 900
+PRIMARY_TIMEOUT_SEC = 14
+FALLBACK_WIDTH = 600
+FALLBACK_TIMEOUT_SEC = 12
 
 
 def _check_auth():
@@ -58,21 +66,56 @@ def _check_auth():
     return True, ""
 
 
-def _resize_if_needed(img: Image.Image) -> Image.Image:
-    """2026-09-11: 폭이 MAX_WIDTH를 넘으면 비율유지 축소. 실측(우버 1080폭
-    샘플)으로 900px까지 핵심필드(날짜/금액/라벨) 정확도 100% 유지 확인됨."""
-    if img.width <= MAX_WIDTH:
+def _resize_to_width(img: Image.Image, max_width: int) -> Image.Image:
+    """폭이 max_width를 넘으면 비율을 유지한 채 축소한다."""
+    if img.width <= max_width:
         return img
-    scale = MAX_WIDTH / img.width
-    new_size = (MAX_WIDTH, max(1, int(img.height * scale)))
+    scale = max_width / img.width
+    new_size = (max_width, max(1, int(img.height * scale)))
     return img.resize(new_size, Image.LANCZOS)
 
 
+def _resize_if_needed(img: Image.Image) -> Image.Image:
+    """기본 OCR 경로는 기존 검증값인 900px 상한을 유지한다."""
+    return _resize_to_width(img, MAX_WIDTH)
+
+
+def _ocr_chunk_with_fallback(img: Image.Image, lang: str, chunk_name: str, meta: dict) -> str:
+    """기존 900px OCR을 우선하고, timeout 난 조각에만 600px 1회 fallback.
+
+    정확도 회귀를 피하기 위해 정상 1차 OCR 결과는 변경하지 않는다.
+    fallback은 RuntimeError(timeout)일 때만 수행하며 다른 오류는 숨기지 않는다.
+    """
+    try:
+        return pytesseract.image_to_string(
+            img, lang=lang, config=TESSERACT_CONFIG, timeout=PRIMARY_TIMEOUT_SEC)
+    except RuntimeError as primary_error:
+        fallback_img = _resize_to_width(img, FALLBACK_WIDTH)
+        meta["fallback_used"] = True
+        meta.setdefault("fallback_chunks", []).append(chunk_name)
+        print(
+            f"[OCR_FALLBACK] chunk={chunk_name} primary_timeout={PRIMARY_TIMEOUT_SEC}s "
+            f"primary_size={[img.width, img.height]} "
+            f"fallback_size={[fallback_img.width, fallback_img.height]} "
+            f"error={primary_error}",
+            flush=True,
+        )
+        return pytesseract.image_to_string(
+            fallback_img,
+            lang=lang,
+            config=TESSERACT_CONFIG,
+            timeout=FALLBACK_TIMEOUT_SEC,
+        )
+
+
 def smart_ocr(img: Image.Image, lang: str) -> tuple:
-    """실측검증(2026-09-05/09-11)된 OCR 전략. resize(900px상한) 후
-    PSM 6 고정 + 긴 이미지 자동분할 + Tesseract 자체 timeout.
-    반환: (텍스트, 처리단계별 메타정보 dict) — 관측성용."""
-    meta = {"orig_size": [img.width, img.height]}
+    """PSM 6 고정 + 900px 기본 resize + 긴 이미지 2분할.
+
+    2026-09-11 운영복구: 각 조각에서 900px 14초를 우선하고 timeout 조각만
+    600px 12초 fallback을 1회 허용한다.
+    반환: (텍스트, 처리단계별 메타정보 dict)
+    """
+    meta = {"orig_size": [img.width, img.height], "fallback_used": False}
     img = _resize_if_needed(img)
     meta["processed_size"] = [img.width, img.height]
 
@@ -83,14 +126,11 @@ def smart_ocr(img: Image.Image, lang: str) -> tuple:
     if meta["split"]:
         top = img.crop((0, 0, w, int(h * 0.55)))
         bottom = img.crop((0, int(h * 0.45), w, h))
-        text_top = pytesseract.image_to_string(
-            top, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
-        text_bottom = pytesseract.image_to_string(
-            bottom, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
+        text_top = _ocr_chunk_with_fallback(top, lang, "top", meta)
+        text_bottom = _ocr_chunk_with_fallback(bottom, lang, "bottom", meta)
         return text_top + "\n" + text_bottom, meta
 
-    text = pytesseract.image_to_string(
-        img, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
+    text = _ocr_chunk_with_fallback(img, lang, "full", meta)
     return text, meta
 
 
@@ -119,15 +159,23 @@ def ocr():
 
         text, meta = smart_ocr(img, lang)
         duration_ms = int((time.time() - t_start) * 1000)
-        print(f"[OCR_OK] duration_ms={duration_ms} orig={meta['orig_size']} "
-              f"processed={meta['processed_size']} split={meta['split']} "
-              f"text_len={len(text)}", flush=True)
+        print(
+            f"[OCR_OK] duration_ms={duration_ms} orig={meta['orig_size']} "
+            f"processed={meta['processed_size']} split={meta['split']} "
+            f"fallback_used={meta['fallback_used']} "
+            f"fallback_chunks={meta.get('fallback_chunks', [])} "
+            f"text_len={len(text)}",
+            flush=True,
+        )
         return jsonify({
-            "success": True, "text": text, "engine": "tesseract", "lang": lang,
+            "success": True,
+            "text": text,
+            "engine": "tesseract",
+            "lang": lang,
             "duration_ms": duration_ms,
+            "fallback_used": meta["fallback_used"],
         })
     except RuntimeError as e:
-        # pytesseract가 timeout 초과시 RuntimeError 발생
         duration_ms = int((time.time() - t_start) * 1000)
         print(f"[OCR_TIMEOUT] duration_ms={duration_ms} error={e}", flush=True)
         return jsonify({"success": False, "error": "OCR 처리시간 초과",
