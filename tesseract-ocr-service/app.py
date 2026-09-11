@@ -8,39 +8,29 @@ task93(2026-09-03) 3단계 — MAGI DATA CORE 비LLM OCR 서비스.
 jarvis-bot(bot_v5_legacy.py)의 parse_kakao_trip_detail() 등에서
 별도로 수행한다(관심사 분리).
 
-2026-09-05 실측검증 기반 개선(대표님 "완벽 구현" 지시):
-①기본 PSM(3)이 카카오T "일별운행이력" 스크린샷류 레이아웃에서 특정
-텍스트블록을 통째로 건너뛰는 문제를 실제 이미지로 재현확인(예:
-"23:34-23:48/동인동/방촌동" 항목 완전누락) → PSM 6("균일 텍스트
-블록 가정")으로 교체, 동일 이미지 재현시 전건 정확 추출 확인.
-②매우 긴 세로스크롤 이미지(세로/가로 2.5배 초과)는 안전장치로
-자동 2분할(0~55%/45~100%, 10%겹침) 후 각각 OCR, 텍스트 연결.
+2026-09-05 실측검증(1차): 기본 PSM(3)이 카카오T "일별운행이력"
+스크린샷류 레이아웃에서 특정 텍스트블록을 통째로 건너뛰는 문제를
+실제 이미지로 재현확인 → PSM 6("균일 텍스트 블록 가정")으로 교체.
+그 시점 추가 안전장치로 긴 이미지(세로/가로>2.5) 자동 2분할을
+도입했음(당시는 resize 없이 원본 그대로 처리).
 
-2026-09-11 CASPER_콜카드_파일명비의존_판별_OCR_TIMEOUT 작업지시서 반영:
-실제 우버 이미지(1080x2929/1080x3619, 세로/가로>2.5라 분할대상)에서
-Gunicorn worker timeout(60s) 재현 확인. 자체 재현측정(빠른 CPU
-환경) 결과 원본 그대로도 처리시간은 5초 내외였으나, Render Free
-플랜은 CPU가 크게 제한적이라 동일 작업이 훨씬 오래 걸릴 수 있음.
-- 폭 900px 초과시 비율유지 축소
-- pytesseract 자체 timeout 추가
-- 구조화 로그 추가
+2026-09-11 CASPER_콜카드_파일명비의존_판별_OCR_TIMEOUT 작업지시서
+반영(2차): 실제 우버 이미지에서 Gunicorn worker timeout(60s) 재현
+확인. 1차 수정(resize 900px+분할유지+timeout25s)을 실제 Render에
+배포해 재현측정한 결과 26.66초로 여전히 근접초과 — Render Free
+플랜 CPU가 로컬 재현환경보다 대폭 느림을 실측 확인.
 
-2026-09-11 YOUNGSIL 운영실측 최소복구 1차:
-Render Free(0.15 CPU) 실제 운영에서 900px 분할 OCR이 25초 timeout을
-초과하는 것을 확인. 정상 입력 정확도 경로를 보존하기 위해 전역 해상도를
-낮추지 않고, 각 OCR 조각마다 900px 14초 우선 → timeout 조각만 600px
-12초 fallback 1회로 제한했다.
-
-2026-09-11 YOUNGSIL 운영실측 최소복구 2차:
-실제 실패 샘플(1080x2929)에서 전체 900px OCR은 우버 날짜줄의 AM/PM을
-간헐적으로 손실했지만 원본 상단 소영역 OCR은 AM/PM을 안정적으로 복원했다.
-파서에 시간대를 추정하는 규칙을 넣지 않고, 긴 이미지에서 전체 OCR 결과에
-날짜+AM/PM 패턴이 없을 때만 원본 해상도 상단 헤더를 최대 5초 보조 OCR해
-텍스트 앞에 붙인다. 정상적으로 날짜+AM/PM이 읽힌 요청은 추가 OCR을 하지 않는다.
+이어서 분할 로직 자체의 필요성을 재검증: resize 후에는 분할(2회
+호출)이 비분할(1회 호출)보다 항상 25~30% 느리면서 정확도는
+동일함을 실측 확인(우버 샘플, 그리고 원 세로8423px 카카오 "일별
+운행이력" 11건 전체 리스트로도 비분할+800px에서 전건 정확 추출
+확인 — 2026-09-05 분할 도입 당시는 resize 없이 원본 그대로였던
+것이 원인으로, PSM6+적정resize 조합에서는 분할이 더 이상 필요
+없음). 따라서 분할 로직을 제거하고 MAX_WIDTH를 900→800px로
+조정(우버 샘플 750px부터 전필드 정확, 800px로 안전마진 확보).
 """
 import base64
 import os
-import re
 import time
 from io import BytesIO
 
@@ -52,15 +42,8 @@ app = Flask(__name__)
 
 MCP_KEY = os.getenv("OCR_MCP_KEY")
 TESSERACT_CONFIG = "--psm 6"
-MAX_WIDTH = 900
-PRIMARY_TIMEOUT_SEC = 14
-FALLBACK_WIDTH = 600
-FALLBACK_TIMEOUT_SEC = 12
-HEADER_TIMEOUT_SEC = 5
-DATE_WITH_MERIDIEM_RE = re.compile(
-    r'\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.\S*\s*(?:AM|PM)\s*\d{1,2}:\d{2}',
-    re.IGNORECASE,
-)
+MAX_WIDTH = 800          # 2026-09-11 2차: 750px부터 전필드 정확 확인, 안전마진 800px
+TESSERACT_TIMEOUT_SEC = 25  # Gunicorn worker timeout(60s)보다 충분히 작게
 
 
 def _check_auth():
@@ -72,108 +55,26 @@ def _check_auth():
     return True, ""
 
 
-def _resize_to_width(img: Image.Image, max_width: int) -> Image.Image:
-    """폭이 max_width를 넘으면 비율을 유지한 채 축소한다."""
-    if img.width <= max_width:
+def _resize_if_needed(img: Image.Image) -> Image.Image:
+    """폭이 MAX_WIDTH를 넘으면 비율유지 축소."""
+    if img.width <= MAX_WIDTH:
         return img
-    scale = max_width / img.width
-    new_size = (max_width, max(1, int(img.height * scale)))
+    scale = MAX_WIDTH / img.width
+    new_size = (MAX_WIDTH, max(1, int(img.height * scale)))
     return img.resize(new_size, Image.LANCZOS)
 
 
-def _resize_if_needed(img: Image.Image) -> Image.Image:
-    """기본 OCR 경로는 기존 검증값인 900px 상한을 유지한다."""
-    return _resize_to_width(img, MAX_WIDTH)
-
-
-def _ocr_chunk_with_fallback(img: Image.Image, lang: str, chunk_name: str, meta: dict) -> str:
-    """기존 900px OCR을 우선하고, timeout 난 조각에만 600px 1회 fallback."""
-    try:
-        return pytesseract.image_to_string(
-            img, lang=lang, config=TESSERACT_CONFIG, timeout=PRIMARY_TIMEOUT_SEC)
-    except RuntimeError as primary_error:
-        fallback_img = _resize_to_width(img, FALLBACK_WIDTH)
-        meta["fallback_used"] = True
-        meta.setdefault("fallback_chunks", []).append(chunk_name)
-        print(
-            f"[OCR_FALLBACK] chunk={chunk_name} primary_timeout={PRIMARY_TIMEOUT_SEC}s "
-            f"primary_size={[img.width, img.height]} "
-            f"fallback_size={[fallback_img.width, fallback_img.height]} "
-            f"error={primary_error}",
-            flush=True,
-        )
-        return pytesseract.image_to_string(
-            fallback_img,
-            lang=lang,
-            config=TESSERACT_CONFIG,
-            timeout=FALLBACK_TIMEOUT_SEC,
-        )
-
-
-def _maybe_prepend_original_header(orig_img: Image.Image, text: str, lang: str, meta: dict) -> str:
-    """긴 화면에서 전체 OCR이 날짜+AM/PM을 놓친 경우에만 원본 상단을 보조 OCR한다.
-
-    시간대를 추정하지 않는다. 보조 OCR 자체가 실패/timeout하면 기존 OCR 텍스트를
-    그대로 반환해 기존 경로를 깨뜨리지 않는다.
-    """
-    if not meta.get("split") or DATE_WITH_MERIDIEM_RE.search(text):
-        return text
-
-    # 실제 1080x2929 우버 샘플 기준 상단 앱바+날짜/금액 영역만 포함.
-    # 비율로 제한해 다른 긴 이미지에서도 전체를 다시 OCR하지 않도록 한다.
-    header_top = max(0, int(orig_img.height * 0.04))
-    header_bottom = min(orig_img.height, max(header_top + 1, int(orig_img.height * 0.24)))
-    header = orig_img.crop((0, header_top, orig_img.width, header_bottom))
-    try:
-        header_text = pytesseract.image_to_string(
-            header, lang=lang, config=TESSERACT_CONFIG, timeout=HEADER_TIMEOUT_SEC)
-        if DATE_WITH_MERIDIEM_RE.search(header_text):
-            meta["header_ocr_used"] = True
-            print(
-                f"[OCR_HEADER_RECOVERY] header_size={[header.width, header.height]} "
-                f"text_len={len(header_text)}",
-                flush=True,
-            )
-            return header_text + "\n" + text
-        meta["header_ocr_attempted"] = True
-    except RuntimeError as e:
-        meta["header_ocr_timeout"] = True
-        print(f"[OCR_HEADER_TIMEOUT] error={e}", flush=True)
-    except Exception as e:
-        meta["header_ocr_error"] = True
-        print(f"[OCR_HEADER_ERROR] error={e}", flush=True)
-    return text
-
-
 def smart_ocr(img: Image.Image, lang: str) -> tuple:
-    """PSM 6 + 900px 기본 resize + 긴 이미지 2분할 + timeout fallback.
-
-    전체 OCR 이후 날짜+AM/PM이 사라진 긴 화면에 한해서만 원본 상단 소영역을
-    추가 OCR한다. 반환: (텍스트, 처리단계별 메타정보 dict)
-    """
-    orig_img = img
-    meta = {
-        "orig_size": [img.width, img.height],
-        "fallback_used": False,
-        "header_ocr_used": False,
-    }
+    """2026-09-11 2차 실측검증된 OCR 전략. resize(800px상한) + PSM6
+    + 단일 image_to_string 호출(분할 제거 — 비분할이 항상 더 빠르고
+    정확도 동일함을 실측확인) + Tesseract 자체 timeout."""
+    meta = {"orig_size": [img.width, img.height]}
     img = _resize_if_needed(img)
     meta["processed_size"] = [img.width, img.height]
+    meta["split"] = False  # 2026-09-11 2차: 분할 로직 제거
 
-    w, h = img.width, img.height
-    ratio = h / max(w, 1)
-    meta["split"] = ratio > 2.5
-
-    if meta["split"]:
-        top = img.crop((0, 0, w, int(h * 0.55)))
-        bottom = img.crop((0, int(h * 0.45), w, h))
-        text_top = _ocr_chunk_with_fallback(top, lang, "top", meta)
-        text_bottom = _ocr_chunk_with_fallback(bottom, lang, "bottom", meta)
-        text = text_top + "\n" + text_bottom
-    else:
-        text = _ocr_chunk_with_fallback(img, lang, "full", meta)
-
-    text = _maybe_prepend_original_header(orig_img, text, lang, meta)
+    text = pytesseract.image_to_string(
+        img, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
     return text, meta
 
 
@@ -202,23 +103,11 @@ def ocr():
 
         text, meta = smart_ocr(img, lang)
         duration_ms = int((time.time() - t_start) * 1000)
-        print(
-            f"[OCR_OK] duration_ms={duration_ms} orig={meta['orig_size']} "
-            f"processed={meta['processed_size']} split={meta['split']} "
-            f"fallback_used={meta['fallback_used']} "
-            f"fallback_chunks={meta.get('fallback_chunks', [])} "
-            f"header_ocr_used={meta['header_ocr_used']} "
-            f"text_len={len(text)}",
-            flush=True,
-        )
+        print(f"[OCR_OK] duration_ms={duration_ms} orig={meta['orig_size']} "
+              f"processed={meta['processed_size']} text_len={len(text)}", flush=True)
         return jsonify({
-            "success": True,
-            "text": text,
-            "engine": "tesseract",
-            "lang": lang,
+            "success": True, "text": text, "engine": "tesseract", "lang": lang,
             "duration_ms": duration_ms,
-            "fallback_used": meta["fallback_used"],
-            "header_ocr_used": meta["header_ocr_used"],
         })
     except RuntimeError as e:
         duration_ms = int((time.time() - t_start) * 1000)
