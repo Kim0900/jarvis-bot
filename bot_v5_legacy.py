@@ -2348,7 +2348,10 @@ async def google_vision_ocr(image_bytes: bytes) -> str:
     if not service_url or not mcp_key:
         raise RuntimeError("OCR_SERVICE_URL/OCR_MCP_KEY 환경변수 없음")
     b64 = base64.b64encode(image_bytes).decode()
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # 2026-09-11: httpx timeout을 30s→65s로 조정 — OCR서비스 Gunicorn
+    # worker timeout(60s)보다 짧으면 서버가 정상처리 중에도 클라이언트가
+    # 먼저 끊어버리는 모순이 있었음(값 대폭증가가 아니라 정합성 수정).
+    async with httpx.AsyncClient(timeout=65.0) as client:
         resp = await client.post(
             f"{service_url}/ocr",
             headers={"X-MCP-Key": mcp_key},
@@ -2544,7 +2547,10 @@ def detect_and_parse_call_document(text: str) -> dict:
         return parse_meter_receipt(text)
     if "일별" in text and "운행" in text and "이력" in text:
         return parse_daily_history(text)
-    if "운행 세부사항" in text or "순수익" in text:
+    # 2026-09-11 CASPER_콜카드_파일명비의존_판별 작업지시서 반영: 단일
+    # 일반키워드 하나만으로 확정하지 않는다 — OR을 AND로 강화(실측:
+    # 실제 우버 운행세부사항 화면엔 두 키워드가 항상 함께 존재함 확인).
+    if "운행 세부사항" in text and "순수익" in text:
         return parse_uber_trip_detail(text)
     if "배차" in text and ("기사" in text or "운행 정보" in text):
         return parse_kakao_trip_detail(text)
