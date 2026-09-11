@@ -21,25 +21,26 @@ jarvis-bot(bot_v5_legacy.py)의 parse_kakao_trip_detail() 등에서
 Gunicorn worker timeout(60s) 재현 확인. 자체 재현측정(빠른 CPU
 환경) 결과 원본 그대로도 처리시간은 5초 내외였으나, Render Free
 플랜은 CPU가 크게 제한적이라 동일 작업이 훨씬 오래 걸릴 수 있음.
-지시서 수정검토순서(①중복호출→②원본해상도→③crop→④resize→⑤tesseract
-timeout→⑥gunicorn timeout→⑦자원) 중 ②④⑤를 최소변경으로 적용:
-- 폭 900px 초과시 비율유지 축소(실측: 900px까지는 핵심필드 정확도
-  100% 유지 확인, 카카오 정상샘플도 동일폭 기준 회귀없음 확인)
-- pytesseract에 자체 timeout 추가 — 무한대기 대신 명확한 OCR_TIMEOUT 오류로 종료
-- 구조화 로그(duration_ms, 입력/처리 크기, error_stage) 추가
+- 폭 900px 초과시 비율유지 축소
+- pytesseract 자체 timeout 추가
+- 구조화 로그 추가
 
-2026-09-11 YOUNGSIL 운영실측 후 최소복구 패치:
+2026-09-11 YOUNGSIL 운영실측 최소복구 1차:
 Render Free(0.15 CPU) 실제 운영에서 900px 분할 OCR이 25초 timeout을
-초과하는 것을 확인. 정상 입력의 기존 정확도 경로를 보존하기 위해
-전역 해상도를 낮추지 않고, 각 OCR 조각마다 다음의 제한된 fallback만 추가한다.
-- 1차: 기존 900px 입력, 최대 14초
-- timeout 발생 조각만: 폭 600px로 추가 축소 후 최대 12초, 1회 재시도
-- 긴 이미지 2조각 모두 1차+fallback을 소진해도 이론상 OCR 대기 상한은
-  52초(14+12)x2로 Gunicorn 60초보다 8초 작음
-- 정상적으로 14초 안에 처리되는 조각은 기존 900px 텍스트를 그대로 사용
+초과하는 것을 확인. 정상 입력 정확도 경로를 보존하기 위해 전역 해상도를
+낮추지 않고, 각 OCR 조각마다 900px 14초 우선 → timeout 조각만 600px
+12초 fallback 1회로 제한했다.
+
+2026-09-11 YOUNGSIL 운영실측 최소복구 2차:
+실제 실패 샘플(1080x2929)에서 전체 900px OCR은 우버 날짜줄의 AM/PM을
+간헐적으로 손실했지만 원본 상단 소영역 OCR은 AM/PM을 안정적으로 복원했다.
+파서에 시간대를 추정하는 규칙을 넣지 않고, 긴 이미지에서 전체 OCR 결과에
+날짜+AM/PM 패턴이 없을 때만 원본 해상도 상단 헤더를 최대 5초 보조 OCR해
+텍스트 앞에 붙인다. 정상적으로 날짜+AM/PM이 읽힌 요청은 추가 OCR을 하지 않는다.
 """
 import base64
 import os
+import re
 import time
 from io import BytesIO
 
@@ -55,6 +56,11 @@ MAX_WIDTH = 900
 PRIMARY_TIMEOUT_SEC = 14
 FALLBACK_WIDTH = 600
 FALLBACK_TIMEOUT_SEC = 12
+HEADER_TIMEOUT_SEC = 5
+DATE_WITH_MERIDIEM_RE = re.compile(
+    r'\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.\S*\s*(?:AM|PM)\s*\d{1,2}:\d{2}',
+    re.IGNORECASE,
+)
 
 
 def _check_auth():
@@ -81,11 +87,7 @@ def _resize_if_needed(img: Image.Image) -> Image.Image:
 
 
 def _ocr_chunk_with_fallback(img: Image.Image, lang: str, chunk_name: str, meta: dict) -> str:
-    """기존 900px OCR을 우선하고, timeout 난 조각에만 600px 1회 fallback.
-
-    정확도 회귀를 피하기 위해 정상 1차 OCR 결과는 변경하지 않는다.
-    fallback은 RuntimeError(timeout)일 때만 수행하며 다른 오류는 숨기지 않는다.
-    """
+    """기존 900px OCR을 우선하고, timeout 난 조각에만 600px 1회 fallback."""
     try:
         return pytesseract.image_to_string(
             img, lang=lang, config=TESSERACT_CONFIG, timeout=PRIMARY_TIMEOUT_SEC)
@@ -108,14 +110,53 @@ def _ocr_chunk_with_fallback(img: Image.Image, lang: str, chunk_name: str, meta:
         )
 
 
-def smart_ocr(img: Image.Image, lang: str) -> tuple:
-    """PSM 6 고정 + 900px 기본 resize + 긴 이미지 2분할.
+def _maybe_prepend_original_header(orig_img: Image.Image, text: str, lang: str, meta: dict) -> str:
+    """긴 화면에서 전체 OCR이 날짜+AM/PM을 놓친 경우에만 원본 상단을 보조 OCR한다.
 
-    2026-09-11 운영복구: 각 조각에서 900px 14초를 우선하고 timeout 조각만
-    600px 12초 fallback을 1회 허용한다.
-    반환: (텍스트, 처리단계별 메타정보 dict)
+    시간대를 추정하지 않는다. 보조 OCR 자체가 실패/timeout하면 기존 OCR 텍스트를
+    그대로 반환해 기존 경로를 깨뜨리지 않는다.
     """
-    meta = {"orig_size": [img.width, img.height], "fallback_used": False}
+    if not meta.get("split") or DATE_WITH_MERIDIEM_RE.search(text):
+        return text
+
+    # 실제 1080x2929 우버 샘플 기준 상단 앱바+날짜/금액 영역만 포함.
+    # 비율로 제한해 다른 긴 이미지에서도 전체를 다시 OCR하지 않도록 한다.
+    header_top = max(0, int(orig_img.height * 0.04))
+    header_bottom = min(orig_img.height, max(header_top + 1, int(orig_img.height * 0.24)))
+    header = orig_img.crop((0, header_top, orig_img.width, header_bottom))
+    try:
+        header_text = pytesseract.image_to_string(
+            header, lang=lang, config=TESSERACT_CONFIG, timeout=HEADER_TIMEOUT_SEC)
+        if DATE_WITH_MERIDIEM_RE.search(header_text):
+            meta["header_ocr_used"] = True
+            print(
+                f"[OCR_HEADER_RECOVERY] header_size={[header.width, header.height]} "
+                f"text_len={len(header_text)}",
+                flush=True,
+            )
+            return header_text + "\n" + text
+        meta["header_ocr_attempted"] = True
+    except RuntimeError as e:
+        meta["header_ocr_timeout"] = True
+        print(f"[OCR_HEADER_TIMEOUT] error={e}", flush=True)
+    except Exception as e:
+        meta["header_ocr_error"] = True
+        print(f"[OCR_HEADER_ERROR] error={e}", flush=True)
+    return text
+
+
+def smart_ocr(img: Image.Image, lang: str) -> tuple:
+    """PSM 6 + 900px 기본 resize + 긴 이미지 2분할 + timeout fallback.
+
+    전체 OCR 이후 날짜+AM/PM이 사라진 긴 화면에 한해서만 원본 상단 소영역을
+    추가 OCR한다. 반환: (텍스트, 처리단계별 메타정보 dict)
+    """
+    orig_img = img
+    meta = {
+        "orig_size": [img.width, img.height],
+        "fallback_used": False,
+        "header_ocr_used": False,
+    }
     img = _resize_if_needed(img)
     meta["processed_size"] = [img.width, img.height]
 
@@ -128,9 +169,11 @@ def smart_ocr(img: Image.Image, lang: str) -> tuple:
         bottom = img.crop((0, int(h * 0.45), w, h))
         text_top = _ocr_chunk_with_fallback(top, lang, "top", meta)
         text_bottom = _ocr_chunk_with_fallback(bottom, lang, "bottom", meta)
-        return text_top + "\n" + text_bottom, meta
+        text = text_top + "\n" + text_bottom
+    else:
+        text = _ocr_chunk_with_fallback(img, lang, "full", meta)
 
-    text = _ocr_chunk_with_fallback(img, lang, "full", meta)
+    text = _maybe_prepend_original_header(orig_img, text, lang, meta)
     return text, meta
 
 
@@ -164,6 +207,7 @@ def ocr():
             f"processed={meta['processed_size']} split={meta['split']} "
             f"fallback_used={meta['fallback_used']} "
             f"fallback_chunks={meta.get('fallback_chunks', [])} "
+            f"header_ocr_used={meta['header_ocr_used']} "
             f"text_len={len(text)}",
             flush=True,
         )
@@ -174,6 +218,7 @@ def ocr():
             "lang": lang,
             "duration_ms": duration_ms,
             "fallback_used": meta["fallback_used"],
+            "header_ocr_used": meta["header_ocr_used"],
         })
     except RuntimeError as e:
         duration_ms = int((time.time() - t_start) * 1000)
