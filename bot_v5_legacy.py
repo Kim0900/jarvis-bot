@@ -2502,7 +2502,10 @@ def parse_uber_trip_detail(text: str) -> dict:
     vs 13자리) 별도 형식으로 분리."""
     result: dict = {"format": "uber_trip_detail", "parse_errors": [], "콜유형": "우버"}
 
-    m = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.\S*\s*(AM|PM)\s*(\d{1,2}):(\d{2})', text)
+    # 2026-09-16 개선: OCR.space 도입후 실측(날짜~AM 사이에 "•" 등
+    # 불릿기호가 낌, Tesseract 때는 없었음) — 구분자를 \S* 대신
+    # [^\dAP]*?(숫자·A·P가 아닌 아무 문자나 non-greedy)로 완화.
+    m = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.[^\dAP]*?(AM|PM)\s*(\d{1,2}):(\d{2})', text)
     if m:
         y, mo, d, ampm, h, mi = m.groups()
         h = int(h)
@@ -2530,7 +2533,11 @@ def parse_uber_trip_detail(text: str) -> dict:
     else:
         result["parse_errors"].append(f"출발/도착 파싱실패(찾은건수:{len(matches)})")
 
-    m = re.search(r'요금[^\d\n]*([\d,]{4,})', text)
+    # 2026-09-16 개선: OCR.space는 "요금"/"순수익" 라벨을 값보다 먼저
+    # 몰아서 인식하는 경우가 있어(표 레이아웃 순서 재배열), 같은 줄
+    # 제한(\n 제외)이던 기존 정규식이 실패. 줄바꿈 포함 최대 20자
+    # 이내로 완화하고 원(₩)/역슬래시(Tesseract오인식) 둘 다 허용.
+    m = re.search(r'요금[\s\S]{0,20}?[₩\\]\s*([\d,]{4,})', text)
     if m:
         result["요금"] = int(m.group(1).replace(",", ""))
     else:
