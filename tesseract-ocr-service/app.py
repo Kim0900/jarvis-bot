@@ -160,6 +160,8 @@ def ocr():
         print(f"[OCR_OK] duration_ms={duration_ms} engine={meta.get('engine')} "
               f"fallback={meta.get('fallback_used')} orig={meta['orig_size']} "
               f"processed={meta['processed_size']} text_len={len(text)}", flush=True)
+        # 2026-09-16 임시 디버그: OCR.space 텍스트 출력형식 확인용(날짜파싱실패 원인규명)
+        print(f"[OCR_TEXT_DEBUG] {text[:500]!r}", flush=True)
         return jsonify({
             "success": True, "text": text, "lang": lang,
             "duration_ms": duration_ms, "engine": meta.get("engine"),
