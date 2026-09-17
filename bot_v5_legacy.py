@@ -5036,6 +5036,55 @@ async def check_ingestion_gap():
     return gap_days
 
 
+async def check_daily_ingestion_detail():
+    """task#69(2026-09-17): 04시 실행 — 어제 영업일 데이터 인입상태를
+    operated_status(task#38 인프라) 기반으로 세분화 판정. 기존
+    check_ingestion_gap()의 "3일 연속 0건"은 매우 뭉뚱그려진 백업감지라
+    (완전누락만, 최대 3일 지연) 그대로 유지하고, 이 함수는 매일(대기없이)
+    + 부분누락(GPX는 있는데 콜/영수증만 없음, source='gpx_proxy')까지
+    구분해서 하루 단위로 먼저 알린다."""
+    await sync_operated_status()
+
+    yesterday = str(today_kst() - timedelta(days=1))
+    try:
+        rows = await sb_select("operated_status", {"날짜": f"eq.{yesterday}"})
+    except Exception as e:
+        logger.error(f"세분화 인입상태 조회 실패({yesterday}): {e}")
+        return None
+
+    status = rows[0] if rows else None
+    if not status:
+        return None
+
+    source = status.get("source")
+    operated = status.get("operated")
+
+    if source == "confirmed" or operated is False:
+        return None  # 정상(콜/영수증 있음) 또는 휴무확정 — 알림 없음
+
+    if source == "gpx_proxy":
+        msg = (
+            f"🟡 부분누락 경고 ({yesterday})\n"
+            f"GPX로 운행은 확인됐으나 콜카드·영수증 데이터가 없습니다.\n"
+            f"OCR 업로드를 확인해주세요."
+        )
+    elif operated is None and source is None:
+        msg = (
+            f"🔴 데이터 없음 ({yesterday})\n"
+            f"콜·영수증·GPX 어느 것도 없습니다. 운행하셨다면 업로드를 확인해주세요.\n"
+            f"휴무였다면 잠시 후 08시 질문에 답장해주세요."
+        )
+    else:
+        return None
+
+    try:
+        await send_telegram_broadcast(msg)
+        logger.info(f"세분화 인입알림 발송: {yesterday} source={source} operated={operated}")
+    except Exception as e:
+        logger.error(f"세분화 인입알림 발송 실패: {e}")
+    return {"날짜": yesterday, "source": source, "operated": operated}
+
+
 async def recalc_daily_summary_totals(days_back: int = 14):
     """daily_summary가 GPX업로드/영수증OCR 시점에만 갱신되는 구조라, 그 액션을
     안 하면 운행을 해도 daily_summary가 그 날짜 자체가 안 만들어지는 문제
@@ -5924,6 +5973,13 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
                     loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot", f"FAIL: {e}"))
+                # ── task#69: 04:00 세분화 인입알림(부분누락 gpx_proxy 포함, 매일체크)
+                try:
+                    detail = loop.run_until_complete(check_daily_ingestion_detail())
+                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", str(detail) if detail else "OK"))
+                except Exception as e:
+                    logger.error(f"세분화 인입알림(task#69) 실패: {e}")
+                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", f"FAIL: {e}"))
                 last_kpi7day = now.day
 
             # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
