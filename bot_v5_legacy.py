@@ -2600,6 +2600,13 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
     fmt = parsed.get("format")
     saved = 0
 
+    if fmt == "daily_history":
+        # TEMP DEBUG (2026-09-17 캐스퍼) — 카카오 9건/8건 원인규명용.
+        # 원인파악 끝나면 이 블록 반드시 제거하고 재배포할 것.
+        logger.info(f"[TEMPDEBUG daily_history] raw_text=\n{text}")
+        logger.info(f"[TEMPDEBUG daily_history] parsed_items_count={len(parsed.get('items', []))} "
+                    f"parse_errors={parsed.get('parse_errors')}")
+
     if fmt == "meter_receipt":
         for item in parsed.get("items", []):
             payload = {
