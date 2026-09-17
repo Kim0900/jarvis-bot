@@ -2543,6 +2543,22 @@ def parse_uber_trip_detail(text: str) -> dict:
     else:
         result["parse_errors"].append("요금 파싱실패")
 
+    # 2026-09-17 실측(대표님 확인: 실제 18,600원인데 418,600원으로
+    # 오저장됨) — 원인: 라벨(순수익/요금/순수익/정산/지급)과 값이
+    # 화면에서 분리되어 OCR이 순서만 유지한 채 뭉쳐서 뱉어내는 경우,
+    # "요금" 바로 다음 값이 실제로는 다른 항목의 값(+OCR 문자인식
+    # 오류가 겹침)일 수 있음. "정산"은 항상 마이너스 부호가 붙어
+    # 식별이 명확하므로 교차검증용으로 사용 — 절댓값이 "요금"과
+    # 크게 다르면 자신있게 틀린 값을 저장하는 대신 명시적으로
+    # "확인필요" 표시만 남기고 값 자체는 보수적으로 건드리지 않는다.
+    m_settle = re.search(r'정산[\s\S]{0,40}?-\s*[₩\\]\s*([\d,]{4,})', text)
+    if m_settle and "요금" in result:
+        settle_amt = int(m_settle.group(1).replace(",", ""))
+        if abs(result["요금"] - settle_amt) > 100:
+            result["parse_errors"].append(
+                f"요금({result['요금']})≠정산액({settle_amt}) 불일치 — OCR오류 의심, 확인필요")
+            result["요금_정산액_참고"] = settle_amt
+
     return result
 
 
@@ -2613,10 +2629,16 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         if await _save_one_raw_call(payload):
             saved += 1
     elif fmt == "uber_trip_detail":
+        # 2026-09-17: 요금불일치 등 parse_errors가 있으면 비고에 명시
+        # — 잘못된 값을 조용히 저장하지 않고 확인 필요함을 남긴다.
+        note = f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km" if parsed.get("운행시간_분") else None
+        if parsed.get("parse_errors"):
+            warn = " | ⚠️" + "; ".join(parsed["parse_errors"])
+            note = (note or "") + warn
         payload = {
             "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"),
             "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
-            "콜유형": "우버", "비고": f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km" if parsed.get("운행시간_분") else None,
+            "콜유형": "우버", "비고": note,
             "data_source": "drive_ocr_tesseract",
         }
         if await _save_one_raw_call(payload):
