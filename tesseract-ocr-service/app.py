@@ -160,6 +160,8 @@ def ocr():
         print(f"[OCR_OK] duration_ms={duration_ms} engine={meta.get('engine')} "
               f"fallback={meta.get('fallback_used')} orig={meta['orig_size']} "
               f"processed={meta['processed_size']} text_len={len(text)}", flush=True)
+        # 2026-09-17 임시디버그: 요금파싱오류(418600) 원인규명용
+        print(f"[OCR_TEXT_DEBUG2] {text!r}", flush=True)
         return jsonify({
             "success": True, "text": text, "lang": lang,
             "duration_ms": duration_ms, "engine": meta.get("engine"),
