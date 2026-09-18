@@ -795,6 +795,19 @@ async def sb_upsert(table: str, data: dict, on_conflict: str) -> dict:
         raise RuntimeError(f"sb_upsert 실패: table={table}, on_conflict={on_conflict} (RLS/네트워크 등 — sb_h가 None 반환)")
     return result
 
+async def sb_patch(path: str, json_data: dict) -> dict | list:
+    """task#57(2026-09-17, 캐스퍼): sb_insert/sb_upsert와 동일 원칙 — task#47 계열의
+    반환값 미검사 위험이 approve_task의 직접 PATCH 호출에 잔존해있던 것을 원천봉쇄.
+    실패(sb_h가 None 반환)시 예외를 던져 호출부가 무검사로 "성공"처럼 넘어가는 것을 막음."""
+    result = await sb_h(
+        "PATCH", path,
+        json=json_data,
+        headers={**HEADERS_SB, "Prefer": "return=minimal"}
+    )
+    if result is None:
+        raise RuntimeError(f"sb_patch 실패: path={path} (RLS/네트워크 등 — sb_h가 None 반환)")
+    return result
+
 
 # ──────────────────────────────────────────────
 # GitHub 직접 커밋 (캐스퍼 명령서 #014 §2)
@@ -4764,11 +4777,10 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
                 "detail": f"자동승인 시도 거부됨(서버강제) - COMPLEX 또는 architect_decision_required=true. 원요청요약: {tool_input.get('summary','')[:200]}"
             })
             return "거부: 이 태스크는 COMPLEX 또는 architect_decision_required=true라 자동승인 불가합니다. escalate_to_architect를 사용하세요."
-        await sb_h("PATCH", f"magi_tasks?task_id=eq.{task_id}",
-                   json={"status": "COMPLETED", "verification_status": "MAGI_CONFIRMED",
-                         "verified_by": "마기(자동)", "verified_at": datetime.now(KST).isoformat(),
-                         "notes": f"[마기(자동) 승인] {tool_input.get('summary','')}"},
-                   headers={**HEADERS_SB, "Prefer": "return=minimal"})
+        await sb_patch(f"magi_tasks?task_id=eq.{task_id}",
+                       {"status": "COMPLETED", "verification_status": "MAGI_CONFIRMED",
+                        "verified_by": "마기(자동)", "verified_at": datetime.now(KST).isoformat(),
+                        "notes": f"[마기(자동) 승인] {tool_input.get('summary','')}"})
         await sb_insert("magi_task_events", {
             "task_id": task_id, "event_type": "TASK_COMPLETED", "old_status": "VERIFICATION",
             "new_status": "COMPLETED", "actor": "마기(자동)", "detail": tool_input.get("summary", "")
