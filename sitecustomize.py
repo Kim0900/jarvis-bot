@@ -497,6 +497,36 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
                     last_kpi7day = now.day
 
+                    # task#69: 세분화 인입알림은 KPI 3종과 독립적으로 하루 1회 실행.
+                    # task#146 DB기반 재시작내성 가드 원칙을 동일 적용하여,
+                    # 재배포/재시작 또는 다른 04시 작업 완료 여부와 무관하게 보장한다.
+                    try:
+                        ingestion_detail_done = loop.run_until_complete(
+                            legacy.already_ran_today_kst("check_daily_ingestion_detail")
+                        )
+                    except Exception as exc:
+                        legacy.logger.error(
+                            f"already_ran_today_kst(check_daily_ingestion_detail) 조회 실패: {exc}"
+                        )
+                        ingestion_detail_done = False
+                    if not ingestion_detail_done:
+                        try:
+                            detail = loop.run_until_complete(legacy.check_daily_ingestion_detail())
+                            loop.run_until_complete(
+                                legacy.mark_scheduler_run(
+                                    "check_daily_ingestion_detail",
+                                    str(detail) if detail else "OK",
+                                )
+                            )
+                        except Exception as exc:
+                            legacy.logger.error(f"세분화 인입알림(task#69) 실패: {exc}")
+                            loop.run_until_complete(
+                                legacy.mark_scheduler_run(
+                                    "check_daily_ingestion_detail",
+                                    f"FAIL: {exc}",
+                                )
+                            )
+
                 if now.hour == 8:
                     try:
                         dualverify_done = loop.run_until_complete(legacy.already_ran_today_kst("dual_verify_7day_average"))
