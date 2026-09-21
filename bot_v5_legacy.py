@@ -77,6 +77,32 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
+class _SecretRedactionFilter(logging.Filter):
+    """운영 로그에서 URL/메시지에 포함될 수 있는 credential을 마스킹한다."""
+    _TG_BOT_RE = re.compile(r"(https://api\.telegram\.org/bot)[^/\s\"]+")
+    _BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/-]+", re.IGNORECASE)
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            redacted = self._TG_BOT_RE.sub(r"\1<REDACTED>", msg)
+            redacted = self._BEARER_RE.sub(r"\1<REDACTED>", redacted)
+            if redacted != msg:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+_root_logger = logging.getLogger()
+for _handler in _root_logger.handlers:
+    _handler.addFilter(_SecretRedactionFilter())
+
+# httpx/python-telegram-bot의 요청 URL INFO 로그가 credential을 포함할 수 있어 억제.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
