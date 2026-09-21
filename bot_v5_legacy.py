@@ -372,21 +372,79 @@ class HealthHandler(BaseHTTPRequestHandler):
             # GAS가 Drive 신규이미지 감지시 base64로 인코딩해서 호출.
             # ──────────────────────────────────────────────
             if self.path == '/mcp/process_call_image':
+                source_id = payload.get("source_id")
                 try:
                     image_b64 = payload.get("image_base64")
                     if not image_b64:
                         send_json(400, {"success": False, "error": "image_base64 필요"})
                         return
+                    if not source_id:
+                        send_json(400, {"success": False, "error": "source_id 필요"})
+                        return
+
+                    claim = asyncio.run(acquire_call_image_ingestion(source_id))
+                    if not claim or not claim.get("ok"):
+                        send_json(400, {"success": False, "error": "INGESTION_CLAIM_FAILED", "source_id": source_id})
+                        return
+
+                    if claim.get("duplicate"):
+                        send_json(200, {
+                            "success": True,
+                            "duplicate": True,
+                            "source_id": source_id,
+                            "format": claim.get("format"),
+                            "saved_count": claim.get("inserted_count", 0),
+                        })
+                        return
+
+                    if not claim.get("acquired"):
+                        send_json(409, {
+                            "success": False,
+                            "error": "SOURCE_PROCESSING",
+                            "source_id": source_id,
+                            "status": claim.get("status"),
+                        })
+                        return
+
+                    if claim.get("retry"):
+                        asyncio.run(delete_partial_source_calls(source_id))
+
                     image_bytes = base64.b64decode(image_b64)
                     text = asyncio.run(google_vision_ocr(image_bytes))
                     if not text:
-                        send_json(400, {"success": False, "error": "OCR결과 비어있음"})
+                        asyncio.run(mark_call_image_ingestion(
+                            source_id, "FAILED", last_error="OCR결과 비어있음"
+                        ))
+                        send_json(400, {"success": False, "error": "OCR결과 비어있음", "source_id": source_id})
                         return
-                    result = asyncio.run(process_and_save_call_document(text, source_id=payload.get("source_id")))
-                    send_json(200 if result.get("success") else 400, result)
+
+                    result = asyncio.run(process_and_save_call_document(text, source_id=source_id))
+                    if result.get("success"):
+                        asyncio.run(mark_call_image_ingestion(
+                            source_id,
+                            "COMPLETED",
+                            fmt=result.get("format"),
+                            inserted_count=result.get("saved_count", 0),
+                        ))
+                        result["duplicate"] = False
+                        send_json(200, result)
+                    else:
+                        asyncio.run(mark_call_image_ingestion(
+                            source_id,
+                            "FAILED",
+                            fmt=result.get("format"),
+                            inserted_count=result.get("saved_count", 0),
+                            last_error=result.get("error") or "; ".join(result.get("parse_errors", [])),
+                        ))
+                        send_json(400, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/process_call_image 오류: {e}")
-                    send_json(400, {"success": False, "error": str(e)})
+                    if source_id:
+                        try:
+                            asyncio.run(mark_call_image_ingestion(source_id, "FAILED", last_error=str(e)))
+                        except Exception as mark_err:
+                            logger.error(f"ingestion FAILED 상태기록 실패(source_id={source_id}): {mark_err}")
+                    send_json(400, {"success": False, "error": str(e), "source_id": source_id})
                 return
 
             if self.path == '/mcp/get_blocked_tasks':
@@ -807,6 +865,59 @@ async def sb_patch(path: str, json_data: dict) -> dict | list:
     if result is None:
         raise RuntimeError(f"sb_patch 실패: path={path} (RLS/네트워크 등 — sb_h가 None 반환)")
     return result
+
+
+async def acquire_call_image_ingestion(source_id: str) -> dict:
+    """Drive 원본파일 단위 처리권 선점. DB RPC가 동시요청/FAILED 재시도/10분 stale takeover를 원자적으로 판정."""
+    result = await sb_h(
+        "POST",
+        "rpc/acquire_call_image_ingestion",
+        json={"p_source_id": source_id, "p_source_type": "google_drive"},
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"call image ingestion claim 실패: {result}")
+    return result
+
+
+async def mark_call_image_ingestion(
+    source_id: str,
+    status: str,
+    fmt: str = None,
+    inserted_count: int = 0,
+    last_error: str = None,
+):
+    """파일 처리 결과를 ingestion ledger에 기록."""
+    body = {
+        "status": status,
+        "format": fmt,
+        "inserted_count": int(inserted_count or 0),
+        "last_error": last_error,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat() if status == "COMPLETED" else None,
+    }
+    result = await sb_h(
+        "PATCH",
+        "call_image_ingestions",
+        params={"source_type": "eq.google_drive", "source_id": f"eq.{source_id}"},
+        json=body,
+        headers={**HEADERS_SB, "Prefer": "return=representation"},
+    )
+    if result is None:
+        raise RuntimeError(f"ingestion 상태기록 실패: source_id={source_id}, status={status}")
+    return result
+
+
+async def delete_partial_source_calls(source_id: str) -> int:
+    """FAILED/stale 재시도 전에 같은 원본파일의 부분저장 row만 제거."""
+    result = await sb_h(
+        "DELETE",
+        "raw_calls",
+        params={"source_id": f"eq.{source_id}", "data_source": "eq.drive_ocr_tesseract"},
+        headers={**HEADERS_SB, "Prefer": "return=representation"},
+    )
+    if result is None:
+        raise RuntimeError(f"부분 raw_calls 정리 실패: source_id={source_id}")
+    return len(result) if isinstance(result, list) else 0
 
 
 # ──────────────────────────────────────────────
@@ -2593,9 +2704,11 @@ def detect_and_parse_call_document(text: str) -> dict:
     return {"format": "unknown", "parse_errors": ["형식 판별 실패 — 4종 어디에도 해당 안 함"]}
 
 
-async def _save_one_raw_call(payload: dict) -> bool:
+async def _save_one_raw_call(payload: dict, source_id: str = None) -> bool:
     """raw_calls 1건 저장 공통헬퍼 — calc_service_date+validate_call_payload
-    거쳐서 저장. task93 Drive일괄처리 3종 파서가 공통으로 사용."""
+    거쳐서 저장. Drive 원본 file_id를 provenance로 함께 보존."""
+    if source_id:
+        payload["source_id"] = source_id
     payload.update(calc_service_date(payload.get("날짜"), payload.get("배차시각")))
     _valid, _reason = validate_call_payload(payload)
     if not _valid:
@@ -2620,7 +2733,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
                 "콜유형": "카카오T", "비고": f"{item['결제유형']}결제({item['결제수단']})",
                 "data_source": "drive_ocr_tesseract",
             }
-            if await _save_one_raw_call(payload):
+            if await _save_one_raw_call(payload, source_id=source_id):
                 saved += 1
     elif fmt == "daily_history":
         for item in parsed.get("items", []):
@@ -2630,7 +2743,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
                 "콜유형": "카카오T", "비고": "직접결제" if item["결제방식"] == "직접" else None,
                 "data_source": "drive_ocr_tesseract",
             }
-            if await _save_one_raw_call(payload):
+            if await _save_one_raw_call(payload, source_id=source_id):
                 saved += 1
     elif fmt == "kakao_trip_detail":
         payload = {
@@ -2639,7 +2752,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "콜유형": "카카오T", "비고": parsed.get("결제수단"),
             "data_source": "drive_ocr_tesseract",
         }
-        if await _save_one_raw_call(payload):
+        if await _save_one_raw_call(payload, source_id=source_id):
             saved += 1
     elif fmt == "uber_trip_detail":
         # 2026-09-21 P0: 우버 요금-정산액 불일치 시 Fail Closed.
@@ -2664,7 +2777,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "콜유형": "우버", "비고": note,
             "data_source": "drive_ocr_tesseract",
         }
-        if await _save_one_raw_call(payload):
+        if await _save_one_raw_call(payload, source_id=source_id):
             saved += 1
     else:
         return {"success": False, "error": "형식판별실패", "detail": parsed}
