@@ -2613,13 +2613,6 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
     fmt = parsed.get("format")
     saved = 0
 
-    if fmt == "daily_history":
-        # TEMP DEBUG (2026-09-17 캐스퍼) — 카카오 9건/8건 원인규명용.
-        # 원인파악 끝나면 이 블록 반드시 제거하고 재배포할 것.
-        logger.info(f"[TEMPDEBUG daily_history] raw_text=\n{text}")
-        logger.info(f"[TEMPDEBUG daily_history] parsed_items_count={len(parsed.get('items', []))} "
-                    f"parse_errors={parsed.get('parse_errors')}")
-
     if fmt == "meter_receipt":
         for item in parsed.get("items", []):
             payload = {
@@ -2649,8 +2642,18 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         if await _save_one_raw_call(payload):
             saved += 1
     elif fmt == "uber_trip_detail":
-        # 2026-09-17: 요금불일치 등 parse_errors가 있으면 비고에 명시
-        # — 잘못된 값을 조용히 저장하지 않고 확인 필요함을 남긴다.
+        # 2026-09-21 P0: 우버 요금-정산액 불일치 시 Fail Closed.
+        # OCR 오독으로 확인된 잘못된 요금을 raw_calls에 저장하지 않는다.
+        if parsed.get("요금_정산액_참고") is not None:
+            return {
+                "success": False,
+                "error": "UBER_FARE_MISMATCH",
+                "format": fmt,
+                "saved_count": 0,
+                "parse_errors": parsed.get("parse_errors", []),
+                "source_id": source_id,
+            }
+
         note = f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km" if parsed.get("운행시간_분") else None
         if parsed.get("parse_errors"):
             warn = " | ⚠️" + "; ".join(parsed["parse_errors"])
