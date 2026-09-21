@@ -4676,6 +4676,30 @@ async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
     return "알 수 없는 tool"
 
 
+async def already_ran_today_kst(job_name: str) -> bool:
+    """task#145(2026-09-21, 캐스퍼): 스케줄러의 '하루 1회' 가드가 메모리 변수
+    (예: last_pending_simple_notify_day)로만 구현돼있으면, Render 재배포/재시작마다
+    변수가 초기화되어 같은 시간대(hour==9 등)에 재진입시 중복발송됨 — 09:00/09:40/09:42
+    3회 중복알림으로 실증(2026-09-21, 09:40·09:42는 다른 세션의 재배포 타이밍과 정확히
+    일치). scheduler_status(mark_scheduler_run이 매번 갱신)의 DB영구기록을 근거로 삼아
+    재시작에도 살아남는 가드. 오늘자로 이미 기록돼있으면 True."""
+    try:
+        rows = await sb_select("scheduler_status", {"job_name": f"eq.{job_name}"})
+    except Exception as e:
+        logger.error(f"scheduler_status 조회 실패({job_name}): {e}")
+        return False
+    if not rows:
+        return False
+    last_run_at = rows[0].get("last_run_at")
+    if not last_run_at:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(last_run_at).astimezone(KST)
+    except Exception:
+        return False
+    return last_dt.date() == datetime.now(KST).date()
+
+
 async def notify_pending_simple_tasks():
     """task93후속(2026-09-07) 검누리 실행Handoff 설계지시 반영 —
     Haiku 자동오케스트레이션 퇴역(1단계: scheduler 호출 비활성화)에
@@ -4698,6 +4722,7 @@ async def notify_pending_simple_tasks():
         lines.append(f"  #{r.get('task_id')} {str(r.get('title') or '')[:40]} (담당:{r.get('owner_agent','')})")
     if len(rows) > 10:
         lines.append(f"  ...외 {len(rows) - 10}건 더")
+
     await send_telegram_broadcast("\n".join(lines))
 
 
