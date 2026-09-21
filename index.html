@@ -1445,28 +1445,9 @@ select.inp{padding:10px 13px}
           if(ocrResp && ocrResp.success) ocrData_raw = ocrResp.data;
         } catch(e){ /* 서버 실패 → 폴백으로 */ }
       }
-      // 2순위: 클라이언트 폴백 — 봇 서버 미연결/실패 시, 설정에 저장된 Claude 키로 직접 호출
-      // (캐스퍼 추가 2026-07-14, 일별이력 탭과 동일 패턴, 신규 서비스·추가비용 없음)
-      if(!ocrData_raw && claudeKey){
-        try {
-          const or2 = await fetch('https://api.anthropic.com/v1/messages',{
-            method:'POST',
-            headers:{'Content-Type':'application/json','x-api-key':claudeKey,
-                     'anthropic-version':'2023-06-01','anthropic-dangerous-allow-browser':'true'},
-            body: JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:400,temperature:0,
-              messages:[{role:'user',content:[
-                {type:'image',source:{type:'base64',media_type:file.type||'image/jpeg',data:b64}},
-                {type:'text',text:`오늘 날짜는 ${td()}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}\n영수증에 연도 표시가 없으면 오늘(${td()}) 기준 연도를 사용해라.\n⚠️ commission(수수료)은 영수증에 "수수료"라고 명시적으로 적힌 금액만 사용해라. "카드결제"·"앱결제"·"현금결제" 같은 결제수단별 분류 금액은 수수료가 아니니 혼동하지 마라. "수수료" 글자가 없으면 commission은 0으로 반환해라. 숫자만(원제외). JSON만 반환.`}
-              ]}]})
-          });
-          const od = await or2.json();
-          if(or2.ok){
-            const raw = (od.content.find(b=>b.type==='text')?.text || '').trim().replace(/```[a-z]*/g,'').replace(/```/g,'').trim();
-            ocrData_raw = JSON.parse(raw);
-          }
-        } catch(e){ /* 폴백도 실패 → 아래에서 최종 에러 처리 */ }
-      }
-      if(!ocrData_raw) throw new Error('OCR 실패: 백엔드 서버 URL을 설정하거나, 설정 탭에 Claude API 키를 입력해주세요');
+      // task#120(2026-09-21): 웹앱 OCR도 비AI 결정론적 경로로 통일.
+      // 서버 /ocr_receipt 실패 시 Claude 직접호출 폴백을 사용하지 않는다.
+      if(!ocrData_raw) throw new Error('OCR 실패: 백엔드 Tesseract OCR 경로를 확인해주세요');
       ocrData = ocrData_raw;
       const ocrIssues = validateOcrData(ocrData);
       // 수수료: 영수증 표시값 그대로 사용 (카카오가 직접 계산한 값)
