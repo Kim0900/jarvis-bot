@@ -191,23 +191,28 @@ class HealthHandler(BaseHTTPRequestHandler):
 
         if self.path == '/ocr_receipt':
             try:
-                import anthropic as _ant
                 b64 = payload.get('image_b64', '')
-                mt  = payload.get('media_type', 'image/jpeg')
-                client = _ant.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
-                # 캐스퍼 수정 2026-07-23: 영수증에 연도가 없는 경우가 대부분이라
-                # 오늘 날짜를 프롬프트에 명시하지 않으면 모델이 엉뚱한 연도(예: 2023)를
-                # 추측해버리는 버그가 있었음. 오늘 날짜를 컨텍스트로 반드시 제공.
-                _today_str = str(today_kst())
-                msg = client.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=400, temperature=0,
-                    messages=[{"role":"user","content":[
-                        {"type":"image","source":{"type":"base64","media_type":mt,"data":b64}},
-                        {"type":"text","text":f'오늘 날짜는 {_today_str}입니다. 이 택시 매출집계 영수증에서 정보를 추출해서 JSON만 반환해줘.\n{{"date":"YYYY-MM-DD","total_sales":숫자,"commission":숫자,"trip_count":숫자,"start_time":"HH:MM","end_time":"HH:MM"}}\n영수증에 연도 표시가 없으면 오늘({_today_str}) 기준 연도를 사용하되, 자정을 넘겨 익일로 표시된 시각이 있으면 날짜 앞뒤 관계를 자연스럽게 맞춰라.\n⚠️ commission(수수료)은 영수증에 "수수료"라고 명시적으로 적힌 금액만 사용해라. "카드결제"·"앱결제"·"현금결제"처럼 결제수단별로 나눈 금액은 수수료가 아니니 절대 혼동하지 마라. "수수료"라는 글자가 영수증에 없으면 commission은 0으로 반환해라. 숫자만(원제외). JSON만 반환.'}
-                    ]}]
-                )
-                txt = _re.sub(r"```[a-z]*", "", _extract_claude_text(msg).strip()).strip()
-                send_json(200, {"success": True, "data": _j.loads(txt)})
+                if not b64:
+                    send_json(400, {"success": False, "error": "image_b64 필요"})
+                    return
+                image_bytes = base64.b64decode(b64)
+                text = asyncio.run(google_vision_ocr(image_bytes))
+                data = parse_receipt_summary(text)
+                if data.get("parse_errors"):
+                    send_json(400, {
+                        "success": False,
+                        "error": "RECEIPT_PARSE_FAILED",
+                        "parse_errors": data.get("parse_errors"),
+                    })
+                    return
+                send_json(200, {"success": True, "data": {
+                    "date": data.get("date"),
+                    "total_sales": data.get("total_sales"),
+                    "commission": data.get("commission", 0),
+                    "trip_count": data.get("trip_count"),
+                    "start_time": data.get("start_time"),
+                    "end_time": data.get("end_time"),
+                }})
             except Exception as e:
                 logger.error(f"OCR 오류: {e}")
                 send_json(400, {"success": False, "error": str(e)})
@@ -2531,6 +2536,62 @@ def parse_kakao_trip_detail(text: str) -> dict:
     result["결제수단"] = m.group(1).strip() if m else None
 
     result["콜유형"] = "카카오T"
+    return result
+
+
+def parse_receipt_summary(text: str) -> dict:
+    """웹앱 /ocr_receipt용 결정론적 영수증 요약 파서.
+    기존 반환계약(date,total_sales,commission,trip_count,start_time,end_time)을 유지한다."""
+    result = {
+        "date": None,
+        "total_sales": None,
+        "commission": 0,
+        "trip_count": None,
+        "start_time": None,
+        "end_time": None,
+        "parse_errors": [],
+    }
+
+    # 집계일시 시작/종료: YY/MM/DD HH:MM:SS ~ YY/MM/DD HH:MM:SS
+    m = re.search(
+        r'집계일시\s*[:：]?\s*(\d{2})/(\d{2})/(\d{2})\s*(\d{1,2}):(\d{2})(?::\d{2})?'
+        r'[\s\S]{0,30}?(?:~|～|-)[\s\S]{0,10}?'
+        r'(\d{2})/(\d{2})/(\d{2})\s*(\d{1,2}):(\d{2})(?::\d{2})?',
+        text
+    )
+    if m:
+        sy, sm, sd, sh, smin, ey, em, ed, eh, emin = m.groups()
+        result["date"] = f"20{sy}-{sm}-{sd}"
+        result["start_time"] = f"{int(sh):02d}:{smin}"
+        result["end_time"] = f"{int(eh):02d}:{emin}"
+    else:
+        m = re.search(r'집계일시\s*[:：]?\s*(\d{2})/(\d{2})/(\d{2})', text)
+        if m:
+            result["date"] = f"20{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        result["parse_errors"].append("집계일시 파싱실패")
+
+    m = re.search(r'매출합계\s*[:：]?\s*([\d,]+)\s*원', text)
+    if m:
+        result["total_sales"] = int(m.group(1).replace(",", ""))
+    else:
+        result["parse_errors"].append("매출합계 파싱실패")
+
+    # 수수료는 화면에 '수수료'라고 명시된 경우만 채택. 없으면 기존 계약대로 0.
+    m = re.search(r'수수료\s*[:：]?\s*-?\s*([\d,]+)\s*원', text)
+    if m:
+        result["commission"] = int(m.group(1).replace(",", ""))
+
+    # 가장 신뢰도 높은 총건수는 '미터수입 ... [N건]'. 없으면 카드/앱/현금 건수 합계.
+    m = re.search(r'미터수입[\s\S]{0,40}?\[\s*(\d+)\s*건\s*\]', text)
+    if m:
+        result["trip_count"] = int(m.group(1))
+    else:
+        counts = re.findall(r'(?:카드|앱|현금)\s*결제[\s\S]{0,40}?\[\s*(\d+)\s*건\s*\]', text)
+        if counts:
+            result["trip_count"] = sum(int(x) for x in counts)
+        else:
+            result["parse_errors"].append("운행건수 파싱실패")
+
     return result
 
 
