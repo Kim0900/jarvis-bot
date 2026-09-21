@@ -526,12 +526,22 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                 # task93후속(2026-09-07): Haiku오케스트레이션 퇴역 대체알림.
                 # 자동실행 없이, 대기중인 SIMPLE 작업 존재만 매일 1회 안내
                 # (사람이 직접 확인·처리하도록 — 가시성 손실 방지).
-                if now.hour == 9 and now.day != last_pending_simple_notify_day:
+                # task#145(2026-09-21, 캐스퍼): last_pending_simple_notify_day(메모리
+                # 변수) 가드가 재배포/재시작마다 초기화되어 같은 09시대에 중복발송되던
+                # 버그 실증(09:00/09:40/09:42 3연속, 뒤 2건은 재배포 타이밍과 일치)
+                # — DB(scheduler_status) 기반 가드로 교체, 재시작에도 살아남음.
+                if now.hour == 9:
                     try:
-                        loop.run_until_complete(legacy.notify_pending_simple_tasks())
-                        loop.run_until_complete(legacy.mark_scheduler_run("notify_pending_simple_tasks"))
+                        already_sent = loop.run_until_complete(legacy.already_ran_today_kst("notify_pending_simple_tasks"))
                     except Exception as exc:
-                        legacy.logger.error(f"대기중 SIMPLE작업 알림 실패: {exc}")
+                        legacy.logger.error(f"already_ran_today_kst 조회 실패: {exc}")
+                        already_sent = False
+                    if not already_sent:
+                        try:
+                            loop.run_until_complete(legacy.notify_pending_simple_tasks())
+                            loop.run_until_complete(legacy.mark_scheduler_run("notify_pending_simple_tasks"))
+                        except Exception as exc:
+                            legacy.logger.error(f"대기중 SIMPLE작업 알림 실패: {exc}")
                     last_pending_simple_notify_day = now.day
 
                 if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
