@@ -470,56 +470,68 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                     except Exception as exc:
                         legacy.logger.error(f"마기(자동)검증 실행 실패: {exc}")
 
-                if now.hour == 4 and now.day != last_kpi7day:
+                if now.hour == 4:
                     try:
-                        loop.run_until_complete(legacy.recalc_daily_summary_totals())
-                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
+                        kpi7day_done = loop.run_until_complete(legacy.already_ran_today_kst("calc_daily_snapshot"))
                     except Exception as exc:
-                        legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
-                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {exc}"))
-                    try:
-                        loop.run_until_complete(legacy.recalc_7day_average())
-                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
-                    except Exception as exc:
-                        legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
-                        loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {exc}"))
-                    try:
-                        loop.run_until_complete(legacy.calc_daily_snapshot())
-                        loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
-                    except Exception as exc:
-                        legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
-                        loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
+                        legacy.logger.error(f"already_ran_today_kst(calc_daily_snapshot) 조회 실패: {exc}")
+                        kpi7day_done = False
+                    if not kpi7day_done:
+                        try:
+                            loop.run_until_complete(legacy.recalc_daily_summary_totals())
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
+                        except Exception as exc:
+                            legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {exc}"))
+                        try:
+                            loop.run_until_complete(legacy.recalc_7day_average())
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
+                        except Exception as exc:
+                            legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {exc}"))
+                        try:
+                            loop.run_until_complete(legacy.calc_daily_snapshot())
+                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
+                        except Exception as exc:
+                            legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
+                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
                     last_kpi7day = now.day
 
-                if now.hour == 8 and now.day != last_dualverify_day:
+                if now.hour == 8:
                     try:
-                        loop.run_until_complete(legacy.check_ingestion_gap())
-                        loop.run_until_complete(legacy.mark_scheduler_run("check_ingestion_gap"))
+                        dualverify_done = loop.run_until_complete(legacy.already_ran_today_kst("dual_verify_7day_average"))
                     except Exception as exc:
-                        legacy.logger.error(f"인입중단 감지 실패: {exc}")
-                    try:
-                        asked = loop.run_until_complete(legacy.ask_operated_status_telegram())
-                        loop.run_until_complete(legacy.mark_scheduler_run("ask_operated_status_telegram", f"asked={len(asked)}"))
-                    except Exception as exc:
-                        legacy.logger.error(f"operated_status 질문발송 실패: {exc}")
-                    try:
-                        dv = loop.run_until_complete(legacy.dual_verify_7day_average())
-                        last_dualverify_day = now.day
-                        loop.run_until_complete(legacy.mark_scheduler_run("dual_verify_7day_average", "OK" if dv["match"] else "MISMATCH"))
-                        if not dv["match"]:
-                            msg = (
-                                f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
-                                f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
-                                f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
-                                f"차이: {dv['diff']:+,}원\n"
-                                + "\n".join(dv.get("detail", []))
-                            )
-                            legacy.logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
-                            loop.run_until_complete(send_all(msg))
-                        else:
-                            legacy.logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
-                    except Exception as exc:
-                        legacy.logger.error(f"7일평균 이중검증 실행 오류: {exc}")
+                        legacy.logger.error(f"already_ran_today_kst(dual_verify_7day_average) 조회 실패: {exc}")
+                        dualverify_done = False
+                    if not dualverify_done:
+                        try:
+                            loop.run_until_complete(legacy.check_ingestion_gap())
+                            loop.run_until_complete(legacy.mark_scheduler_run("check_ingestion_gap"))
+                        except Exception as exc:
+                            legacy.logger.error(f"인입중단 감지 실패: {exc}")
+                        try:
+                            asked = loop.run_until_complete(legacy.ask_operated_status_telegram())
+                            loop.run_until_complete(legacy.mark_scheduler_run("ask_operated_status_telegram", f"asked={len(asked)}"))
+                        except Exception as exc:
+                            legacy.logger.error(f"operated_status 질문발송 실패: {exc}")
+                        try:
+                            dv = loop.run_until_complete(legacy.dual_verify_7day_average())
+                            last_dualverify_day = now.day
+                            loop.run_until_complete(legacy.mark_scheduler_run("dual_verify_7day_average", "OK" if dv["match"] else "MISMATCH"))
+                            if not dv["match"]:
+                                msg = (
+                                    f"⚠️ 7일평균 이중검증 불일치 발견 ({dv['date_range']})\n"
+                                    f"방식A(raw_calls 직접집계): {dv['method_a']['총매출']:,}원 (일평균 {dv['method_a']['일평균']:,.0f}원)\n"
+                                    f"방식B(daily_summary): {dv['method_b']['총매출']:,}원 (일평균 {dv['method_b']['일평균']:,.0f}원)\n"
+                                    f"차이: {dv['diff']:+,}원\n"
+                                    + "\n".join(dv.get("detail", []))
+                                )
+                                legacy.logger.warning(f"명령서#028 갭3 검증 불일치: {msg}")
+                                loop.run_until_complete(send_all(msg))
+                            else:
+                                legacy.logger.info(f"명령서#028 갭3 검증 통과 (일치, {dv['method_a']['총매출']:,}원)")
+                        except Exception as exc:
+                            legacy.logger.error(f"7일평균 이중검증 실행 오류: {exc}")
 
                 # 03시 리셋도 briefing_loop(별도스레드)로 이관됨(2026-08-29).
 
@@ -544,34 +556,50 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             legacy.logger.error(f"대기중 SIMPLE작업 알림 실패: {exc}")
                     last_pending_simple_notify_day = now.day
 
-                if now.hour == 3 and now.minute >= 10 and now.day != last_recalc_day:
+                if now.hour == 3 and now.minute >= 10:
                     try:
-                        loop.run_until_complete(legacy.recalc_fish_hour_data())
-                        legacy._FISH_HOUR_CACHE = {}
-                        legacy.logger.info("fish_hour_data 일일 재계산 완료")
+                        recalc_done = loop.run_until_complete(legacy.already_ran_today_kst("recalc_fish_finder"))
                     except Exception as exc:
-                        legacy.logger.error(f"fish_hour_data 일일 재계산 실패: {exc}")
-                    try:
-                        loop.run_until_complete(legacy.recalc_fish_hour_data_dow())
-                        legacy.logger.info("fish_hour_data_dow 일일 재계산 완료")
-                    except Exception as exc:
-                        legacy.logger.error(f"fish_hour_data_dow 일일 재계산 실패: {exc}")
-                    try:
-                        loop.run_until_complete(legacy.recalc_fish_finder())
-                    except Exception as exc:
-                        legacy.logger.error(f"fish_finder 일일 재계산 실패: {exc}")
+                        legacy.logger.error(f"already_ran_today_kst(recalc_fish_finder) 조회 실패: {exc}")
+                        recalc_done = False
+                    if not recalc_done:
+                        try:
+                            loop.run_until_complete(legacy.recalc_fish_hour_data())
+                            legacy._FISH_HOUR_CACHE = {}
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_fish_hour_data"))
+                            legacy.logger.info("fish_hour_data 일일 재계산 완료")
+                        except Exception as exc:
+                            legacy.logger.error(f"fish_hour_data 일일 재계산 실패: {exc}")
+                        try:
+                            loop.run_until_complete(legacy.recalc_fish_hour_data_dow())
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_fish_hour_data_dow"))
+                            legacy.logger.info("fish_hour_data_dow 일일 재계산 완료")
+                        except Exception as exc:
+                            legacy.logger.error(f"fish_hour_data_dow 일일 재계산 실패: {exc}")
+                        try:
+                            loop.run_until_complete(legacy.recalc_fish_finder())
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_fish_finder"))
+                        except Exception as exc:
+                            legacy.logger.error(f"fish_finder 일일 재계산 실패: {exc}")
                     last_recalc_day = now.day
 
                 # task#76(2026-08-30): 자동교차대조 - 콜카드/영수증 둘다있는
                 # 최근3일 날짜 자동감지, 사람이 매번 "대조 YYYY-MM-DD" 안 넣어도
                 # 됨. cross_check_status로 중복방지(기존수동명령어와 공존).
-                if now.hour == 4 and now.minute < 5 and now.day != last_crosscheck_day:
+                if now.hour == 4 and now.minute < 5:
                     try:
-                        summary = loop.run_until_complete(legacy.auto_cross_check_recent_days())
-                        if summary:
-                            legacy.logger.info(f"자동교차대조 완료:\n{summary[:500]}")
+                        crosscheck_done = loop.run_until_complete(legacy.already_ran_today_kst("auto_cross_check_recent_days"))
                     except Exception as exc:
-                        legacy.logger.error(f"자동교차대조 스케줄 실행 실패: {exc}")
+                        legacy.logger.error(f"already_ran_today_kst(auto_cross_check_recent_days) 조회 실패: {exc}")
+                        crosscheck_done = False
+                    if not crosscheck_done:
+                        try:
+                            summary = loop.run_until_complete(legacy.auto_cross_check_recent_days())
+                            loop.run_until_complete(legacy.mark_scheduler_run("auto_cross_check_recent_days"))
+                            if summary:
+                                legacy.logger.info(f"자동교차대조 완료:\n{summary[:500]}")
+                        except Exception as exc:
+                            legacy.logger.error(f"자동교차대조 스케줄 실행 실패: {exc}")
                     last_crosscheck_day = now.day
 
             except Exception as exc:
