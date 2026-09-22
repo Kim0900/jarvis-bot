@@ -332,6 +332,78 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e)})
                 return
 
+            if self.path == '/mcp/ops_snapshot':
+                try:
+                    tasks = asyncio.run(sb_select("magi_tasks", {
+                        "status": "not.in.(CLOSED,CANCELLED,COMPLETED)",
+                        "order": "priority.asc,updated_at.desc"
+                    })) or []
+                    events = asyncio.run(sb_select("magi_task_events", {
+                        "order": "created_at.desc", "limit": "20"
+                    })) or []
+
+                    def _project_task(t):
+                        return {
+                            "task_id": t.get("task_id"),
+                            "title": t.get("title"),
+                            "owner_agent": t.get("owner_agent"),
+                            "support_agents": t.get("support_agents"),
+                            "priority": t.get("priority"),
+                            "status": t.get("status"),
+                            "blocked_reason": t.get("blocked_reason"),
+                            "waiting_for": t.get("waiting_for"),
+                            "next_action": t.get("next_action"),
+                            "verification_status": t.get("verification_status"),
+                            "architect_decision_required": t.get("architect_decision_required"),
+                            "updated_at": t.get("updated_at"),
+                            "domain": t.get("domain"),
+                        }
+
+                    projected = [_project_task(t) for t in tasks]
+                    status_counts = {}
+                    priority_counts = {}
+                    for t in projected:
+                        status_counts[t.get("status")] = status_counts.get(t.get("status"), 0) + 1
+                        priority_counts[t.get("priority")] = priority_counts.get(t.get("priority"), 0) + 1
+
+                    approvals = [
+                        t for t in projected
+                        if t.get("status") == "WAITING"
+                        and (t.get("waiting_for") or t.get("architect_decision_required"))
+                    ]
+                    blockers = [
+                        t for t in projected
+                        if t.get("blocked_reason") or t.get("status") == "HOLD"
+                    ]
+
+                    send_json(200, {
+                        "success": True,
+                        "generated_at": datetime.now(KST).isoformat(),
+                        "summary": {
+                            "active_total": len(projected),
+                            "by_status": status_counts,
+                            "by_priority": priority_counts,
+                            "approval_waiting": len(approvals),
+                            "blockers": len(blockers),
+                        },
+                        "tasks": projected,
+                        "approvals": approvals,
+                        "blockers": blockers,
+                        "recent_events": [{
+                            "event_id": e.get("event_id"),
+                            "task_id": e.get("task_id"),
+                            "event_type": e.get("event_type"),
+                            "actor": e.get("actor"),
+                            "detail": e.get("detail"),
+                            "created_at": e.get("created_at"),
+                            "domain": e.get("domain"),
+                        } for e in events],
+                    })
+                except Exception as e:
+                    logger.error(f"MCP ops_snapshot 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             if self.path == '/mcp/get_task':
                 try:
                     tid = payload.get("task_id")
