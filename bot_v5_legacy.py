@@ -4853,6 +4853,85 @@ async def ask_operated_status_telegram():
     return pending
 
 
+async def build_agent_context_snapshot(agent_name: str) -> dict:
+    """task#145 Slack/공유상황판 후속: 자동 에이전트가 작업 시작 전에
+    공식 Registry의 자기 담당작업 + 전역 중요작업 + 최근 이벤트를 읽는다.
+    Slack은 표시계층일 뿐이며 판단 근거는 Supabase 원장이다."""
+    alias_map = {
+        "CASPER": ["CASPER", "캐스퍼"],
+        "CASSANDRA": ["CASSANDRA", "카산드라"],
+        "ARGOS": ["ARGOS", "아르고스"],
+        "ATLAS": ["ATLAS", "아틀라스"],
+        "YOUNGSIL": ["YOUNGSIL", "영실"],
+        "ATHENA": ["ATHENA", "아테나"],
+        "TAEO": ["TAEO", "태오"],
+        "MAGI": ["MAGI", "마기"],
+    }
+    aliases = alias_map.get((agent_name or "").upper(), [agent_name])
+    try:
+        active = await sb_select("magi_tasks", {
+            "status": "not.in.(CLOSED,CANCELLED,COMPLETED)",
+            "order": "priority.asc,updated_at.desc"
+        }) or []
+        events = await sb_select("magi_task_events", {
+            "order": "created_at.desc", "limit": "30"
+        }) or []
+    except Exception as exc:
+        logger.error(f"agent context 조회 실패({agent_name}): {exc}")
+        return {"agent": agent_name, "my_tasks": [], "global_critical": [], "recent_events": []}
+
+    def _match(t):
+        owner = str(t.get("owner_agent") or "")
+        supports = t.get("support_agents") or []
+        if not isinstance(supports, list):
+            supports = [supports]
+        values = [owner] + [str(x) for x in supports]
+        return any(a.lower() == v.lower() for a in aliases for v in values)
+
+    my_tasks = [t for t in active if _match(t)]
+    critical = [
+        t for t in active
+        if t.get("priority") in ("P0", "P1")
+        or t.get("status") == "HOLD"
+        or t.get("blocked_reason")
+    ]
+    ids = {t.get("task_id") for t in my_tasks + critical}
+    relevant = [e for e in events if e.get("task_id") in ids][:15]
+    return {
+        "agent": agent_name,
+        "my_tasks": [{
+            "task_id": t.get("task_id"),
+            "title": t.get("title"),
+            "priority": t.get("priority"),
+            "status": t.get("status"),
+            "owner_agent": t.get("owner_agent"),
+            "support_agents": t.get("support_agents"),
+            "blocked_reason": t.get("blocked_reason"),
+            "waiting_for": t.get("waiting_for"),
+            "next_action": t.get("next_action"),
+            "updated_at": t.get("updated_at"),
+        } for t in my_tasks],
+        "global_critical": [{
+            "task_id": t.get("task_id"),
+            "title": t.get("title"),
+            "priority": t.get("priority"),
+            "status": t.get("status"),
+            "owner_agent": t.get("owner_agent"),
+            "blocked_reason": t.get("blocked_reason"),
+            "next_action": t.get("next_action"),
+            "updated_at": t.get("updated_at"),
+        } for t in critical],
+        "recent_events": [{
+            "event_id": e.get("event_id"),
+            "task_id": e.get("task_id"),
+            "event_type": e.get("event_type"),
+            "actor": e.get("actor"),
+            "detail": e.get("detail"),
+            "created_at": e.get("created_at"),
+        } for e in relevant],
+    }
+
+
 # ──────────────────────────────────────────────
 # task#40 문제2 (2026-08-20): Haiku 기반 태스크 오케스트레이션.
 # 마기 최종확정: APScheduler잡(폴링)+Haiku+OCR(Sonnet)과 완전분리+캐스퍼&SIMPLE만.
@@ -5008,10 +5087,14 @@ async def run_haiku_orchestration_once():
         logger.error("Haiku오케스트레이션 - ANTHROPIC_API_KEY 없음")
         return None
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
+    preflight = await build_agent_context_snapshot("CASPER")
     messages = [{"role": "user", "content": (
+        f"[작업 전 공식 시스템 컨텍스트]\n{json.dumps(preflight, ensure_ascii=False, default=str)[:7000]}\n\n"
         f"태스크#{task_id}: {task.get('title','')}\n"
         f"문제: {task.get('problem','') or '(없음)'}\n"
-        f"목표: {task.get('target','') or '(없음)'}"
+        f"목표: {task.get('target','') or '(없음)'}\n"
+        "현재 담당자/최근 변경자가 다른 작업이 보이면 충돌 가능성을 먼저 확인하고, "
+        "확인 없이 동일 영역을 중복수정하지 말 것."
     )}]
 
     await sb_insert("magi_task_events", {
@@ -5271,7 +5354,9 @@ async def run_magi_auto_review_once():
             "이 중 하나라도 통과 못 하면 approve_task를 호출하지 말고 반드시 escalate_to_architect를 호출할 것."
         )
 
+    preflight = await build_agent_context_snapshot("MAGI")
     messages = [{"role": "user", "content": (
+        f"[작업 전 공식 시스템 컨텍스트]\n{json.dumps(preflight, ensure_ascii=False, default=str)[:7000]}\n\n"
         f"태스크#{task_id}: {task.get('title','')}\n"
         f"task_type: {task.get('task_type','미지정')}\n"
         f"architect_decision_required: {task.get('architect_decision_required', False)}\n"
