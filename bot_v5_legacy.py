@@ -404,6 +404,99 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e)})
                 return
 
+            if self.path == '/mcp/agent_context':
+                try:
+                    agent = (payload.get("agent") or payload.get("owner_agent") or "").strip()
+                    if not agent:
+                        send_json(400, {"success": False, "error": "agent 필요"})
+                        return
+
+                    alias_map = {
+                        "CASPER": ["CASPER", "캐스퍼"],
+                        "CASSANDRA": ["CASSANDRA", "카산드라"],
+                        "ARGOS": ["ARGOS", "아르고스"],
+                        "ATLAS": ["ATLAS", "아틀라스"],
+                        "YOUNGSIL": ["YOUNGSIL", "영실"],
+                        "ATHENA": ["ATHENA", "아테나"],
+                        "TAEO": ["TAEO", "태오"],
+                        "MAGI": ["MAGI", "마기"],
+                    }
+                    upper = agent.upper()
+                    aliases = alias_map.get(upper, [agent])
+
+                    active = asyncio.run(sb_select("magi_tasks", {
+                        "status": "not.in.(CLOSED,CANCELLED,COMPLETED)",
+                        "order": "priority.asc,updated_at.desc"
+                    })) or []
+                    recent_events = asyncio.run(sb_select("magi_task_events", {
+                        "order": "created_at.desc", "limit": "50"
+                    })) or []
+
+                    def _matches_agent(t):
+                        owner = str(t.get("owner_agent") or "")
+                        supports = t.get("support_agents") or []
+                        if not isinstance(supports, list):
+                            supports = [supports]
+                        values = [owner] + [str(x) for x in supports]
+                        return any(a.lower() == v.lower() for a in aliases for v in values)
+
+                    my_tasks = [t for t in active if _matches_agent(t)]
+                    global_critical = [
+                        t for t in active
+                        if t.get("priority") in ("P0", "P1")
+                        or t.get("status") == "HOLD"
+                        or t.get("blocked_reason")
+                    ]
+
+                    relevant_ids = {t.get("task_id") for t in my_tasks + global_critical}
+                    rel_events = [
+                        e for e in recent_events
+                        if e.get("task_id") in relevant_ids
+                    ][:20]
+
+                    send_json(200, {
+                        "success": True,
+                        "generated_at": datetime.now(KST).isoformat(),
+                        "agent": agent,
+                        "aliases": aliases,
+                        "my_tasks": [{
+                            "task_id": t.get("task_id"),
+                            "title": t.get("title"),
+                            "priority": t.get("priority"),
+                            "status": t.get("status"),
+                            "owner_agent": t.get("owner_agent"),
+                            "support_agents": t.get("support_agents"),
+                            "blocked_reason": t.get("blocked_reason"),
+                            "waiting_for": t.get("waiting_for"),
+                            "next_action": t.get("next_action"),
+                            "updated_at": t.get("updated_at"),
+                            "domain": t.get("domain"),
+                        } for t in my_tasks],
+                        "global_critical": [{
+                            "task_id": t.get("task_id"),
+                            "title": t.get("title"),
+                            "priority": t.get("priority"),
+                            "status": t.get("status"),
+                            "owner_agent": t.get("owner_agent"),
+                            "blocked_reason": t.get("blocked_reason"),
+                            "waiting_for": t.get("waiting_for"),
+                            "next_action": t.get("next_action"),
+                            "updated_at": t.get("updated_at"),
+                        } for t in global_critical],
+                        "recent_relevant_events": [{
+                            "event_id": e.get("event_id"),
+                            "task_id": e.get("task_id"),
+                            "event_type": e.get("event_type"),
+                            "actor": e.get("actor"),
+                            "detail": e.get("detail"),
+                            "created_at": e.get("created_at"),
+                        } for e in rel_events],
+                    })
+                except Exception as e:
+                    logger.error(f"MCP agent_context 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             if self.path == '/mcp/get_task':
                 try:
                     tid = payload.get("task_id")
