@@ -4996,10 +4996,14 @@ async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
         })
         return "기록 완료"
     elif name == "write_correction_log":
+        # task#83: correction_log는 대상이 혼합되므로 LLM 추정 금지.
+        # 자동 오케스트레이션 correction은 현재 task의 확정 domain만 상속한다.
+        task_rows = await sb_select("magi_tasks", {"task_id": f"eq.{task_id}", "limit": "1"})
+        task_domain = task_rows[0].get("domain") if task_rows else None
         await sb_insert("correction_log", {
             "table_name": tool_input.get("table_name", ""), "field_changed": "자동오케스트레이션발견",
             "old_value": "", "new_value": "", "changed_by": "캐스퍼(Haiku자동)",
-            "reason": tool_input.get("reason", "")
+            "reason": tool_input.get("reason", ""), "domain": task_domain
         })
         return "기록 완료"
     elif name == "finish_task":
@@ -5284,11 +5288,15 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
         return "__ESCALATED__"
     elif name == "create_next_task":
         try:
+            # task#83: 신규 하위 Task의 domain은 LLM이 정하지 않고 parent task의
+            # 확정 domain을 결정론적으로 상속한다. parent가 NULL이면 그대로 NULL.
+            parent_rows = await sb_select("magi_tasks", {"task_id": f"eq.{task_id}", "limit": "1"})
+            parent_domain = parent_rows[0].get("domain") if parent_rows else None
             new_task = await sb_insert("magi_tasks", {
                 "title": tool_input.get("title", ""), "problem": tool_input.get("problem", ""),
                 "target": tool_input.get("target", ""), "owner_agent": tool_input.get("owner_agent", ""),
                 "task_type": tool_input.get("task_type", "SIMPLE"), "status": "ASSIGNED",
-                "issuer": "마기(자동)", "parent_task_id": task_id,
+                "issuer": "마기(자동)", "parent_task_id": task_id, "domain": parent_domain,
             })
             new_id = new_task.get("task_id") if isinstance(new_task, dict) else (new_task[0].get("task_id") if new_task else None)
             try:
