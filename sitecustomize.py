@@ -60,7 +60,9 @@ def _install_ai_fallback() -> None:
 
     gemini_safe_mode = _truthy_env("MAGI_GEMINI_FREE_TIER_SAFE_MODE", True)
     gemini_min_interval = max(_float_env("MAGI_GEMINI_MIN_INTERVAL_SECONDS", 65.0), 0.0)
+    gemini_hard_quota_cooldown = max(_float_env("MAGI_GEMINI_HARD_QUOTA_COOLDOWN_SECONDS", 3600.0), 60.0)
     gemini_last_call_at = 0.0
+    gemini_hard_quota_until = 0.0
     tool_id_to_name: dict[str, str] = {}
 
     @dataclass
@@ -254,9 +256,16 @@ def _install_ai_fallback() -> None:
         max_tokens: int = 1000,
         temperature: float = 0,
     ) -> FallbackMessage:
+        nonlocal gemini_hard_quota_until
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY is not configured")
+        now_ts = time.time()
+        if now_ts < gemini_hard_quota_until:
+            remaining = int(max(gemini_hard_quota_until - now_ts, 0))
+            raise RuntimeError(
+                f"Gemini fallback circuit open after hard quota; retry after {remaining}s"
+            )
 
         payload: dict[str, Any] = {
             "contents": anthropic_messages_to_gemini(messages, system),
@@ -276,6 +285,18 @@ def _install_ai_fallback() -> None:
                 wait_for_free_tier_window()
                 res = client.post(url, headers={"x-goog-api-key": api_key}, json=payload)
                 if res.status_code != 429 or attempt == 3:
+                    break
+                body_lower = (res.text or "").lower()
+                hard_quota = (
+                    "quota exceeded" in body_lower
+                    and "generate_content_free_tier_requests" in body_lower
+                )
+                if hard_quota:
+                    gemini_hard_quota_until = time.time() + gemini_hard_quota_cooldown
+                    logger.warning(
+                        "Gemini hard free-tier quota reached; opening fallback circuit for %.0fs",
+                        gemini_hard_quota_cooldown,
+                    )
                     break
                 delay = retry_delay_seconds(res.text, attempt)
                 logger.warning("Gemini rate limited; retrying in %.1fs", delay)
