@@ -5042,11 +5042,12 @@ async def run_geomnuri_patrol_once() -> dict:
 
     # 3) 자동 에이전트 이벤트 반복루프 — task#68 Golden Failure Case 대응
     try:
-        events = await sb_select("magi_task_events", {
-            "order": "created_at.desc",
-            "limit": "250",
-        }) or []
         cutoff = now - timedelta(minutes=GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES)
+        events = await sb_select("magi_task_events", {
+            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
+            "order": "created_at.desc",
+            "limit": "1000",
+        }) or []
         groups = {}
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))
@@ -5118,11 +5119,12 @@ async def run_geomnuri_patrol_once() -> dict:
 
     # 5) task-linked domain NULL 재발 — task#83 회귀 감시
     try:
-        events = await sb_select("magi_task_events", {
-            "order": "created_at.desc",
-            "limit": "100",
-        }) or []
         cutoff = now - timedelta(hours=1)
+        events = await sb_select("magi_task_events", {
+            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
+            "order": "created_at.desc",
+            "limit": "1000",
+        }) or []
         bad = []
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))
@@ -5159,54 +5161,6 @@ async def run_geomnuri_patrol_once() -> dict:
 
     logger.info(f"검누리 순라 완료: {result}")
     return {"ok": True, "alerts": emitted, "findings": findings}
-
-
-async def _taeo_patrol_fault_injection_once():
-    """task#160 temporary live fault-injection.
-    운영 데이터/Task 상태를 변경하지 않고 경보 기록·Telegram·쿨다운 경로만 검증한다."""
-    await asyncio.sleep(3)
-    key = "synthetic_live_gate_v1"
-    detail = "비파괴 synthetic 순라 경보 — task#160 최종 live gate"
-    first = await _patrol_emit_once(
-        key, detail, task_id=GEOMNURI_PATROL_TASK_ID,
-        severity="WARN", cooldown_seconds=3600,
-    )
-    telegram_first = False
-    if first:
-        await send_telegram_broadcast(
-            "🧪 검누리 순라 synthetic 경보\n"
-            "task#160 최종 live gate — 실제 장애 아님\n"
-            "동일 키 즉시 재발생 시 쿨다운 차단 여부를 검증합니다."
-        )
-        telegram_first = True
-
-    second = await _patrol_emit_once(
-        key, detail, task_id=GEOMNURI_PATROL_TASK_ID,
-        severity="WARN", cooldown_seconds=3600,
-    )
-    telegram_second = False
-    if second:
-        await send_telegram_broadcast(
-            "🧪 검누리 순라 synthetic 2차 경보 — 이 메시지가 오면 쿨다운 실패"
-        )
-        telegram_second = True
-
-    logger.warning(
-        "TAEO_PATROL_FAULT_TEST first_emitted=%s second_emitted=%s "
-        "telegram_first=%s telegram_second=%s",
-        first, second, telegram_first, telegram_second,
-    )
-
-
-def _taeo_patrol_fault_test_thread():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_taeo_patrol_fault_injection_once())
-    except Exception as e:
-        logger.error("TAEO_PATROL_FAULT_TEST failed: %s", e)
-    finally:
-        loop.close()
 
 
 def geomnuri_patrol_scheduler():
@@ -7806,7 +7760,6 @@ def main():
 
     # task#160 검누리 순라 — 어군/자동검증과 독립된 감시 스레드
     threading.Thread(target=geomnuri_patrol_scheduler, daemon=True).start()
-    threading.Thread(target=_taeo_patrol_fault_test_thread, daemon=True).start()
     logger.info("검누리 순라 스케줄러 시작")
 
     # Telegram application
