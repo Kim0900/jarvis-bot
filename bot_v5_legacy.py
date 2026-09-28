@@ -1100,7 +1100,59 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     logger.info(f"Health server on port {PORT}")
-    server.serve_forever()# ──────────────────────────────────────────────
+    server.serve_forever()
+
+
+def _taeo_control_gate_selftest_once():
+    """task#162 temporary read-only live test for meaningful-change feed."""
+    time.sleep(3.0)
+    mcp_key = os.getenv("MCP_API_KEY", "")
+    if not mcp_key:
+        logger.error("TAEO_CONTROL_GATE_SELFTEST missing MCP_API_KEY")
+        return
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            ops = client.post(
+                f"http://127.0.0.1:{PORT}/mcp/ops_snapshot",
+                headers={"X-MCP-Key": mcp_key},
+                json={},
+            )
+            ctx = client.post(
+                f"http://127.0.0.1:{PORT}/mcp/agent_context",
+                headers={"X-MCP-Key": mcp_key},
+                json={"agent": "TAEO"},
+            )
+        opsj = ops.json() if ops.status_code == 200 else {}
+        ctxj = ctx.json() if ctx.status_code == 200 else {}
+        raw = opsj.get("recent_events") or []
+        task158 = [e for e in raw if e.get("task_id") == 158][:8]
+        bad_candidates = [
+            e for e in task158
+            if e.get("event_type") in ("AUTO_REVIEW_PROVIDER_BACKOFF", "TASK_UPDATED")
+            and e.get("slack_post_candidate") is True
+        ]
+        meaningful_158 = [
+            e for e in (opsj.get("meaningful_changes") or [])
+            if e.get("task_id") == 158
+        ]
+        logger.warning(
+            "TAEO_CONTROL_GATE_SELFTEST ops_status=%s ctx_status=%s "
+            "policy=%s suppressed=%s task158_raw=%s task158_bad_candidates=%s "
+            "task158_meaningful=%s ctx_meaningful=%s",
+            ops.status_code,
+            ctx.status_code,
+            (opsj.get("control_policy") or {}).get("version"),
+            opsj.get("suppressed_noise_count"),
+            len(task158),
+            len(bad_candidates),
+            len(meaningful_158),
+            len(ctxj.get("meaningful_changes") or []),
+        )
+    except Exception as e:
+        logger.error("TAEO_CONTROL_GATE_SELFTEST failed: %s", e)
+
+
+# ──────────────────────────────────────────────
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
 async def send_telegram_broadcast(text: str):
@@ -7998,6 +8050,7 @@ def main():
 
     # Health server
     threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=_taeo_control_gate_selftest_once, daemon=True).start()
 
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
