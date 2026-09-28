@@ -7418,6 +7418,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global image_queue
 
+    # TAEO task#158 one-time diagnostic: expose only the effective Supabase role,
+    # never the key/token itself. Remove after permission hardening is decided.
+    try:
+        _role_probe = asyncio.run(sb_h("POST", "rpc/ta_request_role_probe", json={}))
+        logger.warning("TAEO_SUPABASE_ROLE_PROBE=%s", _role_probe)
+    except Exception as e:
+        logger.error("TAEO Supabase role probe failed: %s", e)
+
     # Health server
     threading.Thread(target=run_health_server, daemon=True).start()
 
