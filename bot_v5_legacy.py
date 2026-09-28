@@ -46,6 +46,7 @@ ALLOWED_IDS = {x for x in ALLOWED_IDS_RAW if x}
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY      = os.getenv("SUPABASE_KEY", "")
+SUPABASE_INTERNAL_RPC_SECRET = os.getenv("SUPABASE_INTERNAL_RPC_SECRET", "")
 PORT              = int(os.getenv("PORT", "10000"))
 
 # 캐스퍼 명령서 #014 반영 (2026-07-10) — 봇 직접 GitHub 커밋용
@@ -72,6 +73,11 @@ HEADERS_SB = {
     "Content-Type": "application/json",
     "Prefer": "return=representation",
 }
+
+def _internal_rpc_headers() -> dict:
+    if not SUPABASE_INTERNAL_RPC_SECRET:
+        raise RuntimeError("SUPABASE_INTERNAL_RPC_SECRET is not configured")
+    return {**HEADERS_SB, "X-MAGI-RPC-Secret": SUPABASE_INTERNAL_RPC_SECRET}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1140,6 +1146,7 @@ async def acquire_call_image_ingestion(source_id: str) -> dict:
         "POST",
         "rpc/acquire_call_image_ingestion",
         json={"p_source_id": source_id, "p_source_type": "google_drive"},
+        headers=_internal_rpc_headers(),
     )
     if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError(f"call image ingestion claim 실패: {result}")
@@ -1167,6 +1174,7 @@ async def mark_call_image_ingestion(
             "p_last_error": last_error,
             "p_source_type": "google_drive",
         },
+        headers=_internal_rpc_headers(),
     )
     if not isinstance(result, dict) or not result.get("ok"):
         raise RuntimeError(
@@ -7421,7 +7429,9 @@ def main():
     # TAEO task#158 one-time diagnostic: expose only the effective Supabase role,
     # never the key/token itself. Remove after permission hardening is decided.
     try:
-        _role_probe = asyncio.run(sb_h("POST", "rpc/ta_request_role_probe", json={}))
+        _role_probe = asyncio.run(
+            sb_h("POST", "rpc/ta_request_role_probe", json={}, headers=_internal_rpc_headers())
+        )
         logger.warning("TAEO_SUPABASE_ROLE_PROBE=%s", _role_probe)
     except Exception as e:
         logger.error("TAEO Supabase role probe failed: %s", e)
