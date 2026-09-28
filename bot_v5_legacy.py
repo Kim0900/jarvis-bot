@@ -990,46 +990,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     logger.info(f"Health server on port {PORT}")
-    server.serve_forever()
-
-
-def _taeo_hold_backlog_selftest_once():
-    """task#161 temporary read-only live test for HOLD backlog surfaces."""
-    time.sleep(3.0)
-    mcp_key = os.getenv("MCP_API_KEY", "")
-    if not mcp_key:
-        logger.error("TAEO_HOLD_BACKLOG_SELFTEST missing MCP_API_KEY")
-        return
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            ops = client.post(
-                f"http://127.0.0.1:{PORT}/mcp/ops_snapshot",
-                headers={"X-MCP-Key": mcp_key},
-                json={},
-            )
-            ctx = client.post(
-                f"http://127.0.0.1:{PORT}/mcp/agent_context",
-                headers={"X-MCP-Key": mcp_key},
-                json={"agent": "TAEO"},
-            )
-        opsj = ops.json() if ops.status_code == 200 else {}
-        ctxj = ctx.json() if ctx.status_code == 200 else {}
-        ops_holds = opsj.get("hold_backlog") or []
-        ctx_holds = ctxj.get("hold_backlog") or []
-        by_id = {int(x.get("task_id")): x for x in ops_holds if x.get("task_id") is not None}
-        logger.warning(
-            "TAEO_HOLD_BACKLOG_SELFTEST ops_status=%s ctx_status=%s "
-            "ops_holds=%s ctx_holds=%s task68_complete=%s task68_event=%s "
-            "task114_complete=%s task114_event=%s",
-            ops.status_code, ctx.status_code, len(ops_holds), len(ctx_holds),
-            by_id.get(68, {}).get("metadata_complete"),
-            (by_id.get(68, {}).get("latest_event") or {}).get("event_id"),
-            by_id.get(114, {}).get("metadata_complete"),
-            (by_id.get(114, {}).get("latest_event") or {}).get("event_id"),
-        )
-    except Exception as e:
-        logger.error("TAEO_HOLD_BACKLOG_SELFTEST failed: %s", e)
-# ──────────────────────────────────────────────
+    server.serve_forever()# ──────────────────────────────────────────────
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
 async def send_telegram_broadcast(text: str):
@@ -7928,7 +7889,6 @@ def main():
 
     # Health server
     threading.Thread(target=run_health_server, daemon=True).start()
-    threading.Thread(target=_taeo_hold_backlog_selftest_once, daemon=True).start()
 
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
