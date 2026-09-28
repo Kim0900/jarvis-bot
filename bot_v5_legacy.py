@@ -873,6 +873,36 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e)[:300]})
                 return
 
+            # task#164: Drive GPX -> gpx_sessions 요약 staging.
+            # 기존 index.html parseGpx 의미론을 서버로 이동하며 raw_calls에는 쓰지 않는다.
+            if self.path == '/mcp/ingest_gpx':
+                try:
+                    text = payload.get("gpx_text")
+                    fid = payload.get("source_file_id")
+                    fname = payload.get("source_file_name")
+                    if not isinstance(text, str) or not text.strip():
+                        send_json(400, {"success": False, "error": "gpx_text 필요(문자열)"})
+                        return
+                    if len(text) > 10_000_000:
+                        send_json(400, {"success": False, "error": "gpx_text too_large(>10MB)"})
+                        return
+                    if not fid or not fname:
+                        send_json(400, {"success": False, "error": "source_file_id/source_file_name 필요"})
+                        return
+                    dry_run = bool(payload.get("dry_run", False))
+                    result = asyncio.run(gpx_ingest_text_run(text, str(fid), str(fname), dry_run=dry_run))
+                    logger.info(
+                        f"[GPX] ingest file={fname} dry_run={dry_run} "
+                        f"inserted={result.get('inserted')} duplicate={result.get('duplicate')} "
+                        f"date={(result.get('session') or {}).get('service_date')} "
+                        f"points={(result.get('session') or {}).get('point_count')}"
+                    )
+                    send_json(200, result)
+                except Exception as e:
+                    logger.error(f"MCP /mcp/ingest_gpx 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)[:300]})
+                return
+
             if self.path == '/mcp/get_blocked_tasks':
                 try:
                     rows = asyncio.run(sb_select("magi_tasks", {
@@ -1323,6 +1353,73 @@ async def s700_ingest_jsonl_run(text: str, source_file_id, source_file_name, dry
 async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
     import s700_ingest as _s700
     return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
+
+
+async def gpx_ingest_text_run(
+    text: str,
+    source_file_id: str,
+    source_file_name: str,
+    dry_run: bool = False,
+) -> dict:
+    """task#164: legacy index.html GPX summary semantics를 서버에서 결정론적으로 재현.
+    raw_calls/daily_summary에는 쓰지 않고 gpx_sessions 요약행만 멱등 적재한다."""
+    import gpx_ingest as _gpx
+
+    row, parsed = _gpx.build_gpx_session_row(text, source_file_id, source_file_name)
+
+    existing_by_id = await sb_h(
+        "GET", "gpx_sessions",
+        params={"source_file_id": f"eq.{source_file_id}", "limit": "1"},
+    )
+    if existing_by_id is None:
+        raise RuntimeError("gpx_sessions source_file_id 조회 실패")
+    if existing_by_id:
+        return {
+            "success": True,
+            "duplicate": True,
+            "duplicate_reason": "source_file_id",
+            "inserted": 0,
+            "session": parsed,
+            "existing_id": existing_by_id[0].get("id"),
+        }
+
+    existing_by_hash = await sb_h(
+        "GET", "gpx_sessions",
+        params={"source_sha256": f"eq.{row['source_sha256']}", "limit": "1"},
+    )
+    if existing_by_hash is None:
+        raise RuntimeError("gpx_sessions source_sha256 조회 실패")
+    if existing_by_hash:
+        return {
+            "success": True,
+            "duplicate": True,
+            "duplicate_reason": "source_sha256",
+            "inserted": 0,
+            "session": parsed,
+            "existing_id": existing_by_hash[0].get("id"),
+        }
+
+    if dry_run:
+        return {
+            "success": True,
+            "duplicate": False,
+            "dry_run": True,
+            "inserted": 0,
+            "session": parsed,
+        }
+
+    inserted = await sb_insert("gpx_sessions", row)
+    inserted_id = None
+    if isinstance(inserted, list) and inserted:
+        inserted_id = inserted[0].get("id")
+    return {
+        "success": True,
+        "duplicate": False,
+        "dry_run": False,
+        "inserted": 1,
+        "inserted_id": inserted_id,
+        "session": parsed,
+    }
 
 
 async def acquire_call_image_ingestion(source_id: str) -> dict:
