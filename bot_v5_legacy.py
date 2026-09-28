@@ -112,6 +112,115 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
+# task#162: Slack/관제 meaningful-change Gate
+# raw Registry event는 보존하되 표시계층 게시 후보는 결정론적으로 분리한다.
+# ──────────────────────────────────────────────
+CONTROL_CHANGE_POLICY_VERSION = "2026-09-29.v1"
+_CONTROL_ALWAYS_MEANINGFUL_TYPES = {
+    "TASK_CREATED",
+    "TASK_COMPLETED",
+    "EXECUTIVE_HOLD",
+    "PATROL_ALERT",
+    "ARCHITECT_QUESTION_SENT",
+    "TASK_CANCELLED",
+}
+_CONTROL_ALWAYS_NOISE_TYPES = {
+    "AUTO_REVIEW_PROVIDER_BACKOFF",
+}
+
+def _classify_control_event(event: dict) -> tuple[bool, str]:
+    event_type = str(event.get("event_type") or "").strip().upper()
+    actor = str(event.get("actor") or "").strip()
+    detail = str(event.get("detail") or "").strip()
+    detail_upper = detail.upper()
+    old_status = str(event.get("old_status") or "").strip()
+    new_status = str(event.get("new_status") or "").strip()
+
+    if event_type in _CONTROL_ALWAYS_NOISE_TYPES:
+        return False, "provider_backoff_noise"
+
+    if event_type == "TASK_UPDATED":
+        if old_status and new_status and old_status != new_status:
+            return True, "task_status_changed"
+        auto_review_markers = (
+            "검증 착수",
+            "검증 개시",
+            "조회 시작",
+            "DB 상태 확인",
+            "실제값 확인",
+        )
+        if ("자동" in actor or actor.upper().startswith("MAGI")) and any(
+            marker in detail for marker in auto_review_markers
+        ):
+            return False, "auto_review_progress_noise"
+        return False, "task_updated_without_state_change"
+
+    if event_type in _CONTROL_ALWAYS_MEANINGFUL_TYPES:
+        return True, event_type.lower()
+
+    if any(token in event_type for token in (
+        "BLOCKER", "BLOCKED", "UNBLOCKED", "PRIORITY_CHANGED", "OWNER_CHANGED"
+    )):
+        return True, "control_state_changed"
+
+    if actor.upper() == "CASSANDRA" or actor == "카산드라":
+        if "VALIDATION" in event_type or "REGRESSION" in event_type:
+            if any(token in detail_upper for token in (
+                "PASS", "FAIL", "PARTIAL", "HOLD", "COMPLETED", "REJECT"
+            )):
+                return True, "cassandra_verdict"
+        return False, "cassandra_progress_without_verdict"
+
+    return False, "non_control_event"
+
+
+def _project_control_event(event: dict) -> dict:
+    meaningful, reason = _classify_control_event(event)
+    return {
+        "event_id": event.get("event_id"),
+        "task_id": event.get("task_id"),
+        "event_type": event.get("event_type"),
+        "old_status": event.get("old_status"),
+        "new_status": event.get("new_status"),
+        "actor": event.get("actor"),
+        "detail": event.get("detail"),
+        "created_at": event.get("created_at"),
+        "domain": event.get("domain"),
+        "control_meaningful": meaningful,
+        "control_reason": reason,
+        "slack_post_candidate": meaningful,
+    }
+
+
+def _meaningful_control_changes(events: list[dict], limit: int = 20) -> list[dict]:
+    out = []
+    seen = set()
+    for event in events:
+        projected = _project_control_event(event)
+        if not projected["control_meaningful"]:
+            continue
+        detail = str(projected.get("detail") or "")
+        verdict = ""
+        for token in ("PARTIAL PASS", "PASS", "FAIL", "HOLD", "COMPLETED", "REJECT"):
+            if token in detail.upper():
+                verdict = token
+                break
+        fingerprint = (
+            projected.get("task_id"),
+            str(projected.get("event_type") or "").upper(),
+            projected.get("new_status"),
+            verdict,
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        out.append(projected)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ──────────────────────────────────────────────
 # Health Check 서버
 # ──────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
@@ -428,15 +537,17 @@ class HealthHandler(BaseHTTPRequestHandler):
                         "approvals": approvals,
                         "blockers": blockers,
                         "hold_backlog": hold_backlog,
-                        "recent_events": [{
-                            "event_id": e.get("event_id"),
-                            "task_id": e.get("task_id"),
-                            "event_type": e.get("event_type"),
-                            "actor": e.get("actor"),
-                            "detail": e.get("detail"),
-                            "created_at": e.get("created_at"),
-                            "domain": e.get("domain"),
-                        } for e in events],
+                        "control_policy": {
+                            "version": CONTROL_CHANGE_POLICY_VERSION,
+                            "source_of_truth": "Supabase magi_tasks/magi_task_events",
+                            "slack_role": "display_only",
+                            "rule": "Only meaningful_changes are Slack post candidates; recent_events remains raw diagnostic data.",
+                        },
+                        "meaningful_changes": _meaningful_control_changes(events, limit=20),
+                        "suppressed_noise_count": sum(
+                            1 for e in events if not _classify_control_event(e)[0]
+                        ),
+                        "recent_events": [_project_control_event(e) for e in events],
                     })
                 except Exception as e:
                     logger.error(f"MCP ops_snapshot 오류: {e}")
@@ -563,14 +674,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                             "next_action": t.get("next_action"),
                             "updated_at": t.get("updated_at"),
                         } for t in global_critical],
-                        "recent_relevant_events": [{
-                            "event_id": e.get("event_id"),
-                            "task_id": e.get("task_id"),
-                            "event_type": e.get("event_type"),
-                            "actor": e.get("actor"),
-                            "detail": e.get("detail"),
-                            "created_at": e.get("created_at"),
-                        } for e in rel_events],
+                        "control_policy": {
+                            "version": CONTROL_CHANGE_POLICY_VERSION,
+                            "slack_role": "display_only",
+                            "rule": "Slack posting uses meaningful_changes only. Provider backoff/review-start heartbeats are noise.",
+                        },
+                        "meaningful_changes": _meaningful_control_changes(rel_events, limit=20),
+                        "recent_relevant_events": [_project_control_event(e) for e in rel_events],
                     })
                 except Exception as e:
                     logger.error(f"MCP agent_context 오류: {e}")
@@ -5462,14 +5572,13 @@ async def build_agent_context_snapshot(agent_name: str) -> dict:
             "next_action": t.get("next_action"),
             "updated_at": t.get("updated_at"),
         } for t in critical],
-        "recent_events": [{
-            "event_id": e.get("event_id"),
-            "task_id": e.get("task_id"),
-            "event_type": e.get("event_type"),
-            "actor": e.get("actor"),
-            "detail": e.get("detail"),
-            "created_at": e.get("created_at"),
-        } for e in relevant],
+        "control_policy": {
+            "version": CONTROL_CHANGE_POLICY_VERSION,
+            "slack_role": "display_only",
+            "rule": "Slack posting uses meaningful_changes only; provider backoff and auto-review progress are not meaningful changes.",
+        },
+        "meaningful_changes": _meaningful_control_changes(relevant, limit=15),
+        "recent_events": [_project_control_event(e) for e in relevant],
     }
 
 
