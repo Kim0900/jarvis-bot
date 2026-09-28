@@ -643,6 +643,46 @@ class HealthHandler(BaseHTTPRequestHandler):
                     send_json(400, {"success": False, "error": str(e), "source_id": source_id})
                 return
 
+            # ──────────────────────────────────────────────
+            # task#150(2026-09-28): S700 JSONL -> s700_trips staging (결정론적, AI호출 없음).
+            # raw_calls 에는 쓰지 않는다. dry_run=true 면 DB 쓰기 없이 예상 결과만 반환.
+            # 호출자(YOUNGSIL bridge/GAS)는 Drive JSONL 본문을 jsonl_text 로 push 한다.
+            # ──────────────────────────────────────────────
+            if self.path == '/mcp/ingest_s700_jsonl':
+                try:
+                    text = payload.get("jsonl_text")
+                    fid, fname = payload.get("source_file_id"), payload.get("source_file_name")
+                    if not isinstance(text, str) or not text.strip():
+                        send_json(400, {"success": False, "error": "jsonl_text 필요(문자열)"})
+                        return
+                    if len(text) > 8_000_000:
+                        send_json(400, {"success": False, "error": "jsonl_text too_large(>8MB)"})
+                        return
+                    if not (fid or fname):
+                        send_json(400, {"success": False, "error": "source_file_id 또는 source_file_name 필요(provenance)"})
+                        return
+                    dry_run = bool(payload.get("dry_run", False))
+                    result = asyncio.run(s700_ingest_jsonl_run(text, fid, fname, dry_run))
+                    logger.info(f"[S700] ingest file={fname or fid} dry_run={dry_run} inserted={result.get('inserted')} "
+                                f"dup={result.get('duplicates_existing')} conflicts={len(result.get('conflicts_existing', []))} "
+                                f"failed={len(result.get('insert_failed', []))} match={result.get('match')}")
+                    send_json(200, result)
+                except Exception as e:
+                    logger.error(f"MCP /mcp/ingest_s700_jsonl 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)[:300]})
+                return
+
+            if self.path == '/mcp/s700_match':
+                try:
+                    limit = max(1, min(int(payload.get("limit", 500)), 2000))
+                    result = asyncio.run(s700_rematch_run(bool(payload.get("dry_run", False)), limit))
+                    logger.info(f"[S700] rematch evaluated={result.get('evaluated')} changed={result.get('changed')} match={result.get('match')}")
+                    send_json(200, result)
+                except Exception as e:
+                    logger.error(f"MCP /mcp/s700_match 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)[:300]})
+                return
+
             if self.path == '/mcp/get_blocked_tasks':
                 try:
                     rows = asyncio.run(sb_select("magi_tasks", {
@@ -1061,6 +1101,37 @@ async def sb_patch(path: str, json_data: dict) -> dict | list:
     if result is None:
         raise RuntimeError(f"sb_patch 실패: path={path} (RLS/네트워크 등 — sb_h가 None 반환)")
     return result
+
+
+# ──────────────────────────────────────────────
+# task#150 (TAEO 발주, 대표 착수승인 2026-09-28): S700 JSONL -> s700_trips staging.
+# 순수 로직은 s700_ingest.py(네트워크 없음, 단위테스트 63건)에 있고, 여기는 DB 어댑터 + 얇은 래퍼뿐.
+# 기존 파이프라인(raw_calls/OCR/스케줄러)은 건드리지 않으며 raw_calls 에는 INSERT/UPDATE 하지 않는다.
+# 주의: sb_select 는 실패시 []를 돌려줘서 "조용한 성공"을 만들 수 있으므로 여기선 쓰지 않고
+#       sb_h 결과가 None 이면 예외로 올리는 전용 어댑터를 쓴다.
+# ──────────────────────────────────────────────
+class _S700Sb:
+    async def get(self, table: str, params: dict) -> list:
+        r = await sb_h("GET", table, params=params)
+        if r is None:
+            raise RuntimeError(f"Supabase GET {table} 실패")
+        return r if isinstance(r, list) else []
+
+    async def insert(self, table: str, row: dict):
+        return await sb_insert(table, row)  # 실패시 RuntimeError
+
+    async def patch(self, path: str, data: dict):
+        await sb_patch(path, data)  # 실패시 RuntimeError
+
+
+async def s700_ingest_jsonl_run(text: str, source_file_id, source_file_name, dry_run: bool) -> dict:
+    import s700_ingest as _s700
+    return await _s700.ingest_jsonl(_S700Sb(), text, source_file_id, source_file_name, dry_run=dry_run)
+
+
+async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
+    import s700_ingest as _s700
+    return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
 
 
 async def acquire_call_image_ingestion(source_id: str) -> dict:
