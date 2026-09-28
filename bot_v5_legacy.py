@@ -918,6 +918,46 @@ def run_health_server():
     logger.info(f"Health server on port {PORT}")
     server.serve_forever()
 
+
+def _taeo_s700_http_selftest_once():
+    """task#150 temporary E2E probe. Actual 2026-09-01 closed S700 trip, dry-run only."""
+    time.sleep(2.0)
+    mcp_key = os.getenv("MCP_API_KEY", "")
+    if not mcp_key:
+        logger.error("TAEO_S700_HTTP_SELFTEST missing MCP_API_KEY")
+        return
+    sample = (
+        '{"type":"frame","received_at":"2026-09-01T21:04:32.381+09:00",'
+        '"meter_time_raw":"260901210432",'
+        '"ascii":"2609012104322200780A08004500000000000000000026090121012726090121043100011340043820010045000000004D",'
+        '"hex":"02323630393031323130343332323230303738304130383030343530303030303030303030303030303030303032363039303132313031323732363039303132313034333130303031313334303034333832303031303034353030303030303030344403",'
+        '"payload_length":98,"frame_class":"LONG_BUSINESS_FRAME","checksum_received":"4D",'
+        '"checksum_calculated":"4D","checksum_valid":true,"meter_fare":4500,'
+        '"trip_start":"260901210127","trip_end":"260901210431","distance_raw":11340,'
+        '"fare_copy":4500,"aux_flag":"01","primary_state":"0A","secondary_state":"08",'
+        '"decode_warning":null,"trip_closed":true,"decoder_version":"s700-decoder-v0.4"}'
+    )
+    payload = {
+        "jsonl_text": sample,
+        "source_file_id": "1IPrHGNE_nxoWfRK2MufuZCqFiNc4_dyq",
+        "source_file_name": "s700_20260901.jsonl",
+        "dry_run": True,
+    }
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.post(
+                f"http://127.0.0.1:{PORT}/mcp/ingest_s700_jsonl",
+                headers={"X-MCP-Key": mcp_key},
+                json=payload,
+            )
+        logger.warning(
+            "TAEO_S700_HTTP_SELFTEST status=%s body=%s",
+            resp.status_code,
+            resp.text[:1500],
+        )
+    except Exception as e:
+        logger.error("TAEO_S700_HTTP_SELFTEST failed: %s", e)
+
 # ──────────────────────────────────────────────
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
@@ -7428,6 +7468,7 @@ def main():
 
     # Health server
     threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=_taeo_s700_http_selftest_once, daemon=True).start()
 
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
