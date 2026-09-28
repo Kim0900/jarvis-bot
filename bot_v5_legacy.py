@@ -7429,10 +7429,14 @@ def main():
     # TAEO task#158 one-time diagnostic: expose only the effective Supabase role,
     # never the key/token itself. Remove after permission hardening is decided.
     try:
-        _role_probe = asyncio.run(
-            sb_h("POST", "rpc/ta_request_role_probe", json={}, headers=_internal_rpc_headers())
-        )
-        logger.warning("TAEO_SUPABASE_ROLE_PROBE=%s", _role_probe)
+        with httpx.Client(timeout=10.0) as _probe_client:
+            _probe_resp = _probe_client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/ta_request_role_probe",
+                headers=_internal_rpc_headers(),
+                json={},
+            )
+        _probe_resp.raise_for_status()
+        logger.warning("TAEO_SUPABASE_ROLE_PROBE=%s", _probe_resp.json())
     except Exception as e:
         logger.error("TAEO Supabase role probe failed: %s", e)
 
