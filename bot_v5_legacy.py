@@ -4861,6 +4861,331 @@ async def mark_scheduler_run(job_name: str, result: str = "OK"):
         logger.error(f"scheduler_status 기록 실패({job_name}): {e}")
 
 
+# ──────────────────────────────────────────────
+# task#160: 검누리 순라 MVP (2026-09-28)
+# 1단계 원칙: 감지 → Registry 사건 기록 → Telegram 경보. 자동복구 금지.
+# 순라는 fish_scheduler와 별도 스레드에서 동작해 감시대상과 실패영역을 분리한다.
+# ──────────────────────────────────────────────
+GEOMNURI_PATROL_TASK_ID = int(os.getenv("GEOMNURI_PATROL_TASK_ID", "160") or "160")
+GEOMNURI_PATROL_INTERVAL_SECONDS = max(
+    int(os.getenv("GEOMNURI_PATROL_INTERVAL_SECONDS", "300") or "300"), 60
+)
+GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS = max(
+    int(os.getenv("GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS", "7200") or "7200"), 300
+)
+GEOMNURI_PATROL_P0_STALE_HOURS = max(
+    float(os.getenv("GEOMNURI_PATROL_P0_STALE_HOURS", "4") or "4"), 1.0
+)
+GEOMNURI_PATROL_P1_STALE_HOURS = max(
+    float(os.getenv("GEOMNURI_PATROL_P1_STALE_HOURS", "24") or "24"), 2.0
+)
+GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES = 60
+GEOMNURI_PATROL_EVENT_LOOP_THRESHOLD = 8
+GEOMNURI_PATROL_INGEST_STUCK_MINUTES = 20
+
+_PATROL_SCHEDULER_MAX_AGE_SECONDS = {
+    # 5분 주기
+    "run_magi_auto_review_once": 15 * 60,
+    # 일 1회 계열 — 재배포/약간의 지연을 감안해 36시간
+    "notify_pending_simple_tasks": 36 * 3600,
+    "dual_verify_7day_average": 36 * 3600,
+    "ask_operated_status_telegram": 36 * 3600,
+    "check_ingestion_gap": 36 * 3600,
+    "auto_cross_check_recent_days": 36 * 3600,
+    "check_daily_ingestion_detail": 36 * 3600,
+    "calc_daily_snapshot": 36 * 3600,
+    "recalc_7day_average": 36 * 3600,
+    "recalc_daily_summary_totals": 36 * 3600,
+    "recalc_fish_finder": 36 * 3600,
+    "recalc_fish_hour_data_dow": 36 * 3600,
+    "recalc_fish_hour_data": 36 * 3600,
+}
+
+
+def _patrol_parse_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+async def _patrol_emit_once(
+    key: str,
+    detail: str,
+    *,
+    task_id: int | None = None,
+    severity: str = "WARN",
+    cooldown_seconds: int | None = None,
+) -> bool:
+    """동일 사건의 반복경보를 scheduler_status를 이용해 억제한다.
+    공식 사건은 대상 task(없으면 task#160)에 PATROL_ALERT로 기록한다."""
+    cooldown = cooldown_seconds or GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS
+    state_key = f"patrol_alert::{key}"[:240]
+    try:
+        rows = await sb_select("scheduler_status", {"job_name": f"eq.{state_key}", "limit": "1"})
+    except Exception:
+        rows = []
+
+    now = datetime.now(KST)
+    if rows:
+        last_dt = _patrol_parse_dt(rows[0].get("last_run_at"))
+        if last_dt is not None:
+            try:
+                age = (now - last_dt.astimezone(KST)).total_seconds()
+                if age < cooldown:
+                    return False
+            except Exception:
+                pass
+
+    target_task = int(task_id or GEOMNURI_PATROL_TASK_ID)
+    event_detail = f"[{severity}] {detail}"[:3500]
+    await sb_insert("magi_task_events", {
+        "task_id": target_task,
+        "event_type": "PATROL_ALERT",
+        "actor": "GEOMNURI_PATROL",
+        "detail": event_detail,
+    })
+    await sb_upsert("scheduler_status", {
+        "job_name": state_key,
+        "last_run_at": now.isoformat(),
+        "last_result": event_detail[:900],
+    }, on_conflict="job_name")
+    return True
+
+
+async def run_geomnuri_patrol_once() -> dict:
+    """결정론적 순라 1회.
+    자동복구/상태변경은 하지 않고 이상 감지·기록·알림만 수행한다."""
+    now = datetime.now(KST)
+    emitted = []
+    findings = []
+
+    async def emit(key, detail, *, task_id=None, severity="WARN", cooldown_seconds=None):
+        findings.append({"key": key, "detail": detail, "severity": severity, "task_id": task_id})
+        try:
+            if await _patrol_emit_once(
+                key, detail, task_id=task_id, severity=severity,
+                cooldown_seconds=cooldown_seconds,
+            ):
+                emitted.append({"key": key, "detail": detail, "severity": severity, "task_id": task_id})
+        except Exception as e:
+            logger.error(f"순라 사건기록 실패({key}): {e}")
+
+    # 1) scheduler 누락/실패
+    try:
+        rows = await sb_select("scheduler_status", {}) or []
+        sched = {str(r.get("job_name")): r for r in rows if r.get("job_name")}
+        for job_name, max_age in _PATROL_SCHEDULER_MAX_AGE_SECONDS.items():
+            row = sched.get(job_name)
+            if not row:
+                await emit(
+                    f"scheduler_missing::{job_name}",
+                    f"scheduler_status에 필수 job 기록 없음: {job_name}",
+                    severity="CRITICAL",
+                )
+                continue
+            last_dt = _patrol_parse_dt(row.get("last_run_at"))
+            if last_dt is None:
+                await emit(
+                    f"scheduler_invalid_time::{job_name}",
+                    f"scheduler_status last_run_at 파싱 불가: {job_name}={row.get('last_run_at')}",
+                    severity="CRITICAL",
+                )
+                continue
+            age_sec = (now - last_dt.astimezone(KST)).total_seconds()
+            if age_sec > max_age:
+                await emit(
+                    f"scheduler_stale::{job_name}",
+                    f"스케줄러 정체: {job_name}, 마지막 실행 {age_sec/3600:.1f}시간 전 "
+                    f"(허용 {max_age/3600:.1f}시간), result={row.get('last_result')}",
+                    severity="CRITICAL",
+                    cooldown_seconds=3600,
+                )
+            result = str(row.get("last_result") or "")
+            if result.upper().startswith("FAIL") or "MISMATCH" in result.upper():
+                await emit(
+                    f"scheduler_fail::{job_name}",
+                    f"스케줄러 최근 결과 이상: {job_name} → {result[:500]}",
+                    severity="CRITICAL",
+                    cooldown_seconds=3600,
+                )
+    except Exception as e:
+        await emit("patrol_internal_scheduler_check", f"순라 scheduler 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 2) P0/P1 장기점유 — WAITING/HOLD/VERIFICATION은 의도적 대기이므로 제외
+    try:
+        tasks = await sb_select("magi_tasks", {
+            "status": "in.(ASSIGNED,IN_PROGRESS)",
+            "priority": "in.(P0,P1)",
+            "order": "updated_at.asc",
+        }) or []
+        for t in tasks:
+            updated = _patrol_parse_dt(t.get("updated_at"))
+            if updated is None:
+                continue
+            age_h = (now - updated.astimezone(KST)).total_seconds() / 3600
+            limit_h = GEOMNURI_PATROL_P0_STALE_HOURS if t.get("priority") == "P0" else GEOMNURI_PATROL_P1_STALE_HOURS
+            if age_h > limit_h:
+                tid = t.get("task_id")
+                await emit(
+                    f"task_stale::{tid}",
+                    f"{t.get('priority')} Task 장기점유: #{tid} {str(t.get('title') or '')[:120]} "
+                    f"status={t.get('status')} owner={t.get('owner_agent')} updated={age_h:.1f}시간 전",
+                    task_id=tid,
+                    severity="CRITICAL" if t.get("priority") == "P0" else "WARN",
+                    cooldown_seconds=6 * 3600,
+                )
+    except Exception as e:
+        await emit("patrol_internal_task_check", f"순라 Task 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 3) 자동 에이전트 이벤트 반복루프 — task#68 Golden Failure Case 대응
+    try:
+        events = await sb_select("magi_task_events", {
+            "order": "created_at.desc",
+            "limit": "250",
+        }) or []
+        cutoff = now - timedelta(minutes=GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES)
+        groups = {}
+        for ev in events:
+            created = _patrol_parse_dt(ev.get("created_at"))
+            if created is None or created.astimezone(KST) < cutoff:
+                continue
+            actor = str(ev.get("actor") or "")
+            if "자동" not in actor and "haiku" not in actor.lower():
+                continue
+            tid = ev.get("task_id")
+            if not tid:
+                continue
+            gkey = (tid, actor, str(ev.get("event_type") or ""))
+            groups[gkey] = groups.get(gkey, 0) + 1
+        for (tid, actor, event_type), count in groups.items():
+            if count >= GEOMNURI_PATROL_EVENT_LOOP_THRESHOLD:
+                await emit(
+                    f"event_loop::{tid}::{actor}::{event_type}",
+                    f"자동 이벤트 반복루프 의심: task#{tid}, actor={actor}, event={event_type}, "
+                    f"{GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES}분 내 {count}회 "
+                    f"(임계 {GEOMNURI_PATROL_EVENT_LOOP_THRESHOLD}회)",
+                    task_id=tid,
+                    severity="CRITICAL",
+                    cooldown_seconds=3600,
+                )
+    except Exception as e:
+        await emit("patrol_internal_event_loop_check", f"순라 반복루프 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 4) CALL/OCR ingestion 장기 PROCESSING 및 최근 FAILED
+    try:
+        ingest_rows = await sb_h(
+            "GET",
+            "call_image_ingestions",
+            params={"order": "updated_at.asc", "limit": "200"},
+            headers=_internal_rpc_headers(),
+        )
+        if not isinstance(ingest_rows, list):
+            ingest_rows = []
+        failed_recent = 0
+        stuck = []
+        fail_cutoff = now - timedelta(hours=1)
+        stuck_cutoff = now - timedelta(minutes=GEOMNURI_PATROL_INGEST_STUCK_MINUTES)
+        for row in ingest_rows:
+            updated = _patrol_parse_dt(row.get("updated_at"))
+            if updated is None:
+                continue
+            local_updated = updated.astimezone(KST)
+            if row.get("status") == "PROCESSING" and local_updated < stuck_cutoff:
+                stuck.append(row)
+            if row.get("status") == "FAILED" and local_updated >= fail_cutoff:
+                failed_recent += 1
+        if stuck:
+            sample = ", ".join(str(x.get("source_id"))[:24] for x in stuck[:3])
+            await emit(
+                "ingestion_stuck",
+                f"call_image_ingestions PROCESSING {GEOMNURI_PATROL_INGEST_STUCK_MINUTES}분 초과 "
+                f"{len(stuck)}건. sample={sample}",
+                severity="CRITICAL",
+                cooldown_seconds=3600,
+            )
+        if failed_recent:
+            await emit(
+                "ingestion_failed_recent",
+                f"최근 1시간 call_image_ingestions FAILED {failed_recent}건",
+                severity="WARN",
+                cooldown_seconds=3600,
+            )
+    except Exception as e:
+        await emit("patrol_internal_ingestion_check", f"순라 ingestion 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 5) task-linked domain NULL 재발 — task#83 회귀 감시
+    try:
+        events = await sb_select("magi_task_events", {
+            "order": "created_at.desc",
+            "limit": "100",
+        }) or []
+        cutoff = now - timedelta(hours=1)
+        bad = []
+        for ev in events:
+            created = _patrol_parse_dt(ev.get("created_at"))
+            if created is None or created.astimezone(KST) < cutoff:
+                continue
+            if ev.get("task_id") and ev.get("domain") is None:
+                bad.append(ev)
+        if bad:
+            ids = ",".join(str(x.get("event_id")) for x in bad[:10])
+            await emit(
+                "task_event_domain_null",
+                f"최근 1시간 task-linked magi_task_events domain=NULL {len(bad)}건. event_id={ids}",
+                severity="CRITICAL",
+                cooldown_seconds=3600,
+            )
+    except Exception as e:
+        await emit("patrol_internal_domain_check", f"순라 domain 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 건강한 스캔도 scheduler_status에는 heartbeat만 남긴다.
+    result = f"alerts={len(emitted)} findings={len(findings)}"
+    await mark_scheduler_run("geomnuri_patrol", result)
+
+    if emitted:
+        lines = [f"🚨 검누리 순라 경보 {len(emitted)}건"]
+        for item in emitted[:8]:
+            lines.append(f"• [{item['severity']}] {item['detail'][:260]}")
+        if len(emitted) > 8:
+            lines.append(f"• ...외 {len(emitted)-8}건")
+        lines.append("공식 원장: Supabase magi_task_events")
+        try:
+            await send_telegram_broadcast("\n".join(lines))
+        except Exception as e:
+            logger.error(f"순라 Telegram 경보 발송 실패: {e}")
+
+    logger.info(f"검누리 순라 완료: {result}")
+    return {"ok": True, "alerts": emitted, "findings": findings}
+
+
+def geomnuri_patrol_scheduler():
+    """fish_scheduler와 독립된 감시 스레드.
+    순라 자체 오류가 생겨도 메인/어군/OCR 스레드를 중단시키지 않는다."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        started = time.time()
+        try:
+            loop.run_until_complete(run_geomnuri_patrol_once())
+        except Exception as e:
+            logger.error(f"검누리 순라 실행 실패: {e}")
+            try:
+                loop.run_until_complete(mark_scheduler_run("geomnuri_patrol", f"FAIL: {e}"))
+            except Exception:
+                pass
+            try:
+                loop.run_until_complete(send_telegram_broadcast(
+                    f"🚨 검누리 순라 자체 오류\n{str(e)[:700]}"
+                ))
+            except Exception:
+                pass
+        elapsed = time.time() - started
+        time.sleep(max(GEOMNURI_PATROL_INTERVAL_SECONDS - elapsed, 30))
+
+
 async def sync_operated_status(days_back: int = 30):
     """task#38: 최근 N일에 대해 operated_status를 3단계 소스로 자동채움.
     confirmed(raw_calls존재)/gpx_proxy(raw_calls없음+GPX있음)는 자동확정,
@@ -7430,6 +7755,10 @@ def main():
 
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
+
+    # task#160 검누리 순라 — 어군/자동검증과 독립된 감시 스레드
+    threading.Thread(target=geomnuri_patrol_scheduler, daemon=True).start()
+    logger.info("검누리 순라 스케줄러 시작")
 
     # Telegram application
     app = (
