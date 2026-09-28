@@ -1153,24 +1153,25 @@ async def mark_call_image_ingestion(
     inserted_count: int = 0,
     last_error: str = None,
 ):
-    """파일 처리 결과를 ingestion ledger에 기록."""
-    body = {
-        "status": status,
-        "format": fmt,
-        "inserted_count": int(inserted_count or 0),
-        "last_error": last_error,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": datetime.now(timezone.utc).isoformat() if status == "COMPLETED" else None,
-    }
+    """파일 처리 결과를 SECURITY DEFINER RPC로 기록.
+    task#149(2026-09-28): call_image_ingestions RLS 활성화 후
+    anon/authenticated의 테이블 직접권한을 제거해 ledger를 서버전용으로 고정."""
     result = await sb_h(
-        "PATCH",
-        "call_image_ingestions",
-        params={"source_type": "eq.google_drive", "source_id": f"eq.{source_id}"},
-        json=body,
-        headers={**HEADERS_SB, "Prefer": "return=representation"},
+        "POST",
+        "rpc/mark_call_image_ingestion",
+        json={
+            "p_source_id": source_id,
+            "p_status": status,
+            "p_format": fmt,
+            "p_inserted_count": int(inserted_count or 0),
+            "p_last_error": last_error,
+            "p_source_type": "google_drive",
+        },
     )
-    if result is None:
-        raise RuntimeError(f"ingestion 상태기록 실패: source_id={source_id}, status={status}")
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(
+            f"ingestion 상태기록 실패: source_id={source_id}, status={status}, result={result}"
+        )
     return result
 
 
