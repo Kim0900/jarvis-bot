@@ -366,6 +366,36 @@ class HealthHandler(BaseHTTPRequestHandler):
                         }
 
                     projected = [_project_task(t) for t in tasks]
+
+                    hold_tasks = [t for t in projected if t.get("status") == "HOLD"]
+                    hold_latest_event = {}
+                    hold_ids = [str(t.get("task_id")) for t in hold_tasks if t.get("task_id") is not None]
+                    if hold_ids:
+                        hold_events = asyncio.run(sb_select("magi_task_events", {
+                            "task_id": "in.(" + ",".join(hold_ids) + ")",
+                            "order": "created_at.desc",
+                            "limit": "500",
+                        })) or []
+                        for e in hold_events:
+                            tid = e.get("task_id")
+                            if tid is not None and tid not in hold_latest_event:
+                                hold_latest_event[tid] = {
+                                    "event_id": e.get("event_id"),
+                                    "event_type": e.get("event_type"),
+                                    "actor": e.get("actor"),
+                                    "detail": e.get("detail"),
+                                    "created_at": e.get("created_at"),
+                                }
+
+                    hold_backlog = []
+                    for t in hold_tasks:
+                        item = dict(t)
+                        item["latest_event"] = hold_latest_event.get(t.get("task_id"))
+                        item["metadata_complete"] = bool(
+                            t.get("blocked_reason") and t.get("waiting_for") and t.get("next_action")
+                        )
+                        hold_backlog.append(item)
+
                     status_counts = {}
                     priority_counts = {}
                     for t in projected:
@@ -391,10 +421,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                             "by_priority": priority_counts,
                             "approval_waiting": len(approvals),
                             "blockers": len(blockers),
+                            "hold_backlog": len(hold_backlog),
+                            "hold_metadata_incomplete": sum(1 for t in hold_backlog if not t.get("metadata_complete")),
                         },
                         "tasks": projected,
                         "approvals": approvals,
                         "blockers": blockers,
+                        "hold_backlog": hold_backlog,
                         "recent_events": [{
                             "event_id": e.get("event_id"),
                             "task_id": e.get("task_id"),
@@ -447,6 +480,46 @@ class HealthHandler(BaseHTTPRequestHandler):
                         return any(a.lower() == v.lower() for a in aliases for v in values)
 
                     my_tasks = [t for t in active if _matches_agent(t)]
+
+                    hold_tasks = [t for t in active if t.get("status") == "HOLD"]
+                    hold_latest_event = {}
+                    hold_ids = [str(t.get("task_id")) for t in hold_tasks if t.get("task_id") is not None]
+                    if hold_ids:
+                        hold_events = asyncio.run(sb_select("magi_task_events", {
+                            "task_id": "in.(" + ",".join(hold_ids) + ")",
+                            "order": "created_at.desc",
+                            "limit": "500",
+                        })) or []
+                        for e in hold_events:
+                            tid = e.get("task_id")
+                            if tid is not None and tid not in hold_latest_event:
+                                hold_latest_event[tid] = {
+                                    "event_id": e.get("event_id"),
+                                    "event_type": e.get("event_type"),
+                                    "actor": e.get("actor"),
+                                    "detail": e.get("detail"),
+                                    "created_at": e.get("created_at"),
+                                }
+
+                    hold_backlog = []
+                    for t in hold_tasks:
+                        hold_backlog.append({
+                            "task_id": t.get("task_id"),
+                            "title": t.get("title"),
+                            "priority": t.get("priority"),
+                            "status": t.get("status"),
+                            "owner_agent": t.get("owner_agent"),
+                            "blocked_reason": t.get("blocked_reason"),
+                            "waiting_for": t.get("waiting_for"),
+                            "next_action": t.get("next_action"),
+                            "updated_at": t.get("updated_at"),
+                            "domain": t.get("domain"),
+                            "metadata_complete": bool(
+                                t.get("blocked_reason") and t.get("waiting_for") and t.get("next_action")
+                            ),
+                            "latest_event": hold_latest_event.get(t.get("task_id")),
+                        })
+
                     global_critical = [
                         t for t in active
                         if t.get("priority") in ("P0", "P1")
@@ -478,6 +551,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                             "updated_at": t.get("updated_at"),
                             "domain": t.get("domain"),
                         } for t in my_tasks],
+                        "hold_backlog": hold_backlog,
                         "global_critical": [{
                             "task_id": t.get("task_id"),
                             "title": t.get("title"),
@@ -5143,6 +5217,30 @@ async def run_geomnuri_patrol_once() -> dict:
     except Exception as e:
         await emit("patrol_internal_domain_check", f"순라 domain 점검 자체 실패: {e}", severity="CRITICAL")
 
+    # 6) HOLD 메타데이터 완전성 — 오래된 보류 맥락 유실 방지(task#161)
+    try:
+        hold_tasks = await sb_select("magi_tasks", {
+            "status": "eq.HOLD",
+            "order": "priority.asc,updated_at.desc",
+        }) or []
+        for t in hold_tasks:
+            missing = [
+                name for name in ("blocked_reason", "waiting_for", "next_action")
+                if not str(t.get(name) or "").strip()
+            ]
+            if missing:
+                tid = t.get("task_id")
+                await emit(
+                    f"hold_metadata_incomplete::{tid}",
+                    f"HOLD Task 재개조건 메타데이터 누락: #{tid} "
+                    f"{str(t.get('title') or '')[:120]} missing={','.join(missing)}",
+                    task_id=tid,
+                    severity="WARN",
+                    cooldown_seconds=6 * 3600,
+                )
+    except Exception as e:
+        await emit("patrol_internal_hold_metadata_check", f"순라 HOLD 메타데이터 점검 자체 실패: {e}", severity="CRITICAL")
+
     # 건강한 스캔도 scheduler_status에는 heartbeat만 남긴다.
     result = f"alerts={len(emitted)} findings={len(findings)}"
     await mark_scheduler_run("geomnuri_patrol", result)
@@ -5282,6 +5380,25 @@ async def build_agent_context_snapshot(agent_name: str) -> dict:
         events = await sb_select("magi_task_events", {
             "order": "created_at.desc", "limit": "30"
         }) or []
+        hold_tasks_raw = [t for t in active if t.get("status") == "HOLD"]
+        hold_latest_event = {}
+        hold_ids = [str(t.get("task_id")) for t in hold_tasks_raw if t.get("task_id") is not None]
+        if hold_ids:
+            hold_events = await sb_select("magi_task_events", {
+                "task_id": "in.(" + ",".join(hold_ids) + ")",
+                "order": "created_at.desc",
+                "limit": "500",
+            }) or []
+            for e in hold_events:
+                tid = e.get("task_id")
+                if tid is not None and tid not in hold_latest_event:
+                    hold_latest_event[tid] = {
+                        "event_id": e.get("event_id"),
+                        "event_type": e.get("event_type"),
+                        "actor": e.get("actor"),
+                        "detail": e.get("detail"),
+                        "created_at": e.get("created_at"),
+                    }
     except Exception as exc:
         logger.error(f"agent context 조회 실패({agent_name}): {exc}")
         return {"agent": agent_name, "my_tasks": [], "global_critical": [], "recent_events": []}
@@ -5303,6 +5420,24 @@ async def build_agent_context_snapshot(agent_name: str) -> dict:
     ]
     ids = {t.get("task_id") for t in my_tasks + critical}
     relevant = [e for e in events if e.get("task_id") in ids][:15]
+
+    hold_backlog = [{
+        "task_id": t.get("task_id"),
+        "title": t.get("title"),
+        "priority": t.get("priority"),
+        "status": t.get("status"),
+        "owner_agent": t.get("owner_agent"),
+        "blocked_reason": t.get("blocked_reason"),
+        "waiting_for": t.get("waiting_for"),
+        "next_action": t.get("next_action"),
+        "updated_at": t.get("updated_at"),
+        "domain": t.get("domain"),
+        "metadata_complete": bool(
+            t.get("blocked_reason") and t.get("waiting_for") and t.get("next_action")
+        ),
+        "latest_event": hold_latest_event.get(t.get("task_id")),
+    } for t in active if t.get("status") == "HOLD"]
+
     return {
         "agent": agent_name,
         "my_tasks": [{
@@ -5317,6 +5452,7 @@ async def build_agent_context_snapshot(agent_name: str) -> dict:
             "next_action": t.get("next_action"),
             "updated_at": t.get("updated_at"),
         } for t in my_tasks],
+        "hold_backlog": hold_backlog,
         "global_critical": [{
             "task_id": t.get("task_id"),
             "title": t.get("title"),
