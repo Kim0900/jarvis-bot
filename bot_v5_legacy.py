@@ -5068,10 +5068,15 @@ GEOMNURI_PATROL_P1_STALE_HOURS = max(
 GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES = 60
 GEOMNURI_PATROL_EVENT_LOOP_THRESHOLD = 8
 GEOMNURI_PATROL_INGEST_STUCK_MINUTES = 20
+GEOMNURI_PATROL_CONTROL_TASK_ID = int(
+    os.getenv("GEOMNURI_PATROL_CONTROL_TASK_ID", "163") or "163"
+)
 
 _PATROL_SCHEDULER_MAX_AGE_SECONDS = {
     # 5분 주기
     "run_magi_auto_review_once": 15 * 60,
+    # ChatGPT MAGI Slack 관제는 매시간 실행. 3시간 무heartbeat면 이상.
+    "magi_slack_control": 3 * 3600,
     # 일 1회 계열 — 재배포/약간의 지연을 감안해 36시간
     "notify_pending_simple_tasks": 36 * 3600,
     "dual_verify_7day_average": 36 * 3600,
@@ -5165,10 +5170,16 @@ async def run_geomnuri_patrol_once() -> dict:
         sched = {str(r.get("job_name")): r for r in rows if r.get("job_name")}
         for job_name, max_age in _PATROL_SCHEDULER_MAX_AGE_SECONDS.items():
             row = sched.get(job_name)
+            target_task_id = (
+                GEOMNURI_PATROL_CONTROL_TASK_ID
+                if job_name == "magi_slack_control"
+                else None
+            )
             if not row:
                 await emit(
                     f"scheduler_missing::{job_name}",
                     f"scheduler_status에 필수 job 기록 없음: {job_name}",
+                    task_id=target_task_id,
                     severity="CRITICAL",
                 )
                 continue
@@ -5177,6 +5188,7 @@ async def run_geomnuri_patrol_once() -> dict:
                 await emit(
                     f"scheduler_invalid_time::{job_name}",
                     f"scheduler_status last_run_at 파싱 불가: {job_name}={row.get('last_run_at')}",
+                    task_id=target_task_id,
                     severity="CRITICAL",
                 )
                 continue
@@ -5186,6 +5198,7 @@ async def run_geomnuri_patrol_once() -> dict:
                     f"scheduler_stale::{job_name}",
                     f"스케줄러 정체: {job_name}, 마지막 실행 {age_sec/3600:.1f}시간 전 "
                     f"(허용 {max_age/3600:.1f}시간), result={row.get('last_result')}",
+                    task_id=target_task_id,
                     severity="CRITICAL",
                     cooldown_seconds=3600,
                 )
@@ -5194,11 +5207,97 @@ async def run_geomnuri_patrol_once() -> dict:
                 await emit(
                     f"scheduler_fail::{job_name}",
                     f"스케줄러 최근 결과 이상: {job_name} → {result[:500]}",
+                    task_id=target_task_id,
                     severity="CRITICAL",
                     cooldown_seconds=3600,
                 )
     except Exception as e:
         await emit("patrol_internal_scheduler_check", f"순라 scheduler 점검 자체 실패: {e}", severity="CRITICAL")
+
+    # 1-B) Slack 관제계층 감독 — #162 게시판단을 순라가 재구현하지 않고 회귀만 탐지
+    try:
+        control_row = sched.get("magi_slack_control") if "sched" in locals() else None
+        control_result = str((control_row or {}).get("last_result") or "")
+
+        # 실제 게시된 event_id가 heartbeat에 남은 경우, 모두 meaningful-change인지 사후 검증.
+        if control_result.upper().startswith("POSTED:"):
+            raw_ids = control_result.split(":", 1)[1]
+            posted_ids = []
+            for token in raw_ids.split(","):
+                token = token.strip()
+                if token.isdigit():
+                    posted_ids.append(int(token))
+            if not posted_ids:
+                await emit(
+                    "slack_control_posted_without_event_ids",
+                    f"MAGI Slack 관제 heartbeat가 POSTED이나 event_id가 없음: {control_result[:300]}",
+                    task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+                    severity="CRITICAL",
+                    cooldown_seconds=3600,
+                )
+            else:
+                posted_events = await sb_select("magi_task_events", {
+                    "event_id": "in.(" + ",".join(str(x) for x in posted_ids[:10]) + ")",
+                    "order": "created_at.desc",
+                    "limit": "20",
+                }) or []
+                by_id = {int(e.get("event_id")): e for e in posted_events if e.get("event_id") is not None}
+                bad_posted = []
+                for event_id in posted_ids[:10]:
+                    ev = by_id.get(event_id)
+                    if ev is None:
+                        bad_posted.append(f"{event_id}:missing")
+                        continue
+                    meaningful, reason = _classify_control_event(ev)
+                    if not meaningful:
+                        bad_posted.append(f"{event_id}:{reason}")
+                if bad_posted:
+                    await emit(
+                        "slack_control_policy_breach",
+                        "Slack 관제 게시정책 위반 의심: POSTED event 중 meaningful-change 아님 → "
+                        + ", ".join(bad_posted[:10]),
+                        task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+                        severity="CRITICAL",
+                        cooldown_seconds=3600,
+                    )
+
+        # classifier 자체의 핵심 불변식 회귀 감시.
+        policy_cutoff = now - timedelta(hours=2)
+        policy_events = await sb_select("magi_task_events", {
+            "created_at": f"gte.{policy_cutoff.astimezone(timezone.utc).isoformat()}",
+            "order": "created_at.desc",
+            "limit": "500",
+        }) or []
+        policy_bad = []
+        for ev in policy_events:
+            event_type = str(ev.get("event_type") or "").upper()
+            actor = str(ev.get("actor") or "")
+            detail = str(ev.get("detail") or "")
+            expected_noise = event_type == "AUTO_REVIEW_PROVIDER_BACKOFF"
+            if event_type == "TASK_UPDATED" and ("자동" in actor or actor.upper().startswith("MAGI")):
+                expected_noise = expected_noise or any(marker in detail for marker in (
+                    "검증 착수", "검증 개시", "조회 시작", "DB 상태 확인", "실제값 확인",
+                ))
+            if expected_noise:
+                meaningful, reason = _classify_control_event(ev)
+                if meaningful:
+                    policy_bad.append(f"{ev.get('event_id')}:{reason}")
+        if policy_bad:
+            await emit(
+                "control_classifier_regression",
+                "meaningful-change Gate 회귀: provider/review-progress 잡음이 게시후보로 분류됨 → "
+                + ", ".join(policy_bad[:10]),
+                task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+                severity="CRITICAL",
+                cooldown_seconds=3600,
+            )
+    except Exception as e:
+        await emit(
+            "patrol_internal_control_check",
+            f"순라 Slack 관제계층 점검 자체 실패: {e}",
+            task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+            severity="CRITICAL",
+        )
 
     # 2) P0/P1 장기점유 — WAITING/HOLD/VERIFICATION은 의도적 대기이므로 제외
     try:
