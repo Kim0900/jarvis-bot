@@ -5010,10 +5010,43 @@ async def build_agent_context_snapshot(agent_name: str) -> dict:
 # tool 화이트리스트 4개뿐 — 파괴적작업(DELETE/UPDATE, GitHub커밋, Drive쓰기)은
 # 이번 1단계에서 API경로로 완전히 배제. 완료해도 자동승인 없음(evidence PENDING).
 # ──────────────────────────────────────────────
+_READONLY_SQL_PK_HINTS = {
+    "magi_tasks": "task_id",
+    "magi_task_events": "event_id",
+    "evidence_registry": "evidence_id",
+}
+
+def _readonly_sql_schema_guard(sql: str):
+    """자동 에이전트가 Registry PK를 관성적으로 id로 추정하는 오류를 DB 호출 전에 차단.
+    실제 SQL을 임의 재작성하지 않고, 정확한 PK 힌트를 반환해 에이전트가 수정 쿼리를 재시도하게 한다."""
+    lower = (sql or "").lower()
+    referenced = {
+        table for table in _READONLY_SQL_PK_HINTS
+        if re.search(rf"\b(?:public\.)?{re.escape(table)}\b", lower)
+    }
+    if not referenced:
+        return None
+
+    # schema-qualified t.id도 포함해 'id' 컬럼 참조를 탐지.
+    uses_id = bool(re.search(r"(?<![a-z0-9_])(?:[a-z_][a-z0-9_]*\.)?id(?![a-z0-9_])", lower))
+    if not uses_id:
+        return None
+
+    wrong = [t for t in sorted(referenced) if _READONLY_SQL_PK_HINTS[t] != "id"]
+    if not wrong:
+        return None
+
+    hints = ", ".join(f"{t}.{_READONLY_SQL_PK_HINTS[t]}" for t in wrong)
+    return (
+        "SCHEMA_GUARD: Registry PK를 generic 'id'로 추정한 쿼리를 실행 전 차단했습니다. "
+        f"정확한 키: {hints}. SQL을 이 컬럼명으로 고쳐 다시 query_supabase를 호출하세요. "
+        "다른 테이블 컬럼이 불확실하면 information_schema.columns를 먼저 조회하세요."
+    )
+
 _ORCH_TOOLS = [
     {
         "name": "query_supabase",
-        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. INSERT/UPDATE/DELETE는 거부된다.",
+        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. INSERT/UPDATE/DELETE는 거부된다. Registry PK는 magi_tasks.task_id, magi_task_events.event_id, evidence_registry.evidence_id이다. generic id를 추정하지 말고, 불확실하면 information_schema.columns를 먼저 조회한다.",
         "input_schema": {"type": "object", "properties": {
             "sql": {"type": "string", "description": "SELECT로 시작하는 SQL문"}
         }, "required": ["sql"]},
@@ -5048,7 +5081,10 @@ _ORCH_SYSTEM_PROMPT = (
     "가능하며 데이터 수정(UPDATE/DELETE/INSERT)이나 코드 배포는 절대 할 수 없다 — "
     "그런 조치가 필요하면 finish_task에 '사람 세션 필요'라고 명시하고 종료한다. "
     "④의미있는 확인을 할 때마다 즉시 record_event를 호출한다(끝에 몰아서 하지 않는다). "
-    "⑤작업이 끝나면 반드시 finish_task를 호출해서 마친다."
+    "⑤작업이 끝나면 반드시 finish_task를 호출해서 마친다. "
+    "⑥Registry에서 generic id 컬럼을 가정하지 않는다. magi_tasks는 task_id, "
+    "magi_task_events는 event_id, evidence_registry는 evidence_id를 사용하고, "
+    "그 외 스키마가 불확실하면 information_schema.columns로 먼저 확인한다."
 )
 
 async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
@@ -5056,6 +5092,9 @@ async def _orch_execute_tool(name: str, tool_input: dict, task_id: int) -> str:
         sql = (tool_input.get("sql") or "").strip()
         if not sql.lower().startswith("select"):
             return "거부: SELECT 쿼리만 허용됩니다."
+        schema_guard = _readonly_sql_schema_guard(sql)
+        if schema_guard:
+            return schema_guard
         try:
             result = await sb_h("POST", "rpc/exec_readonly_sql", json={"query": sql})
             return json.dumps(result, ensure_ascii=False, default=str)[:4000]
@@ -5247,7 +5286,7 @@ async def run_haiku_orchestration_once():
 _MAGI_AUTO_TOOLS = [
     {
         "name": "query_supabase",
-        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. 원본대조·실제값 확인용.",
+        "description": "Supabase에 읽기전용 SELECT 쿼리만 실행한다. 원본대조·실제값 확인용. Registry PK는 magi_tasks.task_id, magi_task_events.event_id, evidence_registry.evidence_id이다. generic id를 추정하지 말고, 불확실하면 information_schema.columns를 먼저 조회한다.",
         "input_schema": {"type": "object", "properties": {
             "sql": {"type": "string", "description": "SELECT로 시작하는 SQL문"}
         }, "required": ["sql"]},
@@ -5301,7 +5340,10 @@ _MAGI_AUTO_SYSTEM_PROMPT = (
     "③task_type=SIMPLE이고 architect_decision_required가 아니며 검증이 실제로 통과하면 "
     "approve_task ④task_type=COMPLEX이거나 architect_decision_required=true이거나 "
     "보고내용과 실제값이 다르면 반드시 escalate_to_architect(자동승인 절대 금지) "
-    "⑤확실한 후속단계가 있으면 create_next_task ⑥마지막엔 반드시 finish_review."
+    "⑤확실한 후속단계가 있으면 create_next_task ⑥마지막엔 반드시 finish_review. "
+    "⑦Registry에서 generic id 컬럼을 가정하지 않는다. magi_tasks는 task_id, "
+    "magi_task_events는 event_id, evidence_registry는 evidence_id를 사용하고, "
+    "그 외 스키마가 불확실하면 information_schema.columns로 먼저 확인한다."
 )
 
 async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> str:
@@ -5310,6 +5352,9 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
         sql = (tool_input.get("sql") or "").strip()
         if not sql.lower().startswith(("select", "with")):
             return "거부: SELECT/WITH 쿼리만 허용됩니다."
+        schema_guard = _readonly_sql_schema_guard(sql)
+        if schema_guard:
+            return schema_guard
         try:
             result = await sb_h("POST", "rpc/exec_readonly_sql", json={"query": sql})
             return json.dumps(result, ensure_ascii=False, default=str)[:4000]
