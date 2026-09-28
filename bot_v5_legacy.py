@@ -943,7 +943,7 @@ async def sb_h(method: str, path: str, **kwargs) -> dict | list | None:
     headers = kwargs.pop("headers", HEADERS_SB)
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.request(method, url, headers=headers, **kwargs)
-        if r.status_code in (200, 201):
+        if r.status_code in (200, 201, 204):
             # 캐스퍼 수정 2026-07-06 (2차): Prefer: return=minimal을 쓰는 호출은
             # Supabase가 본문을 아예 비워서 응답하는데, 여기서 무조건 r.json()을
             # 호출해서 JSONDecodeError로 크래시하던 버그. 빈 본문이면 파싱 생략.
@@ -5428,6 +5428,32 @@ async def _magi_auto_execute_tool(name: str, tool_input: dict, task: dict) -> st
     return "알 수 없는 tool"
 
 
+_MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL = 0.0
+_MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG = 0.0
+_MAGI_REVIEW_PROVIDER_BACKOFF_REASON = ""
+MAGI_REVIEW_PROVIDER_COOLDOWN_SECONDS = max(
+    int(os.getenv("MAGI_REVIEW_PROVIDER_COOLDOWN_SECONDS", "3600") or "3600"),
+    300,
+)
+
+def _is_magi_review_provider_unavailable_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        "credit balance is too low",
+        "insufficient_credit",
+        "insufficient credit",
+        "gemini http 429",
+        "quota exceeded",
+        "fallback circuit open",
+        "rate limit",
+        "rate_limit",
+        "overloaded",
+        "529",
+        "503",
+        "504",
+    ))
+
+
 async def run_magi_auto_review_once():
     """task#52: VERIFICATION+verified_by없음 태스크 1건을 찾아 마기(자동)가 검증.
     Sonnet 사용, 최대 10회 tool호출 제한.
@@ -5438,6 +5464,10 @@ async def run_magi_auto_review_once():
     "fish_week_stats 존폐판단"이라는 사람판단 대기항목 하나때문에 verified_by
     미기재 상태로 방치됨). Haiku오케스트레이션(task#78)과 동일한
     review_attempts 카운터+한도(5회) 초과시 큐이탈+텔레그램알림 적용."""
+    global _MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL
+    global _MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG
+    global _MAGI_REVIEW_PROVIDER_BACKOFF_REASON
+
     REVIEW_MAX_ATTEMPTS = 5
     try:
         rows = await sb_select("magi_tasks", {
@@ -5452,6 +5482,17 @@ async def run_magi_auto_review_once():
     task = rows[0]
     task_id = task["task_id"]
     prior_attempts = task.get("review_attempts") or 0
+
+    now_ts = time.time()
+    if now_ts < _MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL:
+        if now_ts - _MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG >= 900:
+            remaining = int(max(_MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL - now_ts, 0))
+            logger.warning(
+                "마기자동검증 provider backoff(task#%s): %ss 남음, review_attempts 유지(%s). reason=%s",
+                task_id, remaining, prior_attempts, _MAGI_REVIEW_PROVIDER_BACKOFF_REASON[:180],
+            )
+            _MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG = now_ts
+        return task_id
 
     if not ANTHROPIC_API_KEY:
         return None
@@ -5497,6 +5538,8 @@ async def run_magi_auto_review_once():
     })
 
     outcome = None  # "__APPROVED__" | "__ESCALATED__" | None
+    provider_unavailable = False
+    provider_error = ""
     for turn in range(10):
         try:
             resp = client.messages.create(
@@ -5504,7 +5547,18 @@ async def run_magi_auto_review_once():
                 system=_MAGI_AUTO_SYSTEM_PROMPT, tools=_MAGI_AUTO_TOOLS, messages=messages,
             )
         except Exception as e:
-            logger.error(f"마기자동검증 API 호출 실패(turn {turn}): {e}")
+            if _is_magi_review_provider_unavailable_error(e):
+                provider_unavailable = True
+                provider_error = str(e)
+                _MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL = time.time() + MAGI_REVIEW_PROVIDER_COOLDOWN_SECONDS
+                _MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG = time.time()
+                _MAGI_REVIEW_PROVIDER_BACKOFF_REASON = provider_error
+                logger.warning(
+                    "마기자동검증 provider unavailable(task#%s, turn %s) — %ss circuit open; review_attempts 미소모: %s",
+                    task_id, turn, MAGI_REVIEW_PROVIDER_COOLDOWN_SECONDS, provider_error[:300],
+                )
+            else:
+                logger.error(f"마기자동검증 API 호출 실패(turn {turn}): {e}")
             break
         messages.append({"role": "assistant", "content": resp.content})
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
@@ -5526,6 +5580,22 @@ async def run_magi_auto_review_once():
             break
 
     logger.info(f"마기(자동)검증 완료(task#{task_id}): outcome={outcome}")
+
+    if provider_unavailable:
+        try:
+            await sb_insert("magi_task_events", {
+                "task_id": task_id,
+                "event_type": "AUTO_REVIEW_PROVIDER_BACKOFF",
+                "actor": "마기(자동)",
+                "detail": (
+                    f"AI provider unavailable. review_attempts={prior_attempts} 유지, "
+                    f"{MAGI_REVIEW_PROVIDER_COOLDOWN_SECONDS}s backoff. "
+                    f"reason={provider_error[:500]}"
+                ),
+            })
+        except Exception as e:
+            logger.error(f"provider backoff event 기록 실패(task#{task_id}): {e}")
+        return task_id
 
     if outcome is None:
         new_attempts = prior_attempts + 1
