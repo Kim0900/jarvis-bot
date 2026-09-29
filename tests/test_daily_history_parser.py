@@ -3,6 +3,7 @@ import unittest
 from daily_history_parser import (
     extract_fare_probe_amounts,
     parse_daily_history_text,
+    repair_daily_history_with_fare_probe,
     validate_daily_history_document,
 )
 
@@ -159,6 +160,28 @@ class TestDailyHistoryParser(unittest.TestCase):
             extract_fare_probe_amounts(text, displayed_amount=70400),
             [6500, 11200, 9200, 7100, 6000, 6900, 7200, 5600, 5000, 5700],
         )
+
+    def test_repair_daily_history_with_fare_probe(self):
+        text = GOLDEN_10
+        for fare in ("6,000원", "6,900원", "7,200원", "5,600원", "5,000원"):
+            text = text.replace(fare, "")
+        repaired = repair_daily_history_with_fare_probe(
+            text,
+            [6500, 11200, 9200, 7100, 6000, 6900, 7200, 5600, 5000, 5700],
+        )
+        self.assertTrue(repaired["repaired"])
+        parsed = repaired["parsed"]
+        self.assertEqual(len(parsed["items"]), 10)
+        self.assertEqual(sum(x["요금"] for x in parsed["items"]), 70400)
+        self.assertTrue(validate_daily_history_document(parsed)["ok"])
+
+    def test_repair_rejects_wrong_fare_sum(self):
+        repaired = repair_daily_history_with_fare_probe(
+            GOLDEN_10,
+            [6500, 11200, 9200, 7100, 6000, 6900, 7200, 5600, 5000, 5800],
+        )
+        self.assertFalse(repaired["repaired"])
+        self.assertEqual(repaired["error_code"], "REPAIR_FARE_SUM_MISMATCH")
 
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
