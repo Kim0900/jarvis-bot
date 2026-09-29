@@ -3192,46 +3192,9 @@ def parse_meter_receipt(text: str) -> dict:
 
 
 def parse_daily_history(text: str) -> dict:
-    """형식②(일별운행이력, 카카오T 앱 "일별 운행 이력" 목록화면)
-    정규식 파서. task93 Drive일괄처리(2026-09-03) 최초구현 후,
-    2026-09-05 실측검증(대표님 지시 "완벽 구현")으로 2차 개선:
-    ①마커(•●○)가 Tesseract에서 자주 누락/깨져 "대구"로 시작하는
-    줄 자체를 매칭하도록 견고화 ②"실시간" 뒤 화살표아이콘이 OCR로
-    깨져 붙는 경우([^\\n]*) 대응 ③긴 이미지 자동분할(app.py)로 인한
-    겹침구간 중복을 (탑승시각,요금) 조합으로 제거.
-    실측: 8/16 실제스크린샷 8건 전부 정확파싱(1건은 출발지 일부
-    깨짐이나 시각·요금은 정확 — 겹침구간 밖이라 물리적 한계)."""
-    result: dict = {"format": "daily_history", "parse_errors": [], "items": []}
-
-    m = re.search(r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일', text)
-    if m:
-        result["날짜"] = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    else:
-        result["parse_errors"].append("날짜 파싱실패")
-
-    pattern = re.compile(
-        r'(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*실시간[^\n]*\n'
-        r'.{0,3}(대구[^\n]+?)\s*\n'
-        r'.{0,3}(대구[^\n]+?)\s*\n'
-        r'(?:(직접결제)\s*\n?\s*)?([\d,]+)\s*원'
-    )
-    seen = set()
-    for m in pattern.finditer(text):
-        start, end, origin, dest, direct, fare = m.groups()
-        key = (start, fare.replace(",", ""))
-        if key in seen:
-            continue  # 분할겹침구간 중복 제거
-        seen.add(key)
-        result["items"].append({
-            "탑승시각": start, "하차시각": end,
-            "출발지": origin.strip(), "도착지": dest.strip(),
-            "요금": int(fare.replace(",", "")),
-            "결제방식": "직접" if direct else "자동",
-        })
-    if not result["items"]:
-        result["parse_errors"].append("콜 목록 파싱실패")
-    return result
-
+    """task#164: robust multi-row daily-history parser wrapper."""
+    from daily_history_parser import parse_daily_history_text
+    return parse_daily_history_text(text)
 
 def parse_uber_trip_detail(text: str) -> dict:
     """형식④(우버 개별운행상세, "운행 세부사항"/"순수익" 화면) 파서.
@@ -3350,6 +3313,27 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             if await _save_one_raw_call(payload, source_id=source_id):
                 saved += 1
     elif fmt == "daily_history":
+        from daily_history_parser import validate_daily_history_document
+
+        validation = validate_daily_history_document(parsed)
+        if not validation.get("ok"):
+            return {
+                "success": False,
+                "error": validation.get("message"),
+                "error_code": validation.get("error_code"),
+                "error_stage": "daily_history_validation",
+                "format": fmt,
+                "saved_count": 0,
+                "parse_errors": parsed.get("parse_errors", []),
+                "source_id": source_id,
+                "displayed_count": validation.get("displayed_count"),
+                "displayed_amount": validation.get("displayed_amount"),
+                "time_anchor_count": validation.get("time_anchor_count"),
+                "parsed_count": validation.get("parsed_count"),
+                "parsed_amount": validation.get("parsed_amount"),
+                "expected_count": validation.get("expected_count"),
+            }
+
         for item in parsed.get("items", []):
             payload = {
                 "날짜": parsed.get("날짜"), "배차시각": item["탑승시각"], "하차시각": item["하차시각"],
