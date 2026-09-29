@@ -816,8 +816,9 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(200, result)
                     else:
                         # task#164: daily_history 본문 OCR이 Fail-Closed 된 경우에만
-                        # 우측 요금영역을 별도 OCR해 숫자 인식 가능성만 진단한다.
-                        # 이 probe 결과는 raw_calls 저장에 절대 사용하지 않는다.
+                        # 우측 요금영역을 별도 OCR해 숫자 인식 가능성을 확인한다.
+                        _repair_candidate = None
+                        _probe_amounts = []
                         if result.get("format") == "daily_history":
                             try:
                                 from daily_history_parser import extract_fare_probe_amounts
@@ -830,9 +831,66 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 result["fare_probe_count"] = len(_probe_amounts)
                                 result["fare_probe_sum"] = sum(_probe_amounts)
                                 result["fare_probe_amounts"] = _probe_amounts[:20]
+
+                                if result.get("error_code") in (
+                                    "DAILY_HISTORY_COUNT_MISMATCH",
+                                    "DAILY_HISTORY_ANCHOR_MISMATCH",
+                                    "DAILY_HISTORY_AMOUNT_MISMATCH",
+                                ):
+                                    from daily_history_parser import repair_daily_history_with_fare_probe
+                                    _repair = repair_daily_history_with_fare_probe(text, _probe_amounts)
+                                    result["fare_repair_error_code"] = _repair.get("error_code")
+                                    result["fare_repair_message"] = _repair.get("message")
+                                    if _repair.get("repaired"):
+                                        _repair_candidate = _repair.get("parsed") or {}
                             except Exception as _probe_err:
                                 logger.warning(f"daily_history fare probe 실패: {_probe_err}")
                                 result["fare_probe_error"] = type(_probe_err).__name__
+
+                        # probe/repair 판정과 실제 쓰기를 분리한다.
+                        # 쓰기 또는 COMPLETED 기록이 실패하면 해당 source_id 행을 즉시 롤백한다.
+                        if _repair_candidate is not None:
+                            _expected = int(_repair_candidate.get("표시건수") or 0)
+                            try:
+                                _saved = asyncio.run(
+                                    _save_repaired_daily_history_batch(
+                                        _repair_candidate, source_id
+                                    )
+                                )
+                                if _saved != _expected:
+                                    raise RuntimeError(
+                                        f"REPAIR_SAVED_COUNT_MISMATCH:{_saved}/{_expected}"
+                                    )
+                                asyncio.run(mark_call_image_ingestion(
+                                    source_id,
+                                    "COMPLETED",
+                                    fmt="daily_history",
+                                    inserted_count=_saved,
+                                ))
+                            except Exception:
+                                try:
+                                    asyncio.run(delete_partial_source_calls(source_id))
+                                except Exception as _rollback_err:
+                                    logger.error(
+                                        f"daily_history repair rollback 실패 "
+                                        f"(source_id={source_id}): {_rollback_err}"
+                                    )
+                                raise
+
+                            send_json(200, {
+                                "success": True,
+                                "duplicate": False,
+                                "source_id": source_id,
+                                "format": "daily_history",
+                                "saved_count": _saved,
+                                "repair_used": True,
+                                "repair_method": "fare_column_probe_ordered",
+                                "displayed_count": _repair_candidate.get("표시건수"),
+                                "displayed_amount": _repair_candidate.get("표시금액"),
+                                "fare_probe_count": len(_probe_amounts),
+                                "fare_probe_sum": sum(_probe_amounts),
+                            })
+                            return
 
                         _err_parts = []
                         _main_error = result.get("error")
@@ -3358,6 +3416,61 @@ async def _save_one_raw_call(payload: dict, source_id: str = None) -> bool:
         payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {_reason}]"
     r = await sb_insert("raw_calls", payload)
     return bool(r)
+
+
+async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> int:
+    """task#164: 엄격 검증을 통과한 daily_history 보정행만 일괄 저장한다.
+
+    - 기존 source_id 행이 남아 있으면 중복 위험으로 중단
+    - 모든 행 validate_call_payload PASS 후에만 PostgREST bulk insert
+    - 개별행 순차저장으로 인한 부분저장을 피한다
+    """
+    if not source_id:
+        raise RuntimeError("REPAIR_SOURCE_ID_REQUIRED")
+    if not parsed.get("날짜"):
+        raise RuntimeError("REPAIR_DATE_REQUIRED")
+
+    existing = await sb_select("raw_calls", {
+        "source_id": f"eq.{source_id}",
+        "limit": "1",
+    })
+    if existing:
+        raise RuntimeError("REPAIR_SOURCE_ROWS_ALREADY_EXIST")
+
+    payloads = []
+    for item in parsed.get("items", []):
+        note_parts = []
+        if item.get("결제방식") == "직접":
+            note_parts.append("직접결제")
+        note_parts.append("요금보조OCR교차검증")
+        payload = {
+            "날짜": parsed.get("날짜"),
+            "배차시각": item.get("탑승시각"),
+            "하차시각": item.get("하차시각"),
+            "출발지": item.get("출발지"),
+            "도착지": item.get("도착지"),
+            "요금": item.get("요금"),
+            "콜유형": "카카오T",
+            "비고": " | ".join(note_parts),
+            "data_source": "drive_ocr_tesseract",
+            "source_id": source_id,
+        }
+        payload.update(calc_service_date(payload.get("날짜"), payload.get("배차시각")))
+        valid, reason = validate_call_payload(payload)
+        if not valid:
+            raise RuntimeError(f"REPAIR_ROW_VALIDATION_FAILED:{reason}")
+        payloads.append(payload)
+
+    if not payloads:
+        raise RuntimeError("REPAIR_NO_ROWS")
+
+    inserted = await sb_h("POST", "raw_calls", json=payloads)
+    if not isinstance(inserted, list) or len(inserted) != len(payloads):
+        raise RuntimeError(
+            f"REPAIR_BULK_INSERT_MISMATCH: expected={len(payloads)} "
+            f"actual={len(inserted) if isinstance(inserted, list) else 'non_list'}"
+        )
+    return len(inserted)
 
 
 async def process_and_save_call_document(text: str, source_id: str = None) -> dict:
