@@ -815,6 +815,25 @@ class HealthHandler(BaseHTTPRequestHandler):
                         result["duplicate"] = False
                         send_json(200, result)
                     else:
+                        # task#164: daily_history 본문 OCR이 Fail-Closed 된 경우에만
+                        # 우측 요금영역을 별도 OCR해 숫자 인식 가능성만 진단한다.
+                        # 이 probe 결과는 raw_calls 저장에 절대 사용하지 않는다.
+                        if result.get("format") == "daily_history":
+                            try:
+                                from daily_history_parser import extract_fare_probe_amounts
+                                _probe_bytes = crop_daily_history_fare_column(image_bytes)
+                                _probe_text = asyncio.run(google_vision_ocr(_probe_bytes))
+                                _probe_amounts = extract_fare_probe_amounts(
+                                    _probe_text or "",
+                                    displayed_amount=result.get("displayed_amount"),
+                                )
+                                result["fare_probe_count"] = len(_probe_amounts)
+                                result["fare_probe_sum"] = sum(_probe_amounts)
+                                result["fare_probe_amounts"] = _probe_amounts[:20]
+                            except Exception as _probe_err:
+                                logger.warning(f"daily_history fare probe 실패: {_probe_err}")
+                                result["fare_probe_error"] = type(_probe_err).__name__
+
                         _err_parts = []
                         _main_error = result.get("error")
                         if _main_error:
@@ -825,6 +844,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                             ("time_anchor_count", "anchors"),
                             ("parsed_count", "parsed"),
                             ("parsed_amount", "parsed_amount"),
+                            ("fare_probe_count", "fare_probe_count"),
+                            ("fare_probe_sum", "fare_probe_sum"),
                         ):
                             if result.get(_k) is not None:
                                 _diag_bits.append(f"{_label}={result.get(_k)}")
@@ -835,6 +856,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                         ]
                         if _safe_parse_errors:
                             _err_parts.append("; ".join(_safe_parse_errors))
+                        if result.get("fare_probe_amounts"):
+                            _err_parts.append(
+                                "fare_probe_amounts=" +
+                                ",".join(str(x) for x in result.get("fare_probe_amounts", [])[:20])
+                            )
                         _last_error = " | ".join(_err_parts)[:1800] or "UNKNOWN_IMAGE_PROCESSING_ERROR"
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
@@ -1725,6 +1751,24 @@ def merge_split_ocr_results(top_data: dict, bottom_data: dict) -> dict:
     key = 'calls' if top_data.get('type') == 'daily_history' else 'items'
     merged[key] = top_calls + dedup_bottom
     return merged
+
+
+def crop_daily_history_fare_column(image_bytes: bytes) -> bytes:
+    """task#164 진단용: 일별운행이력 우측 요금영역만 잘라 OCR 밀도를 높인다.
+
+    실제 raw_calls 저장에는 사용하지 않고, 본문 OCR이 Fail-Closed 된 경우
+    '요금 숫자 자체가 별도 crop에서 읽히는가'만 확인한다.
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.width, img.height
+    x0 = max(0, int(w * 0.60))
+    crop = img.crop((x0, 0, w, h))
+    if crop.mode not in ("RGB", "L"):
+        crop = crop.convert("RGB")
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=90, optimize=True)
+    return buf.getvalue()
 
 
 def resize_image_if_needed(image_bytes: bytes) -> bytes:
