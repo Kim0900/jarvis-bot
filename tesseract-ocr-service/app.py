@@ -58,7 +58,7 @@ def _resize_if_needed(img: Image.Image) -> Image.Image:
     return img.resize(new_size, Image.LANCZOS)
 
 
-def _ocr_space_recognize(image_bytes: bytes, lang: str, timeout_sec: int = None) -> tuple:
+def _ocr_space_recognize(image_bytes: bytes, lang: str) -> tuple:
     """OCR.space 무료 API 호출. 2026-09-16 도입 — Render CPU 병목을
     완전히 우회(처리가 OCR.space 자체 서버에서 일어남). 실패시
     (None, 사유)를 반환해 호출측이 로컬 Tesseract로 폴백하게 한다."""
@@ -83,7 +83,7 @@ def _ocr_space_recognize(image_bytes: bytes, lang: str, timeout_sec: int = None)
         headers={"apikey": OCR_SPACE_API_KEY,
                  "Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=(timeout_sec or OCR_SPACE_TIMEOUT_SEC)) as resp:
+        with urllib.request.urlopen(req, timeout=OCR_SPACE_TIMEOUT_SEC) as resp:
             result = json.loads(resp.read().decode())
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return None, f"OCR.space 네트워크오류: {e}"
@@ -105,10 +105,8 @@ def _ocr_space_recognize(image_bytes: bytes, lang: str, timeout_sec: int = None)
 
 
 TALL_IMAGE_RATIO_THRESHOLD = 4.0
-VERY_TALL_IMAGE_RATIO_THRESHOLD = 6.0
-SPLIT_OVERLAP_RATIO_OF_CHUNK = 0.20
-SPLIT2_OCR_TIMEOUT_SEC = 12
-SPLIT4_OCR_TIMEOUT_SEC = 7
+TALL_SPLIT_TOP_END = 0.55
+TALL_SPLIT_BOTTOM_START = 0.45
 
 
 def _image_to_jpeg_bytes(img: Image.Image) -> bytes:
@@ -118,102 +116,60 @@ def _image_to_jpeg_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def _split_vertical_chunks(img: Image.Image, parts: int) -> list:
-    """세로 이미지를 parts개로 나누되 인접 조각끼리 경계가 겹치게 한다.
-
-    overlap은 각 nominal chunk 높이의 20%다.
-    - 2분할: 전체 이미지 기준 10% overlap → 과거 검증값(0~55%,45~100%)과 동일
-    - 4분할: 인접 조각마다 전체 높이 약 5% overlap
-    """
-    if parts < 2:
-        return [img]
-
+def _split_tall_image(img: Image.Image) -> tuple:
+    """긴 세로 스크린샷을 상/하 2조각으로 분리한다.
+    2026-08-19 실데이터에서 검증했던 10% overlap(0~55%,45~100%)을
+    OCR.space 경로에 복원한다."""
     h = img.height
-    step = h / float(parts)
-    overlap = step * SPLIT_OVERLAP_RATIO_OF_CHUNK
-    half_overlap = overlap / 2.0
-    chunks = []
-
-    for i in range(parts):
-        base_start = i * step
-        base_end = (i + 1) * step
-        start_y = 0 if i == 0 else max(0, int(round(base_start - half_overlap)))
-        end_y = h if i == parts - 1 else min(h, int(round(base_end + half_overlap)))
-        if end_y <= start_y:
-            continue
-        chunks.append(img.crop((0, start_y, img.width, end_y)))
-    return chunks
-
-
-def _ocr_split_chunks(img: Image.Image, lang: str, parts: int, timeout_sec: int) -> tuple:
-    chunks = _split_vertical_chunks(img, parts)
-    texts = []
-    metas = []
-    processed_sizes = []
-
-    for index, chunk in enumerate(chunks, start=1):
-        resized = _resize_if_needed(chunk)
-        processed_sizes.append([resized.width, resized.height])
-        text, meta = _ocr_space_recognize(
-            _image_to_jpeg_bytes(chunk),
-            lang,
-            timeout_sec=timeout_sec,
-        )
-        if text is None:
-            return None, {
-                "failed_chunk": index,
-                "failed_reason": meta,
-                "processed_sizes": processed_sizes,
-            }
-        texts.append(f"---MAGI_OCR_CHUNK_{index}---\n{text.strip()}")
-        metas.append(meta or {})
-
-    return "\n".join(texts), {
-        "processed_sizes": processed_sizes,
-        "durations_ms": [m.get("ocrspace_duration_ms") for m in metas],
-    }
+    top = img.crop((0, 0, img.width, max(1, int(h * TALL_SPLIT_TOP_END))))
+    bottom = img.crop((0, max(0, int(h * TALL_SPLIT_BOTTOM_START)), img.width, h))
+    return top, bottom
 
 
 def smart_ocr(img: Image.Image, lang: str) -> tuple:
     """OCR.space 우선 → 실패시 로컬 Tesseract 폴백.
 
-    task#164(2026-09-29):
-    - 세로비 >= 6.0: 4분할
-    - 세로비 >= 4.0: 2분할
-    - 그 미만: 단일 OCR
-    overlap 중복은 호출측 daily_history parser가 time-key로 제거한다.
+    task#164(2026-09-29): 세로비 4.0 이상 긴 화면은 OCR.space에
+    상/하 2분할로 보내고, 조각 경계 marker를 넣어 호출측 parser가
+    overlap 중복을 결정론적으로 제거할 수 있게 한다.
     """
     meta = {"orig_size": [img.width, img.height]}
     aspect_ratio = (img.height / img.width) if img.width else 0.0
 
-    split_parts = 0
-    split_timeout = None
-    if aspect_ratio >= VERY_TALL_IMAGE_RATIO_THRESHOLD:
-        split_parts = 4
-        split_timeout = SPLIT4_OCR_TIMEOUT_SEC
-    elif aspect_ratio >= TALL_IMAGE_RATIO_THRESHOLD:
-        split_parts = 2
-        split_timeout = SPLIT2_OCR_TIMEOUT_SEC
+    if aspect_ratio >= TALL_IMAGE_RATIO_THRESHOLD:
+        top, bottom = _split_tall_image(img)
+        top_resized = _resize_if_needed(top)
+        bottom_resized = _resize_if_needed(bottom)
+        meta["processed_size"] = [
+            [top_resized.width, top_resized.height],
+            [bottom_resized.width, bottom_resized.height],
+        ]
+        top_text, top_meta = _ocr_space_recognize(_image_to_jpeg_bytes(top), lang)
+        bottom_text, bottom_meta = _ocr_space_recognize(_image_to_jpeg_bytes(bottom), lang)
 
-    if split_parts:
-        text, split_meta = _ocr_split_chunks(
-            img, lang, parts=split_parts, timeout_sec=split_timeout
-        )
-        if text is not None:
-            meta["engine"] = f"ocrspace_split{split_parts}"
+        if top_text is not None and bottom_text is not None:
+            meta["engine"] = "ocrspace_split2"
             meta["fallback_used"] = False
             meta["split_used"] = True
-            meta["split_parts"] = split_parts
-            meta["split_overlap_ratio_of_chunk"] = SPLIT_OVERLAP_RATIO_OF_CHUNK
-            meta["processed_size"] = split_meta.get("processed_sizes")
-            meta["ocrspace_duration_ms"] = split_meta.get("durations_ms")
+            meta["split_overlap_pct"] = 10
+            meta["ocrspace_duration_ms"] = (
+                (top_meta or {}).get("ocrspace_duration_ms"),
+                (bottom_meta or {}).get("ocrspace_duration_ms"),
+            )
+            text = (
+                "---MAGI_OCR_CHUNK_1---\n" + top_text.rstrip() +
+                "\n---MAGI_OCR_CHUNK_2---\n" + bottom_text.lstrip()
+            )
             return text, meta
 
-        # 조각 하나라도 실패하면 OCR.space를 추가 재호출하지 않고
-        # full-image local Tesseract 1회로 폴백해 worker 60초 상한을 지킨다.
-        meta["ocrspace_failed_reason"] = split_meta
+        # 한 조각이라도 OCR.space 실패 시 OCR.space를 세 번째로 재호출하지
+        # 않고 full-image local Tesseract 1회로 폴백한다. Gunicorn 60초
+        # timeout 안에서 Fail-Safe를 유지하기 위한 상한 제어다.
+        meta["ocrspace_failed_reason"] = {
+            "top": None if top_text is not None else top_meta,
+            "bottom": None if bottom_text is not None else bottom_meta,
+        }
         meta["split_used"] = True
-        meta["split_parts"] = split_parts
         resized = _resize_if_needed(img)
         meta["processed_size"] = [resized.width, resized.height]
         meta["fallback_used"] = True
@@ -230,15 +186,13 @@ def smart_ocr(img: Image.Image, lang: str) -> tuple:
     if text is not None:
         meta.update(ocrspace_meta)
         meta["fallback_used"] = False
-        meta["split_used"] = False
-        meta["split_parts"] = 1
+        meta.setdefault("split_used", False)
         return text, meta
 
     meta["ocrspace_failed_reason"] = ocrspace_meta
     meta["fallback_used"] = True
     meta["engine"] = "tesseract_local"
-    meta["split_used"] = False
-    meta["split_parts"] = 1
+    meta.setdefault("split_used", False)
     text = pytesseract.image_to_string(
         resized, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
     return text, meta
@@ -274,8 +228,8 @@ def ocr():
         duration_ms = int((time.time() - t_start) * 1000)
         print(f"[OCR_OK] duration_ms={duration_ms} engine={meta.get('engine')} "
               f"fallback={meta.get('fallback_used')} split={meta.get('split_used')} "
-              f"parts={meta.get('split_parts')} orig={meta['orig_size']} "
-              f"processed={meta['processed_size']} text_len={len(text)}", flush=True)
+              f"orig={meta['orig_size']} processed={meta['processed_size']} "
+              f"text_len={len(text)}", flush=True)
         return jsonify({
             "success": True, "text": text, "lang": lang,
             "duration_ms": duration_ms, "engine": meta.get("engine"),
