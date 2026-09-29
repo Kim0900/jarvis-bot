@@ -816,8 +816,9 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(200, result)
                     else:
                         # task#164: daily_history 본문 OCR이 Fail-Closed 된 경우에만
-                        # 우측 요금영역을 별도 OCR해 숫자 인식 가능성만 진단한다.
-                        # 이 probe 결과는 raw_calls 저장에 절대 사용하지 않는다.
+                        # 우측 요금영역을 별도 OCR해 숫자 인식 가능성을 확인한다.
+                        _repair_candidate = None
+                        _probe_amounts = []
                         if result.get("format") == "daily_history":
                             try:
                                 from daily_history_parser import extract_fare_probe_amounts
@@ -831,7 +832,6 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 result["fare_probe_sum"] = sum(_probe_amounts)
                                 result["fare_probe_amounts"] = _probe_amounts[:20]
 
-                                # 저장은 별도 strict repair gate를 모두 통과할 때만 허용.
                                 if result.get("error_code") in (
                                     "DAILY_HISTORY_COUNT_MISMATCH",
                                     "DAILY_HISTORY_ANCHOR_MISMATCH",
@@ -842,40 +842,55 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     result["fare_repair_error_code"] = _repair.get("error_code")
                                     result["fare_repair_message"] = _repair.get("message")
                                     if _repair.get("repaired"):
-                                        _repaired_parsed = _repair.get("parsed") or {}
-                                        _saved = asyncio.run(
-                                            _save_repaired_daily_history_batch(
-                                                _repaired_parsed, source_id
-                                            )
-                                        )
-                                        _expected = int(_repaired_parsed.get("표시건수") or 0)
-                                        if _saved != _expected:
-                                            raise RuntimeError(
-                                                f"REPAIR_SAVED_COUNT_MISMATCH:{_saved}/{_expected}"
-                                            )
-                                        asyncio.run(mark_call_image_ingestion(
-                                            source_id,
-                                            "COMPLETED",
-                                            fmt="daily_history",
-                                            inserted_count=_saved,
-                                        ))
-                                        send_json(200, {
-                                            "success": True,
-                                            "duplicate": False,
-                                            "source_id": source_id,
-                                            "format": "daily_history",
-                                            "saved_count": _saved,
-                                            "repair_used": True,
-                                            "repair_method": "fare_column_probe_ordered",
-                                            "displayed_count": _repaired_parsed.get("표시건수"),
-                                            "displayed_amount": _repaired_parsed.get("표시금액"),
-                                            "fare_probe_count": len(_probe_amounts),
-                                            "fare_probe_sum": sum(_probe_amounts),
-                                        })
-                                        return
+                                        _repair_candidate = _repair.get("parsed") or {}
                             except Exception as _probe_err:
                                 logger.warning(f"daily_history fare probe 실패: {_probe_err}")
                                 result["fare_probe_error"] = type(_probe_err).__name__
+
+                        # probe/repair 판정과 실제 쓰기를 분리한다.
+                        # 쓰기 또는 COMPLETED 기록이 실패하면 해당 source_id 행을 즉시 롤백한다.
+                        if _repair_candidate is not None:
+                            _expected = int(_repair_candidate.get("표시건수") or 0)
+                            try:
+                                _saved = asyncio.run(
+                                    _save_repaired_daily_history_batch(
+                                        _repair_candidate, source_id
+                                    )
+                                )
+                                if _saved != _expected:
+                                    raise RuntimeError(
+                                        f"REPAIR_SAVED_COUNT_MISMATCH:{_saved}/{_expected}"
+                                    )
+                                asyncio.run(mark_call_image_ingestion(
+                                    source_id,
+                                    "COMPLETED",
+                                    fmt="daily_history",
+                                    inserted_count=_saved,
+                                ))
+                            except Exception:
+                                try:
+                                    asyncio.run(delete_partial_source_calls(source_id))
+                                except Exception as _rollback_err:
+                                    logger.error(
+                                        f"daily_history repair rollback 실패 "
+                                        f"(source_id={source_id}): {_rollback_err}"
+                                    )
+                                raise
+
+                            send_json(200, {
+                                "success": True,
+                                "duplicate": False,
+                                "source_id": source_id,
+                                "format": "daily_history",
+                                "saved_count": _saved,
+                                "repair_used": True,
+                                "repair_method": "fare_column_probe_ordered",
+                                "displayed_count": _repair_candidate.get("표시건수"),
+                                "displayed_amount": _repair_candidate.get("표시금액"),
+                                "fare_probe_count": len(_probe_amounts),
+                                "fare_probe_sum": sum(_probe_amounts),
+                            })
+                            return
 
                         _err_parts = []
                         _main_error = result.get("error")
