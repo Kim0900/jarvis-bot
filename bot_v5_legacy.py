@@ -6423,8 +6423,14 @@ async def run_magi_auto_review_once():
     REVIEW_MAX_ATTEMPTS = 5
     try:
         rows = await sb_select("magi_tasks", {
-            "status": "eq.VERIFICATION", "verified_by": "is.null",
-            "order": "updated_at.asc", "limit": "1"
+            "status": "eq.VERIFICATION",
+            "verified_by": "is.null",
+            # task#167: 명시적으로 CASSANDRA 검증 대기 중인 태스크는
+            # legacy MAGI 자동검증 큐가 소비하면 안 된다.
+            # NULL은 기존 legacy 태스크 호환을 위해 계속 허용한다.
+            "or": "(verification_status.is.null,verification_status.neq.PENDING_CASSANDRA)",
+            "order": "updated_at.asc",
+            "limit": "1",
         })
     except Exception as e:
         logger.error(f"마기자동검증 - magi_tasks 조회 실패: {e}")
