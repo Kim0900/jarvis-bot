@@ -238,6 +238,154 @@ def parse_daily_history_text(text: str) -> dict[str, Any]:
         result["parse_errors"].append("콜 목록 파싱실패")
     return result
 
+def repair_daily_history_with_fare_probe(text: str, fare_amounts: list[int]) -> dict[str, Any]:
+    """본문 OCR 주소/시간과 요금전용 OCR을 엄격히 결합한다.
+
+    허용 조건:
+    - 날짜 존재
+    - 화면 표시건수/표시금액 존재
+    - unique time-anchor 수 == 표시건수 == fare_amounts 수
+    - fare_amounts 합 == 표시금액
+    - 모든 time-anchor마다 주소 2개가 정확히 하나의 출발/도착 pair로 수렴
+    하나라도 어긋나면 repaired=False로 반환하고 저장에 사용하지 않는다.
+    """
+    base = parse_daily_history_text(text)
+    result = {
+        "repaired": False,
+        "error_code": None,
+        "message": None,
+        "parsed": None,
+    }
+
+    date_value = base.get("날짜")
+    displayed_count = base.get("표시건수")
+    displayed_amount = base.get("표시금액")
+    anchor_count = int(base.get("time_anchor_count") or 0)
+
+    if not date_value:
+        result.update(
+            error_code="REPAIR_DATE_MISSING",
+            message="날짜가 없어 요금 보정을 중단했습니다.",
+        )
+        return result
+    if displayed_count is None or displayed_amount is None:
+        result.update(
+            error_code="REPAIR_HEADER_MISSING",
+            message="화면 건수/금액 합계를 확인할 수 없어 요금 보정을 중단했습니다.",
+        )
+        return result
+    if anchor_count != int(displayed_count):
+        result.update(
+            error_code="REPAIR_ANCHOR_COUNT_MISMATCH",
+            message=f"시간행 {anchor_count}건과 화면 {displayed_count}건이 달라 보정을 중단했습니다.",
+        )
+        return result
+    if len(fare_amounts or []) != int(displayed_count):
+        result.update(
+            error_code="REPAIR_FARE_COUNT_MISMATCH",
+            message=f"요금 {len(fare_amounts or [])}건과 화면 {displayed_count}건이 달라 보정을 중단했습니다.",
+        )
+        return result
+
+    normalized_fares = [int(x) for x in fare_amounts]
+    if sum(normalized_fares) != int(displayed_amount):
+        result.update(
+            error_code="REPAIR_FARE_SUM_MISMATCH",
+            message=(
+                f"요금 합계 {sum(normalized_fares):,}원과 화면 "
+                f"{int(displayed_amount):,}원이 달라 보정을 중단했습니다."
+            ),
+        )
+        return result
+
+    chunks = [
+        part for part in re.split(r"---MAGI_OCR_CHUNK_\d+---", text or "")
+        if part and part.strip()
+    ]
+    if not chunks:
+        chunks = [text or ""]
+
+    order: list[tuple[str, str]] = []
+    row_candidates: dict[tuple[str, str], list[dict[str, str]]] = {}
+
+    for chunk in chunks:
+        anchors = list(_TIME_RANGE_RE.finditer(chunk))
+        for idx, anchor in enumerate(anchors):
+            seg_end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(chunk)
+            segment = chunk[anchor.start():seg_end]
+            start, end = anchor.groups()
+            time_key = (start.zfill(5), end.zfill(5))
+
+            if time_key not in row_candidates:
+                order.append(time_key)
+                row_candidates[time_key] = []
+
+            addresses = _address_candidates(segment)
+            if len(addresses) < 2:
+                continue
+            row_candidates[time_key].append({
+                "출발지": addresses[0],
+                "도착지": addresses[1],
+                "결제방식": "직접" if "직접결제" in segment else "자동",
+            })
+
+    if len(order) != int(displayed_count):
+        result.update(
+            error_code="REPAIR_ORDER_COUNT_MISMATCH",
+            message=f"행 순서 {len(order)}건과 화면 {displayed_count}건이 달라 보정을 중단했습니다.",
+        )
+        return result
+
+    items = []
+    for idx, time_key in enumerate(order):
+        candidates = row_candidates.get(time_key) or []
+        unique_pairs: dict[tuple[str, str], dict[str, str]] = {}
+        for candidate in candidates:
+            pair = (candidate["출발지"], candidate["도착지"])
+            if pair not in unique_pairs:
+                unique_pairs[pair] = dict(candidate)
+            elif candidate.get("결제방식") == "직접":
+                unique_pairs[pair]["결제방식"] = "직접"
+
+        if len(unique_pairs) != 1:
+            result.update(
+                error_code="REPAIR_ADDRESS_AMBIGUOUS",
+                message=(
+                    f"{time_key[0]}-{time_key[1]} 주소 후보가 "
+                    f"{len(unique_pairs)}개라 보정을 중단했습니다."
+                ),
+            )
+            return result
+
+        row = next(iter(unique_pairs.values()))
+        items.append({
+            "탑승시각": time_key[0],
+            "하차시각": time_key[1],
+            "출발지": row["출발지"],
+            "도착지": row["도착지"],
+            "요금": normalized_fares[idx],
+            "결제방식": row.get("결제방식") or "자동",
+        })
+
+    repaired = dict(base)
+    repaired["items"] = items
+    repaired["parse_errors"] = []
+    repaired["repair_used"] = True
+    repaired["repair_method"] = "fare_column_probe_ordered"
+    validation = validate_daily_history_document(repaired)
+    if not validation.get("ok"):
+        result.update(
+            error_code="REPAIR_POST_VALIDATION_FAILED",
+            message=validation.get("message"),
+        )
+        return result
+
+    result["repaired"] = True
+    result["parsed"] = repaired
+    result["message"] = "PASS"
+    return result
+
+
 def validate_daily_history_document(parsed: dict[str, Any]) -> dict[str, Any]:
     items = parsed.get("items") or []
     parsed_count = len(items)
