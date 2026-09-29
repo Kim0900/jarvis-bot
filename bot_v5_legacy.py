@@ -5637,7 +5637,7 @@ async def run_geomnuri_patrol_once() -> dict:
         )
         if not isinstance(ingest_rows, list):
             ingest_rows = []
-        failed_recent = 0
+        failed_recent = []
         stuck = []
         fail_cutoff = now - timedelta(hours=1)
         stuck_cutoff = now - timedelta(minutes=GEOMNURI_PATROL_INGEST_STUCK_MINUTES)
@@ -5649,7 +5649,7 @@ async def run_geomnuri_patrol_once() -> dict:
             if row.get("status") == "PROCESSING" and local_updated < stuck_cutoff:
                 stuck.append(row)
             if row.get("status") == "FAILED" and local_updated >= fail_cutoff:
-                failed_recent += 1
+                failed_recent.append(row)
         if stuck:
             sample = ", ".join(str(x.get("source_id"))[:24] for x in stuck[:3])
             await emit(
@@ -5659,12 +5659,17 @@ async def run_geomnuri_patrol_once() -> dict:
                 severity="CRITICAL",
                 cooldown_seconds=3600,
             )
-        if failed_recent:
+
+        # FAILED는 집계키 하나로 매시간 재경보하지 않는다.
+        # source_id별로 24시간 쿨다운하여 신규 실패는 알리되 동일 파일 반복실패는 스팸 방지.
+        for row in failed_recent[:10]:
+            source_id = str(row.get("source_id") or "unknown")
+            fmt = str(row.get("format") or "unknown")
             await emit(
-                "ingestion_failed_recent",
-                f"최근 1시간 call_image_ingestions FAILED {failed_recent}건",
+                f"ingestion_failed::{source_id}",
+                f"call_image_ingestions FAILED: source_id={source_id[:24]}, format={fmt}",
                 severity="WARN",
-                cooldown_seconds=3600,
+                cooldown_seconds=24 * 3600,
             )
     except Exception as e:
         await emit("patrol_internal_ingestion_check", f"순라 ingestion 점검 자체 실패: {e}", severity="CRITICAL")
