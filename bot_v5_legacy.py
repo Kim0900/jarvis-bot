@@ -5451,6 +5451,15 @@ async def run_geomnuri_patrol_once() -> dict:
                     severity="CRITICAL",
                 )
                 continue
+            result = str(row.get("last_result") or "").strip()
+            result_upper = result.upper()
+
+            # 의도적으로 꺼 둔 외부 자동화/스케줄러는 장애가 아니다.
+            # scheduler_status를 DISABLED 또는 PAUSED로 명시하면
+            # stale/FAIL 경보 대상에서 제외한다.
+            if result_upper.startswith("DISABLED") or result_upper.startswith("PAUSED"):
+                continue
+
             age_sec = (now - last_dt.astimezone(KST)).total_seconds()
             if age_sec > max_age:
                 await emit(
@@ -5461,8 +5470,7 @@ async def run_geomnuri_patrol_once() -> dict:
                     severity="CRITICAL",
                     cooldown_seconds=3600,
                 )
-            result = str(row.get("last_result") or "")
-            if result.upper().startswith("FAIL") or "MISMATCH" in result.upper():
+            if result_upper.startswith("FAIL") or "MISMATCH" in result_upper:
                 await emit(
                     f"scheduler_fail::{job_name}",
                     f"스케줄러 최근 결과 이상: {job_name} → {result[:500]}",
