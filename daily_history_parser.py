@@ -21,6 +21,7 @@ _HEADER_RE = re.compile(
     r"[\s/|·,:-]{0,30}?([\d,]{4,})\s*원"
 )
 _FARE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,6})\s*원")
+_NUMERIC_TOKEN_RE = re.compile(r"(?<!\d)(?:\d[\d,\.\s]{2,8}\d)(?!\d)")
 _ADDRESS_FALLBACK_RE = re.compile(
     r"대구\s+[^\s\r\n]{1,12}\s+[^\s\r\n]{1,24}"
 )
@@ -29,6 +30,25 @@ def _clean_line(line: str) -> str:
     line = re.sub(r"^[\s•●○·oO0ㆍ\-–—]+", "", line.strip())
     line = re.sub(r"\s+", " ", line)
     return line.strip()
+
+def _safe_numeric_tokens(segment: str) -> list[str]:
+    """주소/OCR 원문을 남기지 않고 요금 후보 숫자 형태만 진단한다.
+
+    시간(HH:MM)은 제외하고, 구두점/공백을 제거한 뒤 3~6자리 숫자만
+    최대 5개 보존한다. 값 자체는 요금 후보 진단용이며 저장 근거로는
+    사용하지 않는다.
+    """
+    out = []
+    for raw in _NUMERIC_TOKEN_RE.findall(segment):
+        token = re.sub(r"\D", "", raw)
+        if not (3 <= len(token) <= 6):
+            continue
+        if token not in out:
+            out.append(token)
+        if len(out) >= 5:
+            break
+    return out
+
 
 def _address_candidates(segment: str) -> list[str]:
     out: list[str] = []
@@ -108,7 +128,8 @@ def parse_daily_history_text(text: str) -> dict[str, Any]:
 
             addresses = _address_candidates(segment)
             fares = [int(x.replace(",", "")) for x in _FARE_RE.findall(segment)]
-            observed[time_key].append((len(addresses), len(fares)))
+            numeric_tokens = _safe_numeric_tokens(segment)
+            observed[time_key].append((len(addresses), len(fares), numeric_tokens))
 
             if len(addresses) < 2 or not fares:
                 continue
@@ -133,11 +154,23 @@ def parse_daily_history_text(text: str) -> dict[str, Any]:
     for time_key in order:
         candidates = complete.get(time_key) or []
         if not candidates:
-            best_addr = max((x[0] for x in observed.get(time_key, [])), default=0)
-            best_fare = max((x[1] for x in observed.get(time_key, [])), default=0)
+            obs = observed.get(time_key, [])
+            best_addr = max((x[0] for x in obs), default=0)
+            best_fare = max((x[1] for x in obs), default=0)
+            numeric_candidates = []
+            for x in obs:
+                for token in (x[2] if len(x) > 2 else []):
+                    if token not in numeric_candidates:
+                        numeric_candidates.append(token)
+                    if len(numeric_candidates) >= 5:
+                        break
+                if len(numeric_candidates) >= 5:
+                    break
+            candidate_text = ",".join(numeric_candidates) if numeric_candidates else "없음"
             result["parse_errors"].append(
                 f"행 파싱불완전({time_key[0]}-{time_key[1]}): "
-                f"주소최대{best_addr}개/요금최대{best_fare}개"
+                f"주소최대{best_addr}개/요금최대{best_fare}개/"
+                f"숫자후보={candidate_text}"
             )
             continue
 
