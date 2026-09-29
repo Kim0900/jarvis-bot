@@ -162,13 +162,21 @@ def smart_ocr(img: Image.Image, lang: str) -> tuple:
             )
             return text, meta
 
-        # 한 조각이라도 OCR.space 실패 시 2회 local fallback으로 시간을
-        # 늘리지 않고 기존 full-image Tesseract 1회로 안전하게 폴백.
+        # 한 조각이라도 OCR.space 실패 시 OCR.space를 세 번째로 재호출하지
+        # 않고 full-image local Tesseract 1회로 폴백한다. Gunicorn 60초
+        # timeout 안에서 Fail-Safe를 유지하기 위한 상한 제어다.
         meta["ocrspace_failed_reason"] = {
             "top": None if top_text is not None else top_meta,
             "bottom": None if bottom_text is not None else bottom_meta,
         }
         meta["split_used"] = True
+        resized = _resize_if_needed(img)
+        meta["processed_size"] = [resized.width, resized.height]
+        meta["fallback_used"] = True
+        meta["engine"] = "tesseract_local_after_split_failure"
+        text = pytesseract.image_to_string(
+            resized, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
+        return text, meta
 
     resized = _resize_if_needed(img)
     meta["processed_size"] = [resized.width, resized.height]
