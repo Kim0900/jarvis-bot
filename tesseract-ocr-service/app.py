@@ -206,6 +206,20 @@ def health():
     })
 
 
+def _fare_strip_ocr(img: Image.Image, lang: str) -> tuple:
+    """task#164: daily_history 오른쪽 요금열 진단 전용 local OCR.
+    원본 기준 x=55%~, y=12%~ 영역만 읽는다. 본문 OCR/DB 저장에는 관여하지 않는다."""
+    w, h = img.width, img.height
+    crop = img.crop((int(w * 0.55), int(h * 0.12), w, h))
+    text = pytesseract.image_to_string(
+        crop,
+        lang=lang,
+        config="--oem 1 --psm 11",
+        timeout=min(TESSERACT_TIMEOUT_SEC, 20),
+    )
+    return text, {"crop": [int(w * 0.55), int(h * 0.12), w, h]}
+
+
 @app.route("/ocr", methods=["POST"])
 def ocr():
     ok, err = _check_auth()
@@ -221,8 +235,26 @@ def ocr():
                              "error_code": "BAD_REQUEST", "error_stage": "input"}), 400
 
         lang = payload.get("lang", "kor+eng")
+        mode = str(payload.get("mode") or "default")
         image_bytes = base64.b64decode(image_b64)
         img = Image.open(BytesIO(image_bytes))
+
+        if mode == "fare_strip":
+            text, meta = _fare_strip_ocr(img, lang)
+            duration_ms = int((time.time() - t_start) * 1000)
+            print(
+                f"[FARE_OCR_OK] duration_ms={duration_ms} "
+                f"orig={[img.width, img.height]} text_len={len(text)}",
+                flush=True,
+            )
+            return jsonify({
+                "success": True,
+                "text": text,
+                "lang": lang,
+                "mode": "fare_strip",
+                "duration_ms": duration_ms,
+                "engine": "tesseract_local_fare_strip",
+            })
 
         text, meta = smart_ocr(img, lang)
         duration_ms = int((time.time() - t_start) * 1000)
