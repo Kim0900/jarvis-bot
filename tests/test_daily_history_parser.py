@@ -92,6 +92,54 @@ class TestDailyHistoryParser(unittest.TestCase):
         self.assertFalse(v["ok"])
         self.assertEqual(v["error_code"], "DAILY_HISTORY_DATE_MISSING")
 
+
+    def test_split_overlap_dedup(self):
+        top = """일별 운행 이력
+2026년 9월 28일(월) 2건
+실시간 운행 2건 / 17,700원
+21:55 - 22:16 실시간
+대구 동구 신천4동
+대구 남구 대명1동
+직접결제
+11,200원
+21:40 - 21:51 실시간
+대구 남구 대명2동
+대구 동구 신천4동
+9,200원
+"""
+        bottom = """21:40 - 21:51 실시간
+대구 남구 대명2동
+대구 동구 신천4동
+9,200원
+"""
+        p = parse_daily_history_text(
+            "---MAGI_OCR_CHUNK_1---\n" + top +
+            "---MAGI_OCR_CHUNK_2---\n" + bottom
+        )
+        self.assertEqual(p["time_anchor_count"], 2)
+        self.assertEqual(len(p["items"]), 2)
+        self.assertEqual(p["items"][0]["결제방식"], "직접")
+
+    def test_split_prefers_complete_duplicate(self):
+        top = """일별 운행 이력
+2026년 9월 29일(화) 1건
+실시간 운행 1건 / 7,700원
+00:05 - 00:11 실시간
+대구 수성구 범어2동
+"""
+        bottom = """00:05 - 00:11 실시간
+대구 수성구 범어2동
+대구 동구 신천3동
+7,700원
+"""
+        p = parse_daily_history_text(
+            "---MAGI_OCR_CHUNK_1---\n" + top +
+            "---MAGI_OCR_CHUNK_2---\n" + bottom
+        )
+        self.assertEqual(p["time_anchor_count"], 1)
+        self.assertEqual(len(p["items"]), 1)
+        self.assertTrue(validate_daily_history_document(p)["ok"])
+
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
         v = validate_daily_history_document(p)

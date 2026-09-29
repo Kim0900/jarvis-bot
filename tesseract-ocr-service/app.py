@@ -104,26 +104,95 @@ def _ocr_space_recognize(image_bytes: bytes, lang: str) -> tuple:
     return text, meta
 
 
-def smart_ocr(img: Image.Image, lang: str) -> tuple:
-    """2026-09-16 3차: OCR.space 우선 → 실패시 로컬 Tesseract 폴백."""
-    meta = {"orig_size": [img.width, img.height]}
-    resized = _resize_if_needed(img)
-    meta["processed_size"] = [resized.width, resized.height]
+TALL_IMAGE_RATIO_THRESHOLD = 4.0
+TALL_SPLIT_TOP_END = 0.55
+TALL_SPLIT_BOTTOM_START = 0.45
 
+
+def _image_to_jpeg_bytes(img: Image.Image) -> bytes:
+    resized = _resize_if_needed(img)
     buf = BytesIO()
     resized.convert("RGB").save(buf, format="JPEG", quality=90)
-    image_bytes = buf.getvalue()
+    return buf.getvalue()
+
+
+def _split_tall_image(img: Image.Image) -> tuple:
+    """긴 세로 스크린샷을 상/하 2조각으로 분리한다.
+    2026-08-19 실데이터에서 검증했던 10% overlap(0~55%,45~100%)을
+    OCR.space 경로에 복원한다."""
+    h = img.height
+    top = img.crop((0, 0, img.width, max(1, int(h * TALL_SPLIT_TOP_END))))
+    bottom = img.crop((0, max(0, int(h * TALL_SPLIT_BOTTOM_START)), img.width, h))
+    return top, bottom
+
+
+def smart_ocr(img: Image.Image, lang: str) -> tuple:
+    """OCR.space 우선 → 실패시 로컬 Tesseract 폴백.
+
+    task#164(2026-09-29): 세로비 4.0 이상 긴 화면은 OCR.space에
+    상/하 2분할로 보내고, 조각 경계 marker를 넣어 호출측 parser가
+    overlap 중복을 결정론적으로 제거할 수 있게 한다.
+    """
+    meta = {"orig_size": [img.width, img.height]}
+    aspect_ratio = (img.height / img.width) if img.width else 0.0
+
+    if aspect_ratio >= TALL_IMAGE_RATIO_THRESHOLD:
+        top, bottom = _split_tall_image(img)
+        top_resized = _resize_if_needed(top)
+        bottom_resized = _resize_if_needed(bottom)
+        meta["processed_size"] = [
+            [top_resized.width, top_resized.height],
+            [bottom_resized.width, bottom_resized.height],
+        ]
+        top_text, top_meta = _ocr_space_recognize(_image_to_jpeg_bytes(top), lang)
+        bottom_text, bottom_meta = _ocr_space_recognize(_image_to_jpeg_bytes(bottom), lang)
+
+        if top_text is not None and bottom_text is not None:
+            meta["engine"] = "ocrspace_split2"
+            meta["fallback_used"] = False
+            meta["split_used"] = True
+            meta["split_overlap_pct"] = 10
+            meta["ocrspace_duration_ms"] = (
+                (top_meta or {}).get("ocrspace_duration_ms"),
+                (bottom_meta or {}).get("ocrspace_duration_ms"),
+            )
+            text = (
+                "---MAGI_OCR_CHUNK_1---\n" + top_text.rstrip() +
+                "\n---MAGI_OCR_CHUNK_2---\n" + bottom_text.lstrip()
+            )
+            return text, meta
+
+        # 한 조각이라도 OCR.space 실패 시 OCR.space를 세 번째로 재호출하지
+        # 않고 full-image local Tesseract 1회로 폴백한다. Gunicorn 60초
+        # timeout 안에서 Fail-Safe를 유지하기 위한 상한 제어다.
+        meta["ocrspace_failed_reason"] = {
+            "top": None if top_text is not None else top_meta,
+            "bottom": None if bottom_text is not None else bottom_meta,
+        }
+        meta["split_used"] = True
+        resized = _resize_if_needed(img)
+        meta["processed_size"] = [resized.width, resized.height]
+        meta["fallback_used"] = True
+        meta["engine"] = "tesseract_local_after_split_failure"
+        text = pytesseract.image_to_string(
+            resized, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
+        return text, meta
+
+    resized = _resize_if_needed(img)
+    meta["processed_size"] = [resized.width, resized.height]
+    image_bytes = _image_to_jpeg_bytes(img)
 
     text, ocrspace_meta = _ocr_space_recognize(image_bytes, lang)
     if text is not None:
         meta.update(ocrspace_meta)
         meta["fallback_used"] = False
+        meta.setdefault("split_used", False)
         return text, meta
 
-    # 폴백: 로컬 Tesseract
     meta["ocrspace_failed_reason"] = ocrspace_meta
     meta["fallback_used"] = True
     meta["engine"] = "tesseract_local"
+    meta.setdefault("split_used", False)
     text = pytesseract.image_to_string(
         resized, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
     return text, meta
@@ -158,8 +227,9 @@ def ocr():
         text, meta = smart_ocr(img, lang)
         duration_ms = int((time.time() - t_start) * 1000)
         print(f"[OCR_OK] duration_ms={duration_ms} engine={meta.get('engine')} "
-              f"fallback={meta.get('fallback_used')} orig={meta['orig_size']} "
-              f"processed={meta['processed_size']} text_len={len(text)}", flush=True)
+              f"fallback={meta.get('fallback_used')} split={meta.get('split_used')} "
+              f"orig={meta['orig_size']} processed={meta['processed_size']} "
+              f"text_len={len(text)}", flush=True)
         return jsonify({
             "success": True, "text": text, "lang": lang,
             "duration_ms": duration_ms, "engine": meta.get("engine"),

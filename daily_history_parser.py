@@ -80,41 +80,85 @@ def parse_daily_history_text(text: str) -> dict[str, Any]:
         result["표시건수"] = int(header.group(1))
         result["표시금액"] = int(header.group(2).replace(",", ""))
 
-    anchors = list(_TIME_RANGE_RE.finditer(text))
-    result["time_anchor_count"] = len(anchors)
-    if not anchors:
+    # OCR.space 긴이미지 2분할 경로는 조각 marker를 삽입한다.
+    # overlap 구간의 동일 운행은 (시작,종료) time key로 합치고,
+    # 한 조각이 불완전해도 다른 조각이 완전하면 완전행을 채택한다.
+    chunks = [
+        part for part in re.split(r"---MAGI_OCR_CHUNK_\d+---", text)
+        if part and part.strip()
+    ]
+    if not chunks:
+        chunks = [text]
+
+    order = []
+    observed = {}
+    complete = {}
+
+    for chunk in chunks:
+        anchors = list(_TIME_RANGE_RE.finditer(chunk))
+        for idx, anchor in enumerate(anchors):
+            seg_end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(chunk)
+            segment = chunk[anchor.start():seg_end]
+            start, end = anchor.groups()
+            time_key = (start.zfill(5), end.zfill(5))
+            if time_key not in observed:
+                order.append(time_key)
+                observed[time_key] = []
+                complete[time_key] = []
+
+            addresses = _address_candidates(segment)
+            fares = [int(x.replace(",", "")) for x in _FARE_RE.findall(segment)]
+            observed[time_key].append((len(addresses), len(fares)))
+
+            if len(addresses) < 2 or not fares:
+                continue
+
+            fare = fares[-1]
+            origin, dest = addresses[0], addresses[1]
+            item = {
+                "탑승시각": time_key[0],
+                "하차시각": time_key[1],
+                "출발지": origin,
+                "도착지": dest,
+                "요금": fare,
+                "결제방식": "직접" if "직접결제" in segment else "자동",
+            }
+            complete[time_key].append(item)
+
+    result["time_anchor_count"] = len(order)
+    if not order:
         result["parse_errors"].append("운행 시간범위 파싱실패")
         return result
 
-    seen = set()
-    for idx, anchor in enumerate(anchors):
-        seg_end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
-        segment = text[anchor.start():seg_end]
-        start, end = anchor.groups()
-        addresses = _address_candidates(segment)
-        fares = [int(x.replace(",", "")) for x in _FARE_RE.findall(segment)]
-
-        if len(addresses) < 2 or not fares:
+    for time_key in order:
+        candidates = complete.get(time_key) or []
+        if not candidates:
+            best_addr = max((x[0] for x in observed.get(time_key, [])), default=0)
+            best_fare = max((x[1] for x in observed.get(time_key, [])), default=0)
             result["parse_errors"].append(
-                f"행 파싱불완전({start}-{end}): "
-                f"주소{len(addresses)}개/요금{len(fares)}개"
+                f"행 파싱불완전({time_key[0]}-{time_key[1]}): "
+                f"주소최대{best_addr}개/요금최대{best_fare}개"
             )
             continue
 
-        fare = fares[-1]
-        origin, dest = addresses[0], addresses[1]
-        key = (start, end, origin, dest, fare)
-        if key in seen:
+        # overlap 양쪽에서 같은 운행이 잡힌 경우 실제 필드가 같은지 확인.
+        # 결제방식은 한쪽 조각에 직접결제 라벨이 잘릴 수 있어 '직접'을 우선 병합한다.
+        normalized = {}
+        for item in candidates:
+            key = (item["출발지"], item["도착지"], item["요금"])
+            if key not in normalized:
+                normalized[key] = dict(item)
+            elif item["결제방식"] == "직접":
+                normalized[key]["결제방식"] = "직접"
+
+        if len(normalized) != 1:
+            result["parse_errors"].append(
+                f"중복조각 OCR 불일치({time_key[0]}-{time_key[1]}): "
+                f"후보{len(normalized)}개"
+            )
             continue
-        seen.add(key)
-        result["items"].append({
-            "탑승시각": start.zfill(5),
-            "하차시각": end.zfill(5),
-            "출발지": origin,
-            "도착지": dest,
-            "요금": fare,
-            "결제방식": "직접" if "직접결제" in segment else "자동",
-        })
+
+        result["items"].append(next(iter(normalized.values())))
 
     if not result["items"]:
         result["parse_errors"].append("콜 목록 파싱실패")
