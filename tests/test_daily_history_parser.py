@@ -183,6 +183,13 @@ class TestDailyHistoryParser(unittest.TestCase):
         self.assertFalse(repaired["repaired"])
         self.assertEqual(repaired["error_code"], "REPAIR_FARE_SUM_MISMATCH")
 
+    def test_repair_rejects_wrong_order_even_same_sum(self):
+        fares = [6500, 11200, 9200, 7100, 6000, 6900, 7200, 5600, 5000, 5700]
+        fares[0], fares[1] = fares[1], fares[0]
+        repaired = repair_daily_history_with_fare_probe(GOLDEN_10, fares)
+        self.assertFalse(repaired["repaired"])
+        self.assertEqual(repaired["error_code"], "REPAIR_EXISTING_FARE_MISMATCH")
+
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
         v = validate_daily_history_document(p)
