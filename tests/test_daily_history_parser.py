@@ -1,6 +1,7 @@
 import unittest
 
 from daily_history_parser import (
+    extract_fare_probe_amounts,
     parse_daily_history_text,
     validate_daily_history_document,
 )
@@ -139,6 +140,13 @@ class TestDailyHistoryParser(unittest.TestCase):
         self.assertEqual(p["time_anchor_count"], 1)
         self.assertEqual(len(p["items"]), 1)
         self.assertTrue(validate_daily_history_document(p)["ok"])
+
+    def test_fare_probe_excludes_header_total(self):
+        text = "70,400원\n6,500원\n11,200원\n9,200원"
+        self.assertEqual(
+            extract_fare_probe_amounts(text, displayed_amount=70400),
+            [6500, 11200, 9200],
+        )
 
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
