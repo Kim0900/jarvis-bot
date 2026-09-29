@@ -336,6 +336,25 @@ def repair_daily_history_with_fare_probe(text: str, fare_amounts: list[int]) -> 
         )
         return result
 
+    # 본문 OCR에서 이미 정상 추출된 요금은 보조 OCR 순번과 반드시 일치해야 한다.
+    # 이 교차검증으로 "개수와 합계만 우연히 맞는 순서오류"를 차단한다.
+    existing_fares = {
+        (str(item.get("탑승시각") or ""), str(item.get("하차시각") or "")): int(item.get("요금") or 0)
+        for item in (base.get("items") or [])
+        if item.get("탑승시각") and item.get("하차시각") and item.get("요금") is not None
+    }
+    for idx, time_key in enumerate(order):
+        if time_key in existing_fares and normalized_fares[idx] != existing_fares[time_key]:
+            result.update(
+                error_code="REPAIR_EXISTING_FARE_MISMATCH",
+                message=(
+                    f"{time_key[0]}-{time_key[1]} 기존요금 "
+                    f"{existing_fares[time_key]:,}원과 보조요금 "
+                    f"{normalized_fares[idx]:,}원이 달라 보정을 중단했습니다."
+                ),
+            )
+            return result
+
     items = []
     for idx, time_key in enumerate(order):
         candidates = row_candidates.get(time_key) or []
