@@ -74,6 +74,22 @@ def _address_candidates(segment: str) -> list[str]:
                 out.append(value)
     return out
 
+def extract_fare_probe_amounts(text: str, displayed_amount: int | None = None) -> list[int]:
+    """요금영역 보조 OCR 텍스트에서 'N원' 숫자만 추출한다.
+
+    화면 상단 합계(displayed_amount)가 같이 잡힌 경우 첫 1회만 제외한다.
+    이 함수 결과는 task#164 진단용이며 raw_calls 저장 근거로 사용하지 않는다.
+    """
+    amounts = [int(x.replace(",", "")) for x in _FARE_RE.findall(text or "")]
+    if displayed_amount is not None:
+        try:
+            idx = amounts.index(int(displayed_amount))
+            amounts.pop(idx)
+        except ValueError:
+            pass
+    return amounts
+
+
 def parse_daily_history_text(text: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "format": "daily_history",
