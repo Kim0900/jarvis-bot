@@ -815,12 +815,33 @@ class HealthHandler(BaseHTTPRequestHandler):
                         result["duplicate"] = False
                         send_json(200, result)
                     else:
+                        _err_parts = []
+                        _main_error = result.get("error")
+                        if _main_error:
+                            _err_parts.append(str(_main_error))
+                        _diag_bits = []
+                        for _k, _label in (
+                            ("displayed_count", "displayed"),
+                            ("time_anchor_count", "anchors"),
+                            ("parsed_count", "parsed"),
+                            ("parsed_amount", "parsed_amount"),
+                        ):
+                            if result.get(_k) is not None:
+                                _diag_bits.append(f"{_label}={result.get(_k)}")
+                        if _diag_bits:
+                            _err_parts.append(" ".join(_diag_bits))
+                        _safe_parse_errors = [
+                            str(x) for x in (result.get("parse_errors") or [])[:12]
+                        ]
+                        if _safe_parse_errors:
+                            _err_parts.append("; ".join(_safe_parse_errors))
+                        _last_error = " | ".join(_err_parts)[:1800] or "UNKNOWN_IMAGE_PROCESSING_ERROR"
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
                             "FAILED",
                             fmt=result.get("format"),
                             inserted_count=result.get("saved_count", 0),
-                            last_error=result.get("error") or "; ".join(result.get("parse_errors", [])),
+                            last_error=_last_error,
                         ))
                         send_json(400, result)
                 except Exception as e:
