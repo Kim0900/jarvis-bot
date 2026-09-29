@@ -805,6 +805,23 @@ class HealthHandler(BaseHTTPRequestHandler):
                         return
 
                     result = asyncio.run(process_and_save_call_document(text, source_id=source_id))
+
+                    # task#164: daily_history 부분추출 실패 시 요금열 보조 OCR을
+                    # 진단 목적으로만 1회 수행한다. 이 값으로 DB를 저장하지 않는다.
+                    if (
+                        not result.get("success")
+                        and result.get("format") == "daily_history"
+                        and result.get("error_code") in (
+                            "DAILY_HISTORY_COUNT_MISMATCH",
+                            "DAILY_HISTORY_AMOUNT_MISMATCH",
+                        )
+                    ):
+                        try:
+                            fare_text = asyncio.run(google_vision_fare_ocr(image_bytes))
+                            result.update(_extract_fare_diagnostics(fare_text))
+                        except Exception as fare_err:
+                            result["fare_ocr_error"] = str(fare_err)[:200]
+
                     if result.get("success"):
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
@@ -825,6 +842,8 @@ class HealthHandler(BaseHTTPRequestHandler):
                             ("time_anchor_count", "anchors"),
                             ("parsed_count", "parsed"),
                             ("parsed_amount", "parsed_amount"),
+                            ("fare_ocr_count", "fare_ocr_count"),
+                            ("fare_ocr_sum", "fare_ocr_sum"),
                         ):
                             if result.get(_k) is not None:
                                 _diag_bits.append(f"{_label}={result.get(_k)}")
@@ -3042,6 +3061,39 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
 # 교체(commit 708ac09)가 통째로 Google Vision 버전으로 되돌아갔던
 # 것을 발견·복구. 재발방지: 이번엔 GitHub에서 즉시 전 새로 curl.
 # ──────────────────────────────────────────────
+async def google_vision_fare_ocr(image_bytes: bytes) -> str:
+    """task#164: daily_history 요금열 진단 전용 OCR. 저장 근거로 사용하지 않는다."""
+    service_url = os.getenv("OCR_SERVICE_URL")
+    mcp_key = os.getenv("OCR_MCP_KEY")
+    if not service_url or not mcp_key:
+        raise RuntimeError("OCR_SERVICE_URL/OCR_MCP_KEY 환경변수 없음")
+    b64 = base64.b64encode(image_bytes).decode()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{service_url}/ocr",
+            headers={"X-MCP-Key": mcp_key},
+            json={"image_base64": b64, "lang": "kor+eng", "mode": "fare_strip"},
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"fare OCR서비스 HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    if not data.get("success"):
+        raise RuntimeError(f"fare OCR 실패: {data.get('error')}")
+    return data.get("text", "")
+
+
+def _extract_fare_diagnostics(text: str) -> dict:
+    values = [
+        int(x.replace(",", ""))
+        for x in re.findall(r"(?<!\d)(\d{1,3}(?:,\d{3})+)\s*원", text or "")
+    ]
+    return {
+        "fare_ocr_count": len(values),
+        "fare_ocr_sum": sum(values),
+        "fare_ocr_values": values[:20],
+    }
+
+
 async def google_vision_ocr(image_bytes: bytes) -> str:
     """비LLM OCR — 순수 문자인식만 수행(AI 판단·해석 없음).
     실제로는 자체 Tesseract Docker서비스(jarvis-ocr-tesseract)를
