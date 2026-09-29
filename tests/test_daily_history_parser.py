@@ -148,6 +148,18 @@ class TestDailyHistoryParser(unittest.TestCase):
             [6500, 11200, 9200],
         )
 
+    def test_fare_probe_dedupes_chunk_boundary(self):
+        text = (
+            "---MAGI_OCR_CHUNK_1---\n"
+            "6,500원\n11,200원\n9,200원\n7,100원\n"
+            "---MAGI_OCR_CHUNK_2---\n"
+            "7,100원\n6,000원\n6,900원\n7,200원\n5,600원\n5,000원\n5,700원"
+        )
+        self.assertEqual(
+            extract_fare_probe_amounts(text, displayed_amount=70400),
+            [6500, 11200, 9200, 7100, 6000, 6900, 7200, 5600, 5000, 5700],
+        )
+
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
         v = validate_daily_history_document(p)

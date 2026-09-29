@@ -74,20 +74,45 @@ def _address_candidates(segment: str) -> list[str]:
                 out.append(value)
     return out
 
+def _merge_overlap_sequences(left: list[int], right: list[int], max_overlap: int = 5) -> list[int]:
+    """인접 OCR 조각의 suffix/prefix가 정확히 같은 경우에만 overlap을 제거한다."""
+    max_k = min(max_overlap, len(left), len(right))
+    for k in range(max_k, 0, -1):
+        if left[-k:] == right[:k]:
+            return left + right[k:]
+    return left + right
+
+
 def extract_fare_probe_amounts(text: str, displayed_amount: int | None = None) -> list[int]:
     """요금영역 보조 OCR 텍스트에서 'N원' 숫자만 추출한다.
 
-    화면 상단 합계(displayed_amount)가 같이 잡힌 경우 첫 1회만 제외한다.
+    OCR 서비스가 삽입한 MAGI_OCR_CHUNK marker 단위로 금액을 뽑고,
+    인접 chunk의 동일 suffix/prefix만 overlap 중복으로 제거한다.
+    화면 상단 합계(displayed_amount)는 전체 병합 후 첫 1회만 제외한다.
     이 함수 결과는 task#164 진단용이며 raw_calls 저장 근거로 사용하지 않는다.
     """
-    amounts = [int(x.replace(",", "")) for x in _FARE_RE.findall(text or "")]
+    chunks = [
+        part for part in re.split(r"---MAGI_OCR_CHUNK_\d+---", text or "")
+        if part and part.strip()
+    ]
+    if not chunks:
+        chunks = [text or ""]
+
+    merged: list[int] = []
+    for chunk in chunks:
+        current = [int(x.replace(",", "")) for x in _FARE_RE.findall(chunk)]
+        if not merged:
+            merged = current
+        else:
+            merged = _merge_overlap_sequences(merged, current)
+
     if displayed_amount is not None:
         try:
-            idx = amounts.index(int(displayed_amount))
-            amounts.pop(idx)
+            idx = merged.index(int(displayed_amount))
+            merged.pop(idx)
         except ValueError:
             pass
-    return amounts
+    return merged
 
 
 def parse_daily_history_text(text: str) -> dict[str, Any]:
