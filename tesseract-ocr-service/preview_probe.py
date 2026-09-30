@@ -81,6 +81,8 @@ def _run_once(image_bytes: bytes) -> None:
             "detected_card_count": result.get("detected_card_count"),
             "observed_fare_sum": result.get("observed_fare_sum"),
             "observed_direct_count": result.get("observed_direct_count"),
+            "observed_payment_unknown_count": result.get("observed_payment_unknown_count"),
+            "payment_semantics": result.get("payment_semantics"),
             "actual_total_ocr_calls": result.get("actual_total_ocr_calls"),
             "ocrspace_duration_ms": result.get("ocrspace_duration_ms"),
             "ocr_call_wall_ms": result.get("ocr_call_wall_ms"),
