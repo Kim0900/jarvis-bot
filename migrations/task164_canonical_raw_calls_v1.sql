@@ -7,6 +7,14 @@
 --   B) one/both rows have incomplete timing, same platform + same fare +
 --      same-position time + normalized origin/destination equality.
 -- Cross-boundary time-only matches are WEAK candidates and are NOT auto-collapsed.
+-- Access contract:
+-- - Render currently uses the anon Supabase role.
+-- - This view MUST NOT silently downgrade Drive evidence when the internal RPC
+--   secret is absent, because call_image_ingestions SELECT is secret-gated.
+-- - Therefore the view itself is fail-closed: without the internal secret it
+--   returns zero rows.
+-- - Production consumers must use get_canonical_raw_calls_v1() through the
+--   dedicated internal-secret helper.
 
 create or replace view public.canonical_raw_calls_v1
 with (security_invoker = true)
@@ -53,7 +61,8 @@ with eligible as (
       else 100
     end as canonical_evidence_rank
   from public.raw_calls r
-  where coalesce(r.raw_row_type,'trip') <> 'daily_total'
+  where public.fn_internal_rpc_secret_ok()
+    and coalesce(r.raw_row_type,'trip') <> 'daily_total'
     and coalesce(r.data_source,'') <> 'app_ocr_summary'
 ),
 annotated as (
@@ -186,4 +195,39 @@ select
 from selected;
 
 comment on view public.canonical_raw_calls_v1 is
-'Task164/Task27 shared read-only canonical selector v1. Raw provenance retained. Strong duplicates collapsed by evidence precedence; weak time-only candidates retained and flagged.';
+'Task164/Task27 shared read-only canonical selector v1. Fail-closed without X-MAGI-RPC-Secret. Raw provenance retained. Strong duplicates collapsed by evidence precedence; weak time-only candidates retained and flagged.';
+
+revoke all on public.canonical_raw_calls_v1 from public, anon, authenticated;
+grant select on public.canonical_raw_calls_v1 to anon, service_role;
+
+create or replace function public.get_canonical_raw_calls_v1(
+  p_start_date date default null,
+  p_end_date date default null
+)
+returns setof public.canonical_raw_calls_v1
+language plpgsql
+security invoker
+set search_path = public, pg_temp
+as $
+begin
+  if not public.fn_internal_rpc_secret_ok() then
+    raise exception 'canonical_raw_calls_v1 internal authorization required'
+      using errcode = '42501';
+  end if;
+
+  return query
+  select c.*
+  from public.canonical_raw_calls_v1 c
+  where (p_start_date is null or c."날짜" >= p_start_date)
+    and (p_end_date is null or c."날짜" <= p_end_date)
+  order by c."날짜", c."배차시각" nulls last, c.id;
+end;
+$;
+
+revoke all on function public.get_canonical_raw_calls_v1(date,date)
+  from public, authenticated;
+grant execute on function public.get_canonical_raw_calls_v1(date,date)
+  to anon, service_role;
+
+comment on function public.get_canonical_raw_calls_v1(date,date) is
+'Approved Task164/Task27 canonical read path. SECURITY INVOKER + mandatory internal RPC secret. No-secret calls fail with 42501; the underlying view also returns zero rows without the secret.';
