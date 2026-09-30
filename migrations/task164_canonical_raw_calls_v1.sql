@@ -18,6 +18,9 @@ with eligible as (
       when coalesce(r."콜유형",'') ilike '%카카오%' then 'KAKAO'
       when coalesce(r."콜유형",'') ilike '%우버%' then 'UBER'
       when coalesce(r."콜유형",'') ilike '%배회%' then 'ROAM'
+      when regexp_replace(coalesce(r."콜유형",''),'[[:space:]]+','','g') = ''
+           and r.data_source in ('drive_ocr_layout_v1','drive_ocr_tesseract','app_ocr_individual')
+        then 'KAKAO'
       else 'UNKNOWN'
     end as canonical_platform,
     lower(regexp_replace(coalesce(r."출발지",''),'[[:space:]·.]+','','g')) as _origin_norm,
