@@ -526,3 +526,5 @@ from tests.test_daily_history_primary_adapter import PrimaryPolicyTests
 from tests.test_daily_history_primary_persistence import PersistenceTests
 
 from tests.test_canonical_identity_v1 import CanonicalIdentityV1Tests
+
+from tests.test_canonical_access_v1 import CanonicalAccessV1Tests
