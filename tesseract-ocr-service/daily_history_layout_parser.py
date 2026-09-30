@@ -373,7 +373,10 @@ def build_card_layout(
             "fare": fare,
             "fare_candidates": fares,
             "address_lines": address_lines[:4],
-            "payment": "직접" if direct else "자동",
+            # Only a visible direct-payment label is authoritative evidence.
+            # Absence of the label must not be silently asserted as "자동".
+            "payment": "직접" if direct else "미확인",
+            "payment_evidence": "DIRECT_LABEL" if direct else "NO_DIRECT_LABEL",
             "line_count": len(card_lines),
         }
         card["reocr_reasons"] = _card_reocr_reason(card)
