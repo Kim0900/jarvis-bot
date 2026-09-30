@@ -49,6 +49,19 @@ class CanonicalIdentityV1Tests(unittest.TestCase):
         }
         self.assertEqual(identity_strength(a, b), "STRONG_PARTIAL_ADDRESS")
 
+    def test_blank_known_sources_infer_kakao(self):
+        cases = [
+            {"콜유형": "", "data_source": "app_ocr_individual"},
+            {"콜유형": None, "data_source": "drive_ocr_tesseract"},
+            {"콜유형": "   ", "data_source": "drive_ocr_layout_v1"},
+        ]
+        for row in cases:
+            self.assertEqual(platform_key(row), "KAKAO")
+        self.assertEqual(
+            platform_key({"콜유형": "", "data_source": "argos_reconstructed"}),
+            "UNKNOWN",
+        )
+
     def test_mixed_platform_never_deduplicates(self):
         a = {
             "id": 1, "날짜": "2026-07-15", "콜유형": "카카오T",
