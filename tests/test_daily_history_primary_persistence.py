@@ -90,6 +90,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 "id": 4,
                 "raw_row_type": "trip",
                 "콜유형": "카카오T",
+                "날짜": "2026-09-28",
                 "배차시각": "20:10",
                 "하차시각": None,
                 "요금": 5000,
@@ -109,7 +110,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             validate_call_payload=self.validate,
         )
         self.assertTrue(result["quarantine"])
-        self.assertEqual(result["error_code"], "LAYOUT_KAKAO_OVERLAP_QUARANTINE")
+        self.assertEqual(result["error_code"], "LAYOUT_KAKAO_IDENTITY_AMBIGUOUS")
         self.assertEqual(result["overlap_count"], 1)
 
     async def test_db_failure_rolls_back(self):
