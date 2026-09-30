@@ -208,7 +208,7 @@ returns setof public.canonical_raw_calls_v1
 language plpgsql
 security invoker
 set search_path = public, pg_temp
-as $
+as $canonical$
 begin
   if not public.fn_internal_rpc_secret_ok() then
     raise exception 'canonical_raw_calls_v1 internal authorization required'
@@ -222,7 +222,7 @@ begin
     and (p_end_date is null or c."날짜" <= p_end_date)
   order by c."날짜", c."배차시각" nulls last, c.id;
 end;
-$;
+$canonical$;
 
 revoke all on function public.get_canonical_raw_calls_v1(date,date)
   from public, authenticated;
