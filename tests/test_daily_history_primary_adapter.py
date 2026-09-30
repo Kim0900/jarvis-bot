@@ -5,10 +5,11 @@ from daily_history_primary_adapter import (
     ACTION_FALLBACK_LEGACY,
     ACTION_USE_LAYOUT,
     classify_layout_result,
-    date_has_conflicting_rows,
+    find_kakao_overlap_candidates,
     independent_header_disagreements,
     layout_to_daily_history,
 )
+from task164_primary_patch import _looks_like_daily_history
 
 
 def sample_layout():
@@ -40,11 +41,47 @@ class PrimaryPolicyTests(unittest.TestCase):
         legacy["표시금액"] = 11900
         self.assertEqual(independent_header_disagreements(layout, legacy), ["header_sum"])
 
-    def test_existing_trip_row_quarantines_but_daily_total_does_not(self):
-        self.assertFalse(date_has_conflicting_rows(
-            [{"raw_row_type": "daily_total", "source_id": None}], "src-new"))
-        self.assertTrue(date_has_conflicting_rows(
-            [{"raw_row_type": "trip", "source_id": None}], "src-new"))
+    def test_mixed_platform_same_date_does_not_block_kakao(self):
+        existing = [
+            {"id": 1, "raw_row_type": "trip", "콜유형": "우버",
+             "배차시각": "20:00", "하차시각": "20:10", "요금": 5000},
+            {"id": 2, "raw_row_type": "unclassified", "콜유형": "미분류",
+             "배차시각": "20:20", "요금": 7000},
+            {"id": 3, "raw_row_type": "daily_total", "콜유형": None,
+             "배차시각": "00:00", "요금": 12000},
+        ]
+        payloads = [
+            {"배차시각": "20:00", "하차시각": "20:10", "요금": 5000},
+            {"배차시각": "20:20", "하차시각": "20:30", "요금": 7000},
+        ]
+        self.assertEqual(find_kakao_overlap_candidates(existing, payloads, "src-new"), [])
+
+    def test_kakao_overlap_uses_fare_and_any_start_or_end_time(self):
+        existing = [
+            {"id": 10, "raw_row_type": "trip", "콜유형": "카카오T",
+             "배차시각": "20:10", "하차시각": None, "요금": 5000},
+        ]
+        payloads = [
+            {"배차시각": "20:00", "하차시각": "20:10", "요금": 5000},
+        ]
+        hits = find_kakao_overlap_candidates(existing, payloads, "src-new")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["existing_id"], 10)
+
+    def test_kakao_same_date_without_identity_overlap_does_not_block(self):
+        existing = [
+            {"id": 11, "raw_row_type": "trip", "콜유형": "카카오T",
+             "배차시각": "21:00", "하차시각": "21:10", "요금": 5000},
+        ]
+        payloads = [
+            {"배차시각": "20:00", "하차시각": "20:10", "요금": 5000},
+        ]
+        self.assertEqual(find_kakao_overlap_candidates(existing, payloads, "src-new"), [])
+
+    def test_layout_hint_no_longer_requires_legacy_heading(self):
+        text = "10건 / 70,400원\n19:00 - 19:10\n19:20 - 19:30\n"
+        self.assertTrue(_looks_like_daily_history(text))
+        self.assertFalse(_looks_like_daily_history("배차 19:00\n최종 요금 7,000원"))
 
     def test_positive_direct_only_translation(self):
         parsed = layout_to_daily_history(sample_layout())
