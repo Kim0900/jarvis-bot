@@ -222,6 +222,14 @@ class LayoutParserTests(unittest.TestCase):
             [card["card_index"] for card in r["cards"] if card["payment"] == "직접"],
             [2],
         )
+        self.assertEqual(
+            [card["payment"] for card in r["cards"] if card["card_index"] != 2],
+            ["미확인"] * 9,
+        )
+        self.assertEqual(
+            [card["payment_evidence"] for card in r["cards"] if card["card_index"] != 2],
+            ["NO_DIRECT_LABEL"] * 9,
+        )
         self.assertEqual(r["reocr_card_indices"], [])
         self.assertEqual(r["planned_total_ocr_calls"], 2)
 
@@ -327,6 +335,8 @@ class LayoutParserTests(unittest.TestCase):
         result = verify_layout(r, 3, 15300, None, 2)
         self.assertTrue(result["ok"])
         self.assertEqual(result["observed_direct_count"], 0)
+        self.assertEqual(result["observed_payment_unknown_count"], 3)
+        self.assertEqual(result["payment_semantics"], "POSITIVE_DIRECT_EVIDENCE_ONLY")
         self.assertFalse(result["direct_count_independently_verified"])
 
     def test_ui_guidance_is_not_an_address_and_long_distance_is(self):
@@ -356,8 +366,36 @@ class LayoutParserTests(unittest.TestCase):
         self.assertTrue(result["legacy_validation_ok"])
         self.assertEqual(result["mismatch_count"], 0)
         self.assertEqual(result["mode"], "SAME_BASE_OCR_TEXT_NO_LEGACY_FARE_PROBE")
+        self.assertEqual(
+            result["payment_comparison"],
+            "POSITIVE_DIRECT_EVIDENCE_ONLY",
+        )
         self.assertNotIn("동인동", json.dumps(result, ensure_ascii=False))
         self.assertNotIn("범어동", json.dumps(result, ensure_ascii=False))
+
+    def test_shadow_flags_direct_payment_disagreement_only(self):
+        rows = [
+            line("22:00 - 22:10 실시간", 0.15),
+            line("대구 중구 동인동", 0.17),
+            line("대구 수성구 범어동", 0.19),
+            line("직접 결제", 0.205),
+            line("5,000원", 0.21, x0=0.76, x1=0.96),
+        ]
+        layout = build_card_layout(rows, original_size=(1080, 3000), expected_count=1)
+        legacy_text = (
+            "2026년 9월 28일\n"
+            "실시간 운행 1건 / 5,000원\n"
+            "22:00 - 22:10 실시간\n"
+            "대구 중구 동인동\n"
+            "대구 수성구 범어동\n"
+            "5,000원\n"
+        )
+        result = build_shadow_comparison(layout, legacy_text)
+        self.assertEqual(result["mismatch_count"], 1)
+        self.assertEqual(
+            result["mismatches"][0]["fields"],
+            ["payment_direct_disagreement"],
+        )
 
     def test_runner_latency_probe_counts_noop_provider_calls(self):
         rows = [
