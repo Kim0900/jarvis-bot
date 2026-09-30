@@ -103,6 +103,19 @@ async def _capture_layout(image_bytes):
                 pass
 
 
+def _fail(source_id, error_code, **extra):
+    return {
+        "success": False,
+        "format": "daily_history",
+        "saved_count": 0,
+        "source_id": source_id,
+        "error": error_code,
+        "error_code": error_code,
+        "error_stage": "layout_primary",
+        **extra,
+    }
+
+
 def install(bot):
     if getattr(bot, "_task164_primary_patch_installed", False):
         return
@@ -126,7 +139,55 @@ def install(bot):
             last_error=last_error,
         )
 
+    async def wrapped_process(text, source_id=None):
+        if not _enabled():
+            return await original_process(text, source_id=source_id)
+
+        try:
+            legacy_parsed = bot.detect_and_parse_call_document(text)
+        except Exception:
+            return await original_process(text, source_id=source_id)
+        if legacy_parsed.get("format") != "daily_history":
+            return await original_process(text, source_id=source_id)
+
+        image_bytes = _CURRENT_IMAGE.get()
+        if not image_bytes:
+            bot.logger.warning(
+                "[TASK164_LAYOUT_PRIMARY] original image unavailable; compatibility fallback"
+            )
+            return await original_process(text, source_id=source_id)
+
+        captured = await _capture_layout(image_bytes)
+        action = classify_layout_result(
+            captured.get("status"),
+            captured.get("payload"),
+            transport_error=bool(captured.get("transport_unavailable")),
+        )
+        if action == ACTION_FALLBACK_LEGACY:
+            bot.logger.warning(
+                "[TASK164_LAYOUT_PRIMARY] layout unavailable; compatibility fallback reason=%s",
+                captured.get("error_code"),
+            )
+            return await original_process(text, source_id=source_id)
+
+        layout = captured.get("payload") or {}
+        if action == ACTION_FAIL_CLOSED:
+            return _fail(
+                source_id,
+                layout.get("error_code") or captured.get("error_code") or "LAYOUT_PRIMARY_FAIL_CLOSED",
+            )
+
+        disagreements = independent_header_disagreements(layout, legacy_parsed)
+        if disagreements:
+            return _fail(
+                source_id,
+                "LAYOUT_INDEPENDENT_HEADER_DISAGREEMENT",
+                disagreements=disagreements,
+            )
+
+        return _fail(source_id, "LAYOUT_PRIMARY_NOT_YET_PERSISTED")
+
     bot.google_vision_ocr = wrapped_ocr
+    bot.process_and_save_call_document = wrapped_process
     bot.mark_call_image_ingestion = wrapped_mark
-    bot._task164_original_process = original_process
     bot._task164_primary_patch_installed = True
