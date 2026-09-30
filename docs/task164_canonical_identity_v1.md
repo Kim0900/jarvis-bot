@@ -98,3 +98,23 @@ Weak candidates remain unresolved and must be surfaced, not silently collapsed.
 - regression tests
 - no DB migration applied
 - no PRIMARY activation
+
+
+## Access / RLS contract
+
+Render currently uses the Supabase anon role. The call_image_ingestions ledger is
+SELECT-visible to anon only when X-MAGI-RPC-Secret is valid. Because evidence
+precedence depends on COMPLETED Drive ingestion, canonical selection must never
+silently run without that ledger visibility.
+
+The v1 migration therefore has two fail-closed layers:
+
+1. canonical_raw_calls_v1 includes fn_internal_rpc_secret_ok() in its eligible-row gate,
+   so a direct no-secret view query returns zero rows rather than a lower-rank result.
+2. get_canonical_raw_calls_v1() explicitly raises 42501 without the secret.
+
+Application consumers must use sb_select_canonical(), which always supplies the
+internal RPC secret. Generic sb_select() is not an approved canonical read path.
+
+No-secret behavior is intentionally fail/empty; it must never change the canonical
+winner provenance.
