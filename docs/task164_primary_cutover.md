@@ -23,7 +23,7 @@ Flag:
 - Legacy compatibility fallback is allowed only when the layout service is unavailable, times out, or returns 5xx.
 - Legacy row-level disagreement is not a quarantine reason by itself.
 - Independent date/header count/header sum disagreement is a quarantine reason.
-- Any pre-existing non-`daily_total` row on the same date from another or unknown source quarantines the new layout batch.
+- Same-date rows from unrelated platforms do not block Kakao ingestion. Quarantine is limited to Kakao duplicate candidates with exact fare plus an overlapping start/end clock value.
 - The validated batch uses one bulk insert. DB write failure or ingestion-ledger COMPLETED failure rolls back rows for that source_id.
 - The pre-cutover 504c4699 path remains the rollback target while the feature flag is OFF.
 
@@ -38,7 +38,7 @@ Existing DB state for that date before layout-primary cutover:
 - total non-summary rows: 11 / 105,500 won
 - separate `daily_total` summary row also exists
 
-The 9 trip timestamps correspond largely to card end-times rather than the screenshot start-times, indicating historical ingestion semantics differ from the new layout contract. The new same-date quarantine policy therefore blocks automatic re-ingestion instead of creating double counting.
+The 9 trip timestamps correspond largely to card end-times rather than the screenshot start-times, indicating historical ingestion semantics differ from the new layout contract. The corrected duplicate policy does not treat the whole calendar date as one population. It ignores unrelated Uber/roaming/unclassified rows and only quarantines same-platform Kakao overlap candidates.
 
 ## Regression requirements
 
@@ -48,9 +48,14 @@ Pre-merge tests cover:
 - parser/gate failure Fail-Closed
 - independent header disagreement
 - source duplicate block
-- same-date conflict quarantine
+- mixed-platform same-date coexistence and Kakao identity-overlap quarantine
 - DB failure rollback
 - COMPLETED-mark failure rollback
 - positive-only direct-payment semantics
 
 No production primary activation is part of this PR.
+
+
+## Legacy classifier dependency
+
+The layout primary path is no longer gated exclusively by `detect_and_parse_call_document()`. A conservative independent hint also invokes layout when OCR text contains either the explicit daily-history heading or at least two time-range anchors together with a count and won-amount header. Other document formats remain on the existing path.
