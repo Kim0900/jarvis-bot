@@ -19,6 +19,9 @@ task93(2026-09-03) 3단계 — MAGI DATA CORE 비LLM OCR 서비스.
 import base64
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -209,6 +212,91 @@ def health():
         "status": "ok", "service": "jarvis-ocr-tesseract",
         "ocrspace_configured": bool(OCR_SPACE_API_KEY)
     })
+
+
+@app.route("/daily_history_layout", methods=["POST"])
+def daily_history_layout():
+    """Read-only layout-aware daily_history analysis.
+
+    This endpoint never writes DB/Drive state. It is intended for production shadow
+    comparison before any primary-parser cutover.
+    """
+    ok, err = _check_auth()
+    if not ok:
+        return jsonify({"success": False, "error": err, "error_code": "AUTH_FAILED"}), 401
+
+    payload = request.get_json(force=True, silent=True) or {}
+    image_b64 = payload.get("image_base64")
+    if not image_b64:
+        return jsonify({
+            "success": False,
+            "error": "image_base64 필드 필요",
+            "error_code": "BAD_REQUEST",
+        }), 400
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return jsonify({
+            "success": False,
+            "error": "image_base64 디코딩 실패",
+            "error_code": "BAD_REQUEST",
+        }), 400
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
+
+        script = os.path.join(os.path.dirname(__file__), "daily_history_overlay_poc.py")
+        process = subprocess.run(
+            [sys.executable, script, "--image", tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        stdout = (process.stdout or "").strip()
+        if not stdout:
+            return jsonify({
+                "success": False,
+                "error_code": "LAYOUT_SHADOW_EMPTY_OUTPUT",
+                "exit_code": process.returncode,
+            }), 422
+
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            return jsonify({
+                "success": False,
+                "error_code": "LAYOUT_SHADOW_INVALID_OUTPUT",
+                "exit_code": process.returncode,
+            }), 422
+
+        result["success"] = bool(result.get("ok"))
+        result["shadow_read_only"] = True
+        result["shadow_version"] = "task164-layout-v1"
+        return jsonify(result), (200 if result.get("ok") else 422)
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "success": False,
+            "error_code": "LAYOUT_SHADOW_TIMEOUT",
+            "shadow_read_only": True,
+        }), 504
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error_code": "LAYOUT_SHADOW_EXCEPTION",
+            "exception_type": type(exc).__name__,
+            "shadow_read_only": True,
+        }), 500
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 @app.route("/ocr", methods=["POST"])
