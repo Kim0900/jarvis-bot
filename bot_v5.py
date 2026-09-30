@@ -29,6 +29,12 @@ try:
 except Exception as exc:
     logger.warning("MAGI scheduler dispatch patch install failed: %s", exc)
 
+try:
+    import task164_primary_patch
+    task164_primary_patch.install(bot_v5_legacy)
+except Exception as exc:
+    logger.warning("Task164 primary patch install failed: %s", exc)
+
 
 if __name__ == "__main__":
     bot_v5_legacy.main()
