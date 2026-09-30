@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import threading
 from contextvars import ContextVar
 
@@ -42,4 +45,27 @@ def _consume_primary_completed(source_id):
 def install(bot):
     if getattr(bot, "_task164_primary_patch_installed", False):
         return
+
+    original_ocr = bot.google_vision_ocr
+    original_process = bot.process_and_save_call_document
+    original_mark = bot.mark_call_image_ingestion
+
+    async def wrapped_ocr(image_bytes):
+        _CURRENT_IMAGE.set(bytes(image_bytes))
+        return await original_ocr(image_bytes)
+
+    async def wrapped_mark(source_id, status, fmt=None, inserted_count=0, last_error=None):
+        if status == "COMPLETED" and _consume_primary_completed(source_id):
+            return {"ok": True, "task164_primary_already_completed": True}
+        return await original_mark(
+            source_id,
+            status,
+            fmt=fmt,
+            inserted_count=inserted_count,
+            last_error=last_error,
+        )
+
+    bot.google_vision_ocr = wrapped_ocr
+    bot.mark_call_image_ingestion = wrapped_mark
+    bot._task164_original_process = original_process
     bot._task164_primary_patch_installed = True
