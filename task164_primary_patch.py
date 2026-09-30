@@ -115,12 +115,12 @@ def _looks_like_daily_history(text):
     if "일별" in text and "운행" in text and "이력" in text:
         return True
     anchors = re.findall(
-        r"(?<!\\d)\\d{1,2}:\\d{2}\\s*[-~–—]\\s*\\d{1,2}:\\d{2}(?!\\d)",
+        r"(?<!\d)\d{1,2}:\d{2}\s*[-~–—]\s*\d{1,2}:\d{2}(?!\d)",
         text,
     )
     headerish = bool(
-        re.search(r"\\d{1,3}\\s*건", text)
-        and re.search(r"[\\d,]{4,}\\s*원", text)
+        re.search(r"\d{1,3}\s*건", text)
+        and re.search(r"[\d,]{4,}\s*원", text)
     )
     return len(anchors) >= 2 and headerish
 
