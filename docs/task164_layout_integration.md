@@ -41,3 +41,28 @@ CASSANDRA가 네 쟁점과 이 실측을 독립 검토한 뒤, 통합 PR에서 �
 - 동일 OCR shadow 비교에서도 `자동 vs 미확인`은 불일치로 보지 않는다. 오직 한쪽만 직접결제를 양성 탐지한 경우 `payment_direct_disagreement`로 기록한다.
 - production cutover 시 `미확인`을 `자동`으로 변환해 저장하지 않는다. 현재 raw_calls에서 자동결제는 명시값으로 저장되지 않으므로, 직접결제 양성 탐지 행만 `비고=직접결제`를 기록하는 방식이 기존 저장 의미론과 일치한다.
 - 이 기준은 직접결제 라벨 누락 가능성을 제거하는 것이 아니라, **누락을 자동결제로 오분류하는 오류를 제거**한다. 직접결제 탐지 재현성은 별도 운영 shadow 지표로 계속 측정한다.
+
+
+## 2026-09-30 운영 검증 단순화
+
+Task #164의 초기 구조 교체 구간에서 수행한 수동 Golden/Preview/CASSANDRA 반복은 상시 운영 절차로 사용하지 않는다.
+
+상시 변경은 GitHub CI가 다음 핵심 계약을 자동검증한다.
+- 날짜 추출 Fail-Closed
+- 카드 수 = 헤더 표시건수
+- 카드 요금 합 = 헤더 표시금액
+- 카드별 시간/주소/요금 필수값
+- 최대 OCR 호출 예산(8회)
+- 직접결제는 양성 라벨만 확정, 라벨 부재는 미확인
+- Golden geometry regression(10건/70,400원/직접1)
+- same-input legacy shadow 계약
+
+CASSANDRA 독립검증은 아래 경우에만 요구한다.
+- parser 구조/경계 탐지 방식 변경
+- DB 저장 의미론 또는 스키마 변경
+- Fail-Closed 규칙 완화/변경
+- production primary cutover 또는 rollback 규칙 변경
+- Golden regression 실패나 운영 장애 발생
+
+단순 로그/진단 출력/테스트 보강/동일 의미론 리팩터링은 CI PASS만으로 처리할 수 있다.
+실 OCR provider 실데이터 smoke는 provider/레이아웃/production cutover 변경 때만 수행한다.
