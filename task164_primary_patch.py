@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,21 @@ async def _capture_layout(image_bytes):
                 pass
 
 
+def _looks_like_daily_history(text):
+    text = str(text or "")
+    if "일별" in text and "운행" in text and "이력" in text:
+        return True
+    anchors = re.findall(
+        r"(?<!\\d)\\d{1,2}:\\d{2}\\s*[-~–—]\\s*\\d{1,2}:\\d{2}(?!\\d)",
+        text,
+    )
+    headerish = bool(
+        re.search(r"\\d{1,3}\\s*건", text)
+        and re.search(r"[\\d,]{4,}\\s*원", text)
+    )
+    return len(anchors) >= 2 and headerish
+
+
 def _fail(source_id, error_code, **extra):
     return {
         "success": False,
@@ -156,8 +172,12 @@ def install(bot):
         try:
             legacy_parsed = bot.detect_and_parse_call_document(text)
         except Exception:
-            return await original_process(text, source_id=source_id)
-        if legacy_parsed.get("format") != "daily_history":
+            legacy_parsed = {"format": "unknown", "items": []}
+
+        if (
+            legacy_parsed.get("format") != "daily_history"
+            and not _looks_like_daily_history(text)
+        ):
             return await original_process(text, source_id=source_id)
 
         image_bytes = getattr(_IMAGE_LOCAL, "value", None)
@@ -226,7 +246,8 @@ def install(bot):
                 source_id,
                 persist.get("error_code") or "LAYOUT_PRIMARY_PERSIST_FAILED",
                 quarantine=bool(persist.get("quarantine")),
-                existing_date_rows=persist.get("existing_date_rows"),
+                overlap_count=persist.get("overlap_count"),
+                overlap_candidates=persist.get("overlap_candidates"),
             )
 
         _mark_primary_completed(source_id)
