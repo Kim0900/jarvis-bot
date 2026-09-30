@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-from contextvars import ContextVar
 
 from daily_history_primary_adapter import (
     ACTION_FAIL_CLOSED,
@@ -20,7 +19,7 @@ from daily_history_primary_adapter import (
     persist_layout_primary,
 )
 
-_CURRENT_IMAGE = ContextVar("task164_current_image", default=None)
+_IMAGE_LOCAL = threading.local()
 _COMPLETED_IN_PRIMARY = set()
 _COMPLETED_LOCK = threading.Lock()
 
@@ -76,6 +75,13 @@ async def _capture_layout(image_bytes):
                 "error_code": "LAYOUT_CAPTURE_EMPTY",
             }
         result = json.loads(lines[-1])
+        if result.get("status") is None:
+            return {
+                "transport_unavailable": True,
+                "status": None,
+                "payload": result.get("payload") or {},
+                "error_code": "LAYOUT_CAPTURE_NO_RESPONSE",
+            }
         return {
             "transport_unavailable": False,
             "status": result.get("status"),
@@ -125,7 +131,7 @@ def install(bot):
     original_mark = bot.mark_call_image_ingestion
 
     async def wrapped_ocr(image_bytes):
-        _CURRENT_IMAGE.set(bytes(image_bytes))
+        _IMAGE_LOCAL.value = bytes(image_bytes)
         return await original_ocr(image_bytes)
 
     async def wrapped_mark(source_id, status, fmt=None, inserted_count=0, last_error=None):
@@ -150,7 +156,7 @@ def install(bot):
         if legacy_parsed.get("format") != "daily_history":
             return await original_process(text, source_id=source_id)
 
-        image_bytes = _CURRENT_IMAGE.get()
+        image_bytes = getattr(_IMAGE_LOCAL, "value", None)
         if not image_bytes:
             bot.logger.warning(
                 "[TASK164_LAYOUT_PRIMARY] original image unavailable; compatibility fallback"
@@ -221,21 +227,24 @@ def install(bot):
 
         _mark_primary_completed(source_id)
         legacy_items = legacy_parsed.get("items") or []
-        bot.logger.info(
-            "[TASK164_LAYOUT_PRIMARY] " +
-            json.dumps({
-                "source_id": source_id,
-                "date": persist.get("date"),
-                "saved_count": persist.get("saved_count"),
-                "displayed_count": persist.get("displayed_count"),
-                "displayed_amount": persist.get("displayed_amount"),
-                "layout_ocr_calls": layout.get("actual_total_ocr_calls"),
-                "layout_wall_ms": layout.get("total_wall_duration_ms"),
-                "legacy_count": len(legacy_items),
-                "legacy_sum": sum(int(x.get("요금") or 0) for x in legacy_items),
-                "fallback_used": False,
-            }, ensure_ascii=False, separators=(",", ":"))
-        )
+        try:
+            bot.logger.info(
+                "[TASK164_LAYOUT_PRIMARY] " +
+                json.dumps({
+                    "source_id": source_id,
+                    "date": persist.get("date"),
+                    "saved_count": persist.get("saved_count"),
+                    "displayed_count": persist.get("displayed_count"),
+                    "displayed_amount": persist.get("displayed_amount"),
+                    "layout_ocr_calls": layout.get("actual_total_ocr_calls"),
+                    "layout_wall_ms": layout.get("total_wall_duration_ms"),
+                    "legacy_count": len(legacy_items),
+                    "legacy_sum": sum(int(x.get("요금") or 0) for x in legacy_items),
+                    "fallback_used": False,
+                }, ensure_ascii=False, separators=(",", ":"))
+            )
+        except Exception:
+            pass
         return {
             "success": True,
             "format": "daily_history",
