@@ -42,6 +42,67 @@ def _consume_primary_completed(source_id):
     return False
 
 
+async def _capture_layout(image_bytes):
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+            handle.write(image_bytes)
+            path = handle.name
+        helper = os.path.join(os.path.dirname(__file__), "task164_layout_capture.py")
+
+        def _run():
+            return subprocess.run(
+                [sys.executable, helper, path],
+                capture_output=True,
+                text=True,
+                timeout=55,
+                check=False,
+            )
+
+        proc = await asyncio.to_thread(_run)
+        if proc.returncode != 0:
+            return {
+                "transport_unavailable": True,
+                "status": None,
+                "payload": {},
+                "error_code": "LAYOUT_CAPTURE_SUBPROCESS_FAILED",
+            }
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        if not lines:
+            return {
+                "transport_unavailable": True,
+                "status": None,
+                "payload": {},
+                "error_code": "LAYOUT_CAPTURE_EMPTY",
+            }
+        result = json.loads(lines[-1])
+        return {
+            "transport_unavailable": False,
+            "status": result.get("status"),
+            "payload": result.get("payload") or {},
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "transport_unavailable": True,
+            "status": None,
+            "payload": {},
+            "error_code": "LAYOUT_CAPTURE_TIMEOUT",
+        }
+    except Exception as exc:
+        return {
+            "transport_unavailable": True,
+            "status": None,
+            "payload": {},
+            "error_code": f"LAYOUT_CAPTURE_{type(exc).__name__}",
+        }
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def install(bot):
     if getattr(bot, "_task164_primary_patch_installed", False):
         return
