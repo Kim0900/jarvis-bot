@@ -51,11 +51,50 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["error_code"], "LAYOUT_PRIMARY_SOURCE_ROWS_ALREADY_EXIST")
 
-    async def test_existing_date_rows_quarantine(self):
+    async def test_same_date_unrelated_platform_does_not_block(self):
         async def select_rows(params):
             if "source_id" in params:
                 return []
-            return [{"id": 2, "raw_row_type": "trip", "source_id": None}]
+            return [
+                {"id": 2, "raw_row_type": "trip", "콜유형": "우버",
+                 "배차시각": "20:00", "하차시각": "20:10", "요금": 5000},
+                {"id": 3, "raw_row_type": "unclassified", "콜유형": "미분류",
+                 "배차시각": "20:00", "요금": 5000},
+            ]
+
+        async def bulk(_):
+            return [{"id": 100}]
+
+        marks = []
+        async def mark(count):
+            marks.append(count)
+            return {"ok": True}
+
+        result = await persist_layout_primary(
+            parsed(), "src",
+            select_rows=select_rows,
+            bulk_insert=bulk,
+            mark_completed=mark,
+            rollback_source_rows=self.rollback,
+            calc_service_date=self.calc,
+            validate_call_payload=self.validate,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(marks, [1])
+
+    async def test_same_platform_identity_overlap_quarantines(self):
+        async def select_rows(params):
+            if "source_id" in params:
+                return []
+            return [{
+                "id": 4,
+                "raw_row_type": "trip",
+                "콜유형": "카카오T",
+                "배차시각": "20:10",
+                "하차시각": None,
+                "요금": 5000,
+                "source_id": None,
+            }]
 
         async def no_write(_):
             raise AssertionError("write must not run")
@@ -70,7 +109,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             validate_call_payload=self.validate,
         )
         self.assertTrue(result["quarantine"])
-        self.assertEqual(result["error_code"], "LAYOUT_DATE_EXISTING_ROWS_QUARANTINE")
+        self.assertEqual(result["error_code"], "LAYOUT_KAKAO_OVERLAP_QUARANTINE")
+        self.assertEqual(result["overlap_count"], 1)
 
     async def test_db_failure_rolls_back(self):
         async def select_rows(params):
