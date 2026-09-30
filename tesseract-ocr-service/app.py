@@ -31,6 +31,11 @@ from PIL import Image
 
 app = Flask(__name__)
 
+# Registered only on an isolated Render PR preview; production route set is unchanged.
+if os.getenv("IS_PULL_REQUEST", "").lower() == "true":
+    from preview_probe import register_preview_probe
+    register_preview_probe(app)
+
 MCP_KEY = os.getenv("OCR_MCP_KEY")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 OCR_SPACE_URL = "https://api.ocr.space/parse/image"
