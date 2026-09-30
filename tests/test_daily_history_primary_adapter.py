@@ -79,6 +79,7 @@ class PrimaryPolicyTests(unittest.TestCase):
         self.assertEqual(find_kakao_overlap_candidates(existing, payloads, "src-new"), [])
 
     def test_layout_hint_no_longer_requires_legacy_heading(self):
+        # OCR heading may be missing; repeated time anchors + header are enough.
         text = "10건 / 70,400원\n19:00 - 19:10\n19:20 - 19:30\n"
         self.assertTrue(_looks_like_daily_history(text))
         self.assertFalse(_looks_like_daily_history("배차 19:00\n최종 요금 7,000원"))
