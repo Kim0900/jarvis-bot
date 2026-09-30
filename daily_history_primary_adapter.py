@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from canonical_identity_v1 import identity_strength, platform_key
+
 LAYOUT_COMPLETE_STATUS = "COMPLETE_LAYOUT_VALIDATED"
 ACTION_USE_LAYOUT = "USE_LAYOUT"
 ACTION_FAIL_CLOSED = "FAIL_CLOSED"
@@ -34,76 +36,26 @@ def _int_or_none(value):
         return None
 
 
-def _norm(value):
-    return "".join(str(value or "").split()).lower()
-
-
-def independent_header_disagreements(layout, legacy):
-    legacy = legacy or {}
-    out = []
-    if legacy.get("날짜") and layout.get("date") and str(legacy.get("날짜")) != str(layout.get("date")):
-        out.append("date")
-    header = layout.get("header") or {}
-    layout_count = _int_or_none(header.get("expected_count"))
-    layout_sum = _int_or_none(header.get("expected_sum"))
-    legacy_count = _int_or_none(legacy.get("표시건수"))
-    legacy_sum = _int_or_none(legacy.get("표시금액"))
-    if legacy_count is not None and layout_count is not None and legacy_count != layout_count:
-        out.append("header_count")
-    if legacy_sum is not None and layout_sum is not None and legacy_sum != layout_sum:
-        out.append("header_sum")
-    return out
-
-
-def is_kakao_existing_row(row):
-    if row.get("raw_row_type") == "daily_total":
-        return False
-    call_type = _norm(row.get("콜유형"))
-    if any(x in call_type for x in ("우버", "배회", "미분류")):
-        return False
-    if "카카오" in call_type:
-        return True
-    return not call_type and row.get("data_source") in _KAKAO_SOURCES
-
-
-def _time_set(row):
-    return {
-        str(value)
-        for value in (row.get("배차시각"), row.get("하차시각"))
-        if value
-    }
-
-
 def find_kakao_overlap_candidates(rows, payloads, source_id):
-    """Return only strong same-platform duplicate candidates.
-
-    Identity rule:
-    - existing row must be Kakao (not Uber/roaming/unclassified)
-    - fare must match exactly
-    - at least one start/end clock value must overlap
-
-    Using both start and end accommodates historical rows where the old
-    app OCR stored the card end-time in the dispatch-time column.
-    """
+    """Shared v1 identity policy: STRONG duplicates and WEAK ambiguity candidates."""
     hits = []
     for row in rows or []:
         if row.get("source_id") == source_id:
             continue
-        if not is_kakao_existing_row(row):
+        if row.get("raw_row_type") == "daily_total":
             continue
-        existing_fare = _int_or_none(row.get("요금"))
-        existing_times = _time_set(row)
-        if existing_fare is None or not existing_times:
+        if platform_key(row) != "KAKAO":
             continue
         for payload in payloads:
-            if existing_fare != _int_or_none(payload.get("요금")):
-                continue
-            if existing_times.intersection(_time_set(payload)):
+            candidate = dict(payload)
+            candidate.setdefault("콜유형", "카카오T")
+            strength = identity_strength(row, candidate)
+            if strength:
                 hits.append({
                     "existing_id": row.get("id"),
                     "existing_source_id": row.get("source_id"),
-                    "fare": existing_fare,
-                    "time_overlap": sorted(existing_times.intersection(_time_set(payload))),
+                    "fare": _int_or_none(row.get("요금")),
+                    "strength": strength,
                 })
                 break
     return hits
@@ -190,13 +142,23 @@ async def persist_layout_primary(
 
     date_rows = await select_rows({"날짜": f"eq.{date_value}", "limit": "500"})
     overlaps = find_kakao_overlap_candidates(date_rows, payloads, source_id)
-    if overlaps:
+    strong = [x for x in overlaps if str(x.get("strength", "")).startswith("STRONG_")]
+    weak = [x for x in overlaps if x.get("strength") == "WEAK_TIME_ONLY"]
+    if strong:
         return {
             "ok": False,
             "quarantine": True,
-            "error_code": "LAYOUT_KAKAO_OVERLAP_QUARANTINE",
-            "overlap_count": len(overlaps),
-            "overlap_candidates": overlaps[:20],
+            "error_code": "LAYOUT_KAKAO_DUPLICATE_QUARANTINE",
+            "overlap_count": len(strong),
+            "overlap_candidates": strong[:20],
+        }
+    if weak:
+        return {
+            "ok": False,
+            "quarantine": True,
+            "error_code": "LAYOUT_KAKAO_IDENTITY_AMBIGUOUS",
+            "overlap_count": len(weak),
+            "overlap_candidates": weak[:20],
         }
 
     try:
