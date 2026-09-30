@@ -518,3 +518,9 @@ class LayoutParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Task164 primary-cutover regression is imported here so the existing
+# path-filtered workflow executes the new policy/persistence tests.
+from tests.test_daily_history_primary_adapter import PrimaryPolicyTests
+from tests.test_daily_history_primary_persistence import PersistenceTests
