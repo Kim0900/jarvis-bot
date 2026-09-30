@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "daily_history_layout_parser.py"
+      - "tesseract-ocr-service/app.py"
+      - "bot_v5_legacy.py"
       - "daily_history_parser.py"
       - "scripts/daily_history_overlay_poc.py"
       - "tesseract-ocr-service/daily_history_layout_parser.py"
