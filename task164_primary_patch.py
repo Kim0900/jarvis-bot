@@ -135,8 +135,12 @@ def install(bot):
         return await original_ocr(image_bytes)
 
     async def wrapped_mark(source_id, status, fmt=None, inserted_count=0, last_error=None):
-        if status == "COMPLETED" and _consume_primary_completed(source_id):
-            return {"ok": True, "task164_primary_already_completed": True}
+        if status in ("COMPLETED", "FAILED") and _consume_primary_completed(source_id):
+            return {
+                "ok": True,
+                "task164_primary_already_completed": True,
+                "ignored_status": status,
+            }
         return await original_mark(
             source_id,
             status,
