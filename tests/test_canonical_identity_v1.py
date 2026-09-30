@@ -8,6 +8,7 @@ from canonical_identity_v1 import (
 )
 
 
+# Policy evidence doc synchronized.
 class CanonicalIdentityV1Tests(unittest.TestCase):
     def test_full_interval_exact_match_is_strong(self):
         a = {
