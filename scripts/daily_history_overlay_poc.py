@@ -128,6 +128,10 @@ def verify_layout(layout: dict, expected_count: int, expected_sum: int,
         layout.update(ok=True, status="COMPLETE_LAYOUT_VALIDATED", error_code=None)
     layout["observed_fare_sum"] = sum(card["fare"] or 0 for card in cards)
     layout["observed_direct_count"] = sum(card["payment"] == "직접" for card in cards)
+    layout["observed_payment_unknown_count"] = sum(
+        card["payment"] == "미확인" for card in cards
+    )
+    layout["payment_semantics"] = "POSITIVE_DIRECT_EVIDENCE_ONLY"
     layout["direct_count_source"] = "CARD_LABELS"
     layout["direct_count_independently_verified"] = expected_direct_count is not None
     return layout
@@ -172,8 +176,12 @@ def build_shadow_comparison(layout: dict, legacy_text: str) -> dict:
                     fields.append("destination")
             if int(old.get("요금") or 0) != int(new.get("fare") or 0):
                 fields.append("fare")
-            if str(old.get("결제방식") or "자동") != str(new.get("payment") or "자동"):
-                fields.append("payment")
+            # Payment is not treated as an auto-vs-direct symmetric field.
+            # Only positive direct-payment evidence is comparable; absence is unknown.
+            old_direct = str(old.get("결제방식") or "") == "직접"
+            new_direct = str(new.get("payment") or "") == "직접"
+            if old_direct != new_direct:
+                fields.append("payment_direct_disagreement")
         if fields:
             mismatches.append({"start_time": start, "fields": fields})
 
@@ -183,6 +191,7 @@ def build_shadow_comparison(layout: dict, legacy_text: str) -> dict:
         "layout_item_count": len(layout_map),
         "legacy_validation_ok": bool(legacy_validation.get("ok")),
         "legacy_parse_error_count": len(legacy.get("parse_errors") or []),
+        "payment_comparison": "POSITIVE_DIRECT_EVIDENCE_ONLY",
         "mismatch_count": len(mismatches),
         "mismatches": mismatches,
     }
