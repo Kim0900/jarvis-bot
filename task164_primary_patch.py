@@ -185,7 +185,68 @@ def install(bot):
                 disagreements=disagreements,
             )
 
-        return _fail(source_id, "LAYOUT_PRIMARY_NOT_YET_PERSISTED")
+        parsed = layout_to_daily_history(layout)
+
+        async def select_rows(params):
+            return await bot.sb_select("raw_calls", params)
+
+        async def bulk_insert(payloads):
+            return await bot.sb_h("POST", "raw_calls", json=payloads)
+
+        async def mark_completed(saved_count):
+            return await original_mark(
+                source_id,
+                "COMPLETED",
+                fmt="daily_history",
+                inserted_count=saved_count,
+            )
+
+        persist = await persist_layout_primary(
+            parsed,
+            source_id,
+            select_rows=select_rows,
+            bulk_insert=bulk_insert,
+            mark_completed=mark_completed,
+            rollback_source_rows=bot.delete_partial_source_calls,
+            calc_service_date=bot.calc_service_date,
+            validate_call_payload=bot.validate_call_payload,
+        )
+        if not persist.get("ok"):
+            return _fail(
+                source_id,
+                persist.get("error_code") or "LAYOUT_PRIMARY_PERSIST_FAILED",
+                quarantine=bool(persist.get("quarantine")),
+                existing_date_rows=persist.get("existing_date_rows"),
+            )
+
+        _mark_primary_completed(source_id)
+        legacy_items = legacy_parsed.get("items") or []
+        bot.logger.info(
+            "[TASK164_LAYOUT_PRIMARY] " +
+            json.dumps({
+                "source_id": source_id,
+                "date": persist.get("date"),
+                "saved_count": persist.get("saved_count"),
+                "displayed_count": persist.get("displayed_count"),
+                "displayed_amount": persist.get("displayed_amount"),
+                "layout_ocr_calls": layout.get("actual_total_ocr_calls"),
+                "layout_wall_ms": layout.get("total_wall_duration_ms"),
+                "legacy_count": len(legacy_items),
+                "legacy_sum": sum(int(x.get("요금") or 0) for x in legacy_items),
+                "fallback_used": False,
+            }, ensure_ascii=False, separators=(",", ":"))
+        )
+        return {
+            "success": True,
+            "format": "daily_history",
+            "saved_count": persist.get("saved_count"),
+            "source_id": source_id,
+            "layout_primary": True,
+            "displayed_count": persist.get("displayed_count"),
+            "displayed_amount": persist.get("displayed_amount"),
+            "layout_ocr_calls": layout.get("actual_total_ocr_calls"),
+            "layout_wall_ms": layout.get("total_wall_duration_ms"),
+        }
 
     bot.google_vision_ocr = wrapped_ocr
     bot.process_and_save_call_document = wrapped_process
