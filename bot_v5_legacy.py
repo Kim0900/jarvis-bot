@@ -1315,6 +1315,28 @@ async def sb_select(table: str, params: dict = None) -> list:
     result = await sb_h("GET", table, params=params or {})
     return result if isinstance(result, list) else []
 
+
+async def sb_select_canonical(start_date: str = None, end_date: str = None) -> list:
+    """Approved Task#164/Task#27 canonical read path.
+
+    Never use generic sb_select() for canonical_raw_calls_v1. The canonical
+    precedence depends on the secret-gated call_image_ingestions ledger, so this
+    helper always sends X-MAGI-RPC-Secret and calls the fail-closed RPC.
+    """
+    from canonical_access_v1 import build_canonical_headers, canonical_rpc_payload
+
+    headers = build_canonical_headers(HEADERS_SB, SUPABASE_INTERNAL_RPC_SECRET)
+    result = await sb_h(
+        "POST",
+        "rpc/get_canonical_raw_calls_v1",
+        headers=headers,
+        json=canonical_rpc_payload(start_date, end_date),
+    )
+    if result is None:
+        raise RuntimeError("canonical_raw_calls_v1 query failed")
+    return result if isinstance(result, list) else []
+
+
 # 캐스퍼 명령서#024 (2026-08-05): 영수증 OCR 요약행(비고 "OCR 추출: 매출...")이 개별 콜과
 # 같은 테이블/컬럼에 섞여있어서, raw_calls를 그대로 sum/count하는 모든 곳에서 매출·건수가
 # 이중집계되던 근본원인. index.html 쪽은 이미 excludeSummaryRows()로 수정 완료.
