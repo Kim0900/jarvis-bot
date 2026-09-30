@@ -7,6 +7,12 @@ ACTION_USE_LAYOUT = "USE_LAYOUT"
 ACTION_FAIL_CLOSED = "FAIL_CLOSED"
 ACTION_FALLBACK_LEGACY = "FALLBACK_LEGACY"
 
+_KAKAO_SOURCES = {
+    "app_ocr_individual",
+    "drive_ocr_tesseract",
+    "drive_ocr_layout_v1",
+}
+
 
 def classify_layout_result(http_status, payload, transport_error=False):
     if transport_error:
@@ -28,6 +34,10 @@ def _int_or_none(value):
         return None
 
 
+def _norm(value):
+    return "".join(str(value or "").split()).lower()
+
+
 def independent_header_disagreements(layout, legacy):
     legacy = legacy or {}
     out = []
@@ -45,14 +55,58 @@ def independent_header_disagreements(layout, legacy):
     return out
 
 
-def date_has_conflicting_rows(rows, source_id):
+def is_kakao_existing_row(row):
+    if row.get("raw_row_type") == "daily_total":
+        return False
+    call_type = _norm(row.get("콜유형"))
+    if any(x in call_type for x in ("우버", "배회", "미분류")):
+        return False
+    if "카카오" in call_type:
+        return True
+    return not call_type and row.get("data_source") in _KAKAO_SOURCES
+
+
+def _time_set(row):
+    return {
+        str(value)
+        for value in (row.get("배차시각"), row.get("하차시각"))
+        if value
+    }
+
+
+def find_kakao_overlap_candidates(rows, payloads, source_id):
+    """Return only strong same-platform duplicate candidates.
+
+    Identity rule:
+    - existing row must be Kakao (not Uber/roaming/unclassified)
+    - fare must match exactly
+    - at least one start/end clock value must overlap
+
+    Using both start and end accommodates historical rows where the old
+    app OCR stored the card end-time in the dispatch-time column.
+    """
+    hits = []
     for row in rows or []:
-        if row.get("raw_row_type") == "daily_total":
-            continue
         if row.get("source_id") == source_id:
             continue
-        return True
-    return False
+        if not is_kakao_existing_row(row):
+            continue
+        existing_fare = _int_or_none(row.get("요금"))
+        existing_times = _time_set(row)
+        if existing_fare is None or not existing_times:
+            continue
+        for payload in payloads:
+            if existing_fare != _int_or_none(payload.get("요금")):
+                continue
+            if existing_times.intersection(_time_set(payload)):
+                hits.append({
+                    "existing_id": row.get("id"),
+                    "existing_source_id": row.get("source_id"),
+                    "fare": existing_fare,
+                    "time_overlap": sorted(existing_times.intersection(_time_set(payload))),
+                })
+                break
+    return hits
 
 
 def layout_to_daily_history(layout):
@@ -101,15 +155,6 @@ async def persist_layout_primary(
     if existing_source:
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_SOURCE_ROWS_ALREADY_EXIST"}
 
-    date_rows = await select_rows({"날짜": f"eq.{date_value}", "limit": "500"})
-    if date_has_conflicting_rows(date_rows, source_id):
-        return {
-            "ok": False,
-            "quarantine": True,
-            "error_code": "LAYOUT_DATE_EXISTING_ROWS_QUARANTINE",
-            "existing_date_rows": len(date_rows or []),
-        }
-
     payloads = []
     for item in parsed.get("items") or []:
         payload = {
@@ -142,6 +187,17 @@ async def persist_layout_primary(
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_COUNT_MISMATCH"}
     if sum(int(p.get("요금") or 0) for p in payloads) != expected_sum:
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_SUM_MISMATCH"}
+
+    date_rows = await select_rows({"날짜": f"eq.{date_value}", "limit": "500"})
+    overlaps = find_kakao_overlap_candidates(date_rows, payloads, source_id)
+    if overlaps:
+        return {
+            "ok": False,
+            "quarantine": True,
+            "error_code": "LAYOUT_KAKAO_OVERLAP_QUARANTINE",
+            "overlap_count": len(overlaps),
+            "overlap_candidates": overlaps[:20],
+        }
 
     try:
         inserted = await bulk_insert(payloads)
