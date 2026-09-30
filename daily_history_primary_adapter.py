@@ -36,6 +36,23 @@ def _int_or_none(value):
         return None
 
 
+def independent_header_disagreements(layout, legacy):
+    legacy = legacy or {}
+    out = []
+    if legacy.get("날짜") and layout.get("date") and str(legacy.get("날짜")) != str(layout.get("date")):
+        out.append("date")
+    header = layout.get("header") or {}
+    layout_count = _int_or_none(header.get("expected_count"))
+    layout_sum = _int_or_none(header.get("expected_sum"))
+    legacy_count = _int_or_none(legacy.get("표시건수"))
+    legacy_sum = _int_or_none(legacy.get("표시금액"))
+    if legacy_count is not None and layout_count is not None and legacy_count != layout_count:
+        out.append("header_count")
+    if legacy_sum is not None and layout_sum is not None and legacy_sum != layout_sum:
+        out.append("header_sum")
+    return out
+
+
 def find_kakao_overlap_candidates(rows, payloads, source_id):
     """Shared v1 identity policy: STRONG duplicates and WEAK ambiguity candidates."""
     hits = []
