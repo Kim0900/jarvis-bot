@@ -804,7 +804,25 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "OCR결과 비어있음", "source_id": source_id})
                         return
 
+                    _shadow_parsed = None
+                    try:
+                        _shadow_candidate = detect_and_parse_call_document(text)
+                        if _shadow_candidate.get("format") == "daily_history":
+                            _shadow_parsed = _shadow_candidate
+                    except Exception as _shadow_parse_err:
+                        logger.warning(
+                            "[TASK164_LAYOUT_SHADOW] legacy summary parse failed: %s",
+                            type(_shadow_parse_err).__name__,
+                        )
+
                     result = asyncio.run(process_and_save_call_document(text, source_id=source_id))
+                    if _shadow_parsed is not None:
+                        _schedule_daily_history_layout_shadow(
+                            image_bytes=image_bytes,
+                            source_id=source_id,
+                            legacy_parsed=_shadow_parsed,
+                        )
+
                     if result.get("success"):
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
@@ -3168,6 +3186,103 @@ async def google_vision_ocr(image_bytes: bytes) -> str:
     if not data.get("success"):
         raise RuntimeError(f"Tesseract OCR 실패: {data.get('error')}")
     return data.get("text", "")
+
+
+async def _run_daily_history_layout_shadow(
+    image_bytes: bytes,
+    source_id: str,
+    legacy_parsed: dict,
+) -> None:
+    """task#164 read-only production shadow. Never writes DB or changes ingestion result."""
+    service_url = os.getenv("OCR_SERVICE_URL")
+    mcp_key = os.getenv("OCR_MCP_KEY")
+    if not service_url or not mcp_key:
+        logger.warning("[TASK164_LAYOUT_SHADOW] skipped missing OCR service config")
+        return
+
+    try:
+        b64 = base64.b64encode(image_bytes).decode()
+        async with httpx.AsyncClient(timeout=50.0) as client:
+            resp = await client.post(
+                f"{service_url}/daily_history_layout",
+                headers={"X-MCP-Key": mcp_key},
+                json={"image_base64": b64},
+            )
+        try:
+            layout = resp.json()
+        except Exception:
+            layout = {"success": False, "error_code": "NON_JSON_RESPONSE"}
+
+        legacy_items = legacy_parsed.get("items") or []
+        legacy_count = len(legacy_items)
+        legacy_sum = sum(int(item.get("요금") or 0) for item in legacy_items)
+        summary = {
+            "source_id": source_id,
+            "http_status": resp.status_code,
+            "layout_ok": bool(layout.get("ok")),
+            "layout_status": layout.get("status"),
+            "layout_error_code": layout.get("error_code"),
+            "layout_date": layout.get("date"),
+            "layout_count": layout.get("detected_card_count"),
+            "layout_sum": layout.get("observed_fare_sum"),
+            "layout_direct_positive": layout.get("observed_direct_count"),
+            "layout_payment_unknown": layout.get("observed_payment_unknown_count"),
+            "layout_ocr_calls": layout.get("actual_total_ocr_calls"),
+            "layout_wall_ms": layout.get("total_wall_duration_ms"),
+            "legacy_count": legacy_count,
+            "legacy_sum": legacy_sum,
+            "legacy_displayed_count": legacy_parsed.get("표시건수"),
+            "legacy_displayed_sum": legacy_parsed.get("표시금액"),
+            "count_agree": (
+                layout.get("detected_card_count") == legacy_count
+                if layout.get("detected_card_count") is not None else None
+            ),
+            "sum_agree": (
+                layout.get("observed_fare_sum") == legacy_sum
+                if layout.get("observed_fare_sum") is not None else None
+            ),
+        }
+        logger.info(
+            "[TASK164_LAYOUT_SHADOW] " +
+            json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        )
+    except Exception as exc:
+        logger.warning(
+            "[TASK164_LAYOUT_SHADOW] " +
+            json.dumps({
+                "source_id": source_id,
+                "layout_ok": False,
+                "error_code": "SHADOW_CALL_EXCEPTION",
+                "exception_type": type(exc).__name__,
+            }, ensure_ascii=False, separators=(",", ":"))
+        )
+
+
+def _schedule_daily_history_layout_shadow(
+    image_bytes: bytes,
+    source_id: str,
+    legacy_parsed: dict,
+) -> None:
+    if os.getenv("DAILY_HISTORY_LAYOUT_SHADOW_ENABLED", "").lower() != "true":
+        return
+
+    def _worker():
+        try:
+            asyncio.run(_run_daily_history_layout_shadow(
+                image_bytes=image_bytes,
+                source_id=source_id,
+                legacy_parsed=legacy_parsed,
+            ))
+        except Exception as exc:
+            logger.warning(
+                "[TASK164_LAYOUT_SHADOW] worker failed: %s", type(exc).__name__
+            )
+
+    threading.Thread(
+        target=_worker,
+        name=f"task164-shadow-{source_id[:12]}",
+        daemon=True,
+    ).start()
 
 
 def parse_kakao_trip_detail(text: str) -> dict:
