@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "daily_history_layout_parser.py"
+      - "tests/test_daily_operation_report_v1.py"
+      - "daily_operation_report_v1.py"
       - "tests/test_canonical_identity_v1.py"
       - "tests/test_canonical_access_v1.py"
       - "migrations/task164_canonical_raw_calls_v1.sql"
@@ -51,6 +53,6 @@ jobs:
         run: python -m pip install --disable-pip-version-check pillow
       - name: Syntax check
         run: |
-          python -m py_compile             canonical_runtime_audit.py             canonical_access_v1.py             canonical_identity_v1.py             daily_history_primary_adapter.py             image_retry_policy.py             bot_v5_legacy.py             daily_history_layout_parser.py             daily_history_parser.py             scripts/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_layout_parser.py             tesseract-ocr-service/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_parser.py
+          python -m py_compile             daily_operation_report_v1.py             canonical_runtime_audit.py             canonical_access_v1.py             canonical_identity_v1.py             daily_history_primary_adapter.py             image_retry_policy.py             bot_v5_legacy.py             daily_history_layout_parser.py             daily_history_parser.py             scripts/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_layout_parser.py             tesseract-ocr-service/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_parser.py
       - name: Task164 deterministic regression
         run: python -m unittest tests.test_daily_history_layout_parser -v
