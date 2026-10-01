@@ -524,3 +524,5 @@ if __name__ == "__main__":
 # path-filtered workflow executes the new policy/persistence tests.
 from tests.test_daily_history_primary_adapter import PrimaryPolicyTests
 from tests.test_daily_history_primary_persistence import PersistenceTests
+
+from tests.test_image_retry_policy import ImageRetryPolicyTests
