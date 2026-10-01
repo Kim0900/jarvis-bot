@@ -15,6 +15,12 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
+from image_retry_policy import (
+    classify_result_failure,
+    is_terminal_last_error,
+    mark_retryable,
+    mark_terminal,
+)
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -768,6 +774,25 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_id 필요"})
                         return
 
+                    force_retry = bool(payload.get("force_retry"))
+                    if not force_retry:
+                        prior_state = asyncio.run(get_call_image_ingestion_state(source_id))
+                        if (
+                            prior_state
+                            and prior_state.get("status") == "FAILED"
+                            and is_terminal_last_error(prior_state.get("last_error"))
+                        ):
+                            send_json(422, {
+                                "success": False,
+                                "terminal": True,
+                                "retryable": False,
+                                "error": "TERMINAL_IMAGE_FAILURE",
+                                "source_id": source_id,
+                                "format": prior_state.get("format"),
+                                "saved_count": prior_state.get("inserted_count", 0),
+                            })
+                            return
+
                     claim = asyncio.run(acquire_call_image_ingestion(source_id))
                     if not claim or not claim.get("ok"):
                         send_json(400, {"success": False, "error": "INGESTION_CLAIM_FAILED", "source_id": source_id})
@@ -799,7 +824,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                     text = asyncio.run(google_vision_ocr(image_bytes))
                     if not text:
                         asyncio.run(mark_call_image_ingestion(
-                            source_id, "FAILED", last_error="OCR결과 비어있음"
+                            source_id, "FAILED", last_error=mark_retryable("OCR_EMPTY")
                         ))
                         send_json(400, {"success": False, "error": "OCR결과 비어있음", "source_id": source_id})
                         return
@@ -937,7 +962,18 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 "fare_probe_amounts=" +
                                 ",".join(str(x) for x in result.get("fare_probe_amounts", [])[:20])
                             )
-                        _last_error = " | ".join(_err_parts)[:1800] or "UNKNOWN_IMAGE_PROCESSING_ERROR"
+                        _last_error = " | ".join(_err_parts)[:1700] or "UNKNOWN_IMAGE_PROCESSING_ERROR"
+                        _failure_kind = classify_result_failure(result)
+                        if _failure_kind == "terminal":
+                            _last_error = mark_terminal(_last_error)
+                            result["terminal"] = True
+                            result["retryable"] = False
+                            _http_status = 422
+                        else:
+                            _last_error = mark_retryable(_last_error)
+                            result["terminal"] = False
+                            result["retryable"] = True
+                            _http_status = 503
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
                             "FAILED",
@@ -945,12 +981,16 @@ class HealthHandler(BaseHTTPRequestHandler):
                             inserted_count=result.get("saved_count", 0),
                             last_error=_last_error,
                         ))
-                        send_json(400, result)
+                        send_json(_http_status, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/process_call_image 오류: {e}")
                     if source_id:
                         try:
-                            asyncio.run(mark_call_image_ingestion(source_id, "FAILED", last_error=str(e)))
+                            asyncio.run(mark_call_image_ingestion(
+                                source_id,
+                                "FAILED",
+                                last_error=mark_retryable(f"{type(e).__name__}:{str(e)[:1500]}"),
+                            ))
                         except Exception as mark_err:
                             logger.error(f"ingestion FAILED 상태기록 실패(source_id={source_id}): {mark_err}")
                     send_json(400, {"success": False, "error": str(e), "source_id": source_id})
@@ -1543,6 +1583,23 @@ async def gpx_ingest_text_run(
         "inserted_id": inserted_id,
         "session": parsed,
     }
+
+
+async def get_call_image_ingestion_state(source_id: str) -> dict | None:
+    """Read current source ledger through the internal-secret RLS path."""
+    rows = await sb_h(
+        "GET",
+        "call_image_ingestions",
+        params={
+            "source_type": "eq.google_drive",
+            "source_id": f"eq.{source_id}",
+            "limit": "1",
+        },
+        headers=_internal_rpc_headers(),
+    )
+    if not rows:
+        return None
+    return rows[0] if isinstance(rows, list) else None
 
 
 async def acquire_call_image_ingestion(source_id: str) -> dict:
