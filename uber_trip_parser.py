@@ -45,23 +45,30 @@ def looks_like_uber_trip_detail(text: str) -> bool:
     text = str(text or "")
     if "운행 세부사항" not in text:
         return False
-    if "순수익" in text:
-        return True
 
-    # Compact/new UI signature. We intentionally require several independent
-    # anchors so a generic detail page is not misclassified as Uber revenue.
+    # Both legacy and compact UIs need independent trip anchors. "순수익" is
+    # never sufficient by itself because generic/malformed pages can contain
+    # the same label pair.
     has_datetime = bool(_DATE_TIME_RE.search(text))
     has_duration = bool(_DURATION_RE.search(text))
     has_distance = bool(_DISTANCE_RE.search(text))
     has_two_addresses = len(_ADDRESS_RE.findall(text)) >= 2
     has_currency = bool(_amounts(text))
-    return sum([
+    independent_anchor_count = sum([
         has_datetime,
         has_duration,
         has_distance,
         has_two_addresses,
         has_currency,
-    ]) >= 4
+    ])
+
+    if "순수익" in text:
+        # Legacy keeps its semantic label, but still needs at least three
+        # independent trip anchors before it can be classified as Uber detail.
+        return independent_anchor_count >= 3
+
+    # Compact/new UI has no "순수익", so require a stronger 4/5 signature.
+    return independent_anchor_count >= 4
 
 
 def _parse_datetime(text: str, result: dict) -> None:
@@ -193,16 +200,16 @@ def parse_uber_trip_detail_text(text: str) -> dict:
 
 
 def validate_uber_trip_detail(parsed: dict) -> dict:
-    """Strict save gate for the compact/new UI only."""
-    if parsed.get("ui_variant") != "compact_detail_v2":
-        return {"ok": True}
+    """Strict pre-save gate for both compact and legacy Uber detail UIs."""
+    variant = parsed.get("ui_variant")
 
-    if any(str(e).startswith("상단요금 다중후보") for e in parsed.get("parse_errors", [])):
-        return {
-            "ok": False,
-            "error_code": "UBER_COMPACT_FARE_AMBIGUOUS",
-            "message": "상단 요금이 유일하지 않음",
-        }
+    if variant == "compact_detail_v2":
+        if any(str(e).startswith("상단요금 다중후보") for e in parsed.get("parse_errors", [])):
+            return {
+                "ok": False,
+                "error_code": "UBER_COMPACT_FARE_AMBIGUOUS",
+                "message": "상단 요금이 유일하지 않음",
+            }
 
     required = {
         "날짜": parsed.get("날짜"),
@@ -215,6 +222,12 @@ def validate_uber_trip_detail(parsed: dict) -> dict:
     }
     missing = [k for k, v in required.items() if v in (None, "")]
     if missing:
+        if variant == "legacy_detail":
+            return {
+                "ok": False,
+                "error_code": "UBER_LEGACY_REQUIRED_FIELD_MISSING",
+                "message": "legacy 필수필드 누락:" + ",".join(missing),
+            }
         return {
             "ok": False,
             "error_code": "UBER_COMPACT_REQUIRED_FIELD_MISSING",
