@@ -1376,6 +1376,45 @@ async def sb_select_canonical(start_date: str = None, end_date: str = None) -> l
         raise RuntimeError("canonical_raw_calls_v1 query failed")
     return result if isinstance(result, list) else []
 
+async def run_canonical_runtime_audit_once() -> dict:
+    """Opt-in Task#164 diagnostic using the real anon+internal-secret path."""
+    from canonical_runtime_audit import evaluate_canonical_runtime_rows
+
+    rows = await sb_select_canonical("2026-07-13", "2026-07-15")
+    audit = evaluate_canonical_runtime_rows(rows)
+    result_text = json.dumps(audit, ensure_ascii=False, separators=(",", ":"))[:1800]
+    await sb_upsert("scheduler_status", {
+        "job_name": "canonical_runtime_audit",
+        "last_run_at": datetime.now(KST).isoformat(),
+        "last_result": result_text,
+    }, on_conflict="job_name")
+    await sb_insert("magi_task_events", {
+        "task_id": 164,
+        "event_type": "CANONICAL_RUNTIME_AUDIT_PASS" if audit.get("pass") else "CANONICAL_RUNTIME_AUDIT_FAIL",
+        "actor": "TAEO_RUNTIME_AUDIT",
+        "detail": result_text,
+        "domain": "taxi",
+    })
+    return audit
+
+
+def _run_canonical_runtime_audit_thread():
+    try:
+        time.sleep(8)
+        result = asyncio.run(run_canonical_runtime_audit_once())
+        logger.info("Task164 canonical runtime audit: %s", result)
+    except Exception as exc:
+        logger.error("Task164 canonical runtime audit failed: %s", exc)
+        try:
+            asyncio.run(sb_upsert("scheduler_status", {
+                "job_name": "canonical_runtime_audit",
+                "last_run_at": datetime.now(KST).isoformat(),
+                "last_result": f"FAIL:{type(exc).__name__}:{str(exc)[:700]}",
+            }, on_conflict="job_name"))
+        except Exception:
+            pass
+
+
 # 캐스퍼 명령서#024 (2026-08-05): 영수증 OCR 요약행(비고 "OCR 추출: 매출...")이 개별 콜과
 # 같은 테이블/컬럼에 섞여있어서, raw_calls를 그대로 sum/count하는 모든 곳에서 매출·건수가
 # 이중집계되던 근본원인. index.html 쪽은 이미 excludeSummaryRows()로 수정 완료.
@@ -8588,6 +8627,13 @@ def main():
 
     # Health server
     threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Task#164 explicit operational diagnostic. Default OFF; when enabled it
+    # performs one read-only canonical regression through the real
+    # anon+X-MAGI-RPC-Secret application path and records the result.
+    if str(os.getenv("TASK164_CANONICAL_RUNTIME_AUDIT_ON_START", "false")).lower() in ("1", "true", "yes"):
+        threading.Thread(target=_run_canonical_runtime_audit_thread, daemon=True).start()
+        logger.info("Task164 canonical runtime audit scheduled")
 
     # Insurance scheduler
     threading.Thread(target=insurance_scheduler, daemon=True).start()
