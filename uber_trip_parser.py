@@ -197,6 +197,13 @@ def validate_uber_trip_detail(parsed: dict) -> dict:
     if parsed.get("ui_variant") != "compact_detail_v2":
         return {"ok": True}
 
+    if any(str(e).startswith("상단요금 다중후보") for e in parsed.get("parse_errors", [])):
+        return {
+            "ok": False,
+            "error_code": "UBER_COMPACT_FARE_AMBIGUOUS",
+            "message": "상단 요금이 유일하지 않음",
+        }
+
     required = {
         "날짜": parsed.get("날짜"),
         "배차시각": parsed.get("배차시각"),
@@ -212,13 +219,6 @@ def validate_uber_trip_detail(parsed: dict) -> dict:
             "ok": False,
             "error_code": "UBER_COMPACT_REQUIRED_FIELD_MISSING",
             "message": "필수필드 누락:" + ",".join(missing),
-        }
-
-    if any(str(e).startswith("상단요금 다중후보") for e in parsed.get("parse_errors", [])):
-        return {
-            "ok": False,
-            "error_code": "UBER_COMPACT_FARE_AMBIGUOUS",
-            "message": "상단 요금이 유일하지 않음",
         }
 
     return {"ok": True}
