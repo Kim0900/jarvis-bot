@@ -532,3 +532,5 @@ from tests.test_canonical_identity_v1 import CanonicalIdentityV1Tests
 from tests.test_canonical_access_v1 import CanonicalAccessV1Tests
 
 from tests.test_canonical_runtime_audit import CanonicalRuntimeAuditTests
+
+from tests.test_daily_operation_report_v1 import DailyOperationReportV1Tests

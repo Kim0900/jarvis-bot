@@ -384,6 +384,19 @@ class HealthHandler(BaseHTTPRequestHandler):
                 send_json(401, {"success": False, "error": "MCP 인증 실패 (X-MCP-Key 헤더 확인)"})
                 return
 
+            if self.path == '/mcp/daily_operation_report':
+                try:
+                    report_date = str(payload.get("date") or "").strip()
+                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", report_date):
+                        send_json(400, {"success": False, "error": "date YYYY-MM-DD required"})
+                        return
+                    report = asyncio.run(get_daily_operation_report_v1(report_date))
+                    send_json(200, {"success": True, "report": report})
+                except Exception as e:
+                    logger.error(f"MCP daily_operation_report 오류: {e}")
+                    send_json(400, {"success": False, "error": str(e)})
+                return
+
             if self.path == '/mcp/recent_events':
                 try:
                     n = int(payload.get("limit", 5))
@@ -1376,13 +1389,64 @@ async def sb_select_canonical(start_date: str = None, end_date: str = None) -> l
         raise RuntimeError("canonical_raw_calls_v1 query failed")
     return result if isinstance(result, list) else []
 
+async def get_daily_operation_report_v1(date_value: str) -> dict:
+    """Task#27 canonical daily report core.
+
+    The canonical trip population is always read through sb_select_canonical(),
+    never generic raw_calls selection. S700 is read separately and contributes
+    only an explicitly-labeled roaming candidate diagnostic.
+    """
+    from daily_operation_report_v1 import build_daily_operation_report_v1
+
+    canonical_rows = await sb_select_canonical(date_value, date_value)
+
+    start_dt = datetime.fromisoformat(f"{date_value}T00:00:00").replace(tzinfo=KST)
+    end_dt = start_dt + timedelta(days=1)
+    s700_rows = await sb_select("s700_trips", {
+        "trip_start": [
+            f"gte.{start_dt.astimezone(timezone.utc).isoformat()}",
+            f"lt.{end_dt.astimezone(timezone.utc).isoformat()}",
+        ],
+        "order": "trip_start.asc",
+    })
+    return build_daily_operation_report_v1(date_value, canonical_rows, s700_rows)
+
+
 async def run_canonical_runtime_audit_once() -> dict:
-    """Opt-in Task#164 diagnostic using the real anon+internal-secret path."""
+    """Opt-in Task#164/#27 diagnostic using the real secret-protected path."""
     from canonical_runtime_audit import evaluate_canonical_runtime_rows
 
     rows = await sb_select_canonical("2026-07-13", "2026-07-15")
-    audit = evaluate_canonical_runtime_rows(rows)
-    result_text = json.dumps(audit, ensure_ascii=False, separators=(",", ":"))[:1800]
+    canonical_audit = evaluate_canonical_runtime_rows(rows)
+
+    report_0713 = await get_daily_operation_report_v1("2026-07-13")
+    report_0715 = await get_daily_operation_report_v1("2026-07-15")
+    task27_pass = (
+        report_0713.get("total_count") == 16
+        and report_0713.get("total_revenue") == 144500
+        and report_0715.get("total_count") == 17
+        and report_0715.get("total_revenue") == 145400
+    )
+
+    audit = {
+        "pass": bool(canonical_audit.get("pass")) and task27_pass,
+        "canonical": canonical_audit,
+        "task27_same_path": {
+            "pass": task27_pass,
+            "2026-07-13": {
+                "count": report_0713.get("total_count"),
+                "sum": report_0713.get("total_revenue"),
+                "provenance": report_0713.get("provenance"),
+            },
+            "2026-07-15": {
+                "count": report_0715.get("total_count"),
+                "sum": report_0715.get("total_revenue"),
+                "provenance": report_0715.get("provenance"),
+            },
+        },
+    }
+
+    result_text = json.dumps(audit, ensure_ascii=False, separators=(",", ":"))[:3000]
     await sb_upsert("scheduler_status", {
         "job_name": "canonical_runtime_audit",
         "last_run_at": datetime.now(KST).isoformat(),
