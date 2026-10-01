@@ -530,3 +530,5 @@ from tests.test_image_retry_policy import ImageRetryPolicyTests
 from tests.test_canonical_identity_v1 import CanonicalIdentityV1Tests
 
 from tests.test_canonical_access_v1 import CanonicalAccessV1Tests
+
+from tests.test_canonical_runtime_audit import CanonicalRuntimeAuditTests
