@@ -79,6 +79,30 @@ class UberTripParserV2Tests(unittest.TestCase):
         self.assertEqual(parsed["요금근거"], "LEGACY_FARE_LABEL")
         self.assertNotIn("요금_정산액_참고", parsed)
 
+
+    def test_legacy_two_token_signature_is_not_sufficient(self):
+        text = """운행 세부사항
+순수익
+요금
+₩18,600
+"""
+        self.assertFalse(looks_like_uber_trip_detail(text))
+
+    def test_malformed_legacy_fails_strict_save_gate(self):
+        text = """운행 세부사항
+순수익
+2026. 9. 15. PM 11:57
+요금
+₩18,600
+"""
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertEqual(parsed["ui_variant"], "legacy_detail")
+        gate = validate_uber_trip_detail(parsed)
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["error_code"], "UBER_LEGACY_REQUIRED_FIELD_MISSING")
+        self.assertIn("출발지", gate["message"])
+        self.assertIn("도착지", gate["message"])
+
     def test_generic_detail_page_is_not_misclassified(self):
         text = "운행 세부사항\n2026. 9. 15. PM 11:57\n11.81 km"
         self.assertFalse(looks_like_uber_trip_detail(text))
