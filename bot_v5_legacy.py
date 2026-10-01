@@ -5545,6 +5545,19 @@ _PATROL_SCHEDULER_MAX_AGE_SECONDS = {
 }
 
 
+def _patrol_terminal_ingestion_failure(row: dict) -> bool:
+    """Content/parser rejection is not a system-health failure.
+
+    TERMINAL rows are intentionally quarantined and require explicit force_retry
+    after parser/code changes. Patrol should not surface them as fresh WARNs
+    merely because their ledger timestamp was updated during migration/backfill.
+    """
+    return (
+        str(row.get("status") or "").upper() == "FAILED"
+        and str(row.get("last_error") or "").startswith("TERMINAL:")
+    )
+
+
 def _patrol_parse_dt(value):
     if not value:
         return None
@@ -5841,7 +5854,11 @@ async def run_geomnuri_patrol_once() -> dict:
             local_updated = updated.astimezone(KST)
             if row.get("status") == "PROCESSING" and local_updated < stuck_cutoff:
                 stuck.append(row)
-            if row.get("status") == "FAILED" and local_updated >= fail_cutoff:
+            if (
+                row.get("status") == "FAILED"
+                and local_updated >= fail_cutoff
+                and not _patrol_terminal_ingestion_failure(row)
+            ):
                 failed_recent.append(row)
         if stuck:
             sample = ", ".join(str(x.get("source_id"))[:24] for x in stuck[:3])
