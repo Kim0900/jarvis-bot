@@ -121,7 +121,7 @@ logger = logging.getLogger(__name__)
 # task#162: Slack/관제 meaningful-change Gate
 # raw Registry event는 보존하되 표시계층 게시 후보는 결정론적으로 분리한다.
 # ──────────────────────────────────────────────
-CONTROL_CHANGE_POLICY_VERSION = "2026-09-29.v1"
+CONTROL_CHANGE_POLICY_VERSION = "2026-10-02.v2"
 _CONTROL_ALWAYS_MEANINGFUL_TYPES = {
     "TASK_CREATED",
     "TASK_COMPLETED",
@@ -140,7 +140,7 @@ def _classify_control_event(event: dict) -> tuple[bool, str]:
     detail = str(event.get("detail") or "").strip()
     detail_upper = detail.upper()
     old_status = str(event.get("old_status") or "").strip()
-    new_status = str(event.get("new_status") or "").strip()
+    new_status = str(event.get("new_status") or "").strip()\n    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}\n    severity = str(payload.get("severity") or payload.get("level") or "").strip().upper()\n    priority = str(payload.get("priority") or "").strip().upper()
 
     if event_type in _CONTROL_ALWAYS_NOISE_TYPES:
         return False, "provider_backoff_noise"
@@ -5827,6 +5827,35 @@ async def run_geomnuri_patrol_once() -> dict:
                 "control_classifier_regression",
                 "meaningful-change Gate 회귀: provider/review-progress 잡음이 게시후보로 분류됨 → "
                 + ", ".join(policy_bad[:10]),
+                task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+                severity="CRITICAL",
+                cooldown_seconds=3600,
+            )
+
+        # v2: inverse invariant. Explicitly critical/priority events must never
+        # disappear as non_control_event (under-posting / false-negative guard).
+        underposted = []
+        for ev in policy_events:
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            severity = str(payload.get("severity") or payload.get("level") or "").upper()
+            priority = str(payload.get("priority") or "").upper()
+            detail_upper = str(ev.get("detail") or "").upper()
+            explicitly_critical = (
+                severity in {"CRITICAL", "ERROR", "HIGH"}
+                or priority in {"P0", "P1"}
+                or any(marker in detail_upper for marker in (
+                    "[CRITICAL]", "🔴", "P0 ", "P0급", "P0격상", "P1 "
+                ))
+            )
+            if explicitly_critical:
+                meaningful, reason = _classify_control_event(ev)
+                if not meaningful:
+                    underposted.append(f"{ev.get('event_id')}:{reason}")
+        if underposted:
+            await emit(
+                "control_classifier_underposting",
+                "meaningful-change Gate 과소게시 회귀: 중요도 명시 event가 게시후보에서 누락됨 → "
+                + ", ".join(underposted[:10]),
                 task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
                 severity="CRITICAL",
                 cooldown_seconds=3600,
