@@ -871,6 +871,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                             fmt=result.get("format"),
                             inserted_count=result.get("saved_count", 0),
                         ))
+                        _schedule_s700_rematch_after_raw_change(
+                            source_id=source_id,
+                            reason=f"image:{result.get('format')}",
+                        )
                         result["duplicate"] = False
                         send_json(200, result)
                     else:
@@ -936,6 +940,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     )
                                 raise
 
+                            _schedule_s700_rematch_after_raw_change(
+                                source_id=source_id,
+                                reason="daily_history_fare_repair",
+                            )
                             send_json(200, {
                                 "success": True,
                                 "duplicate": False,
@@ -1645,6 +1653,42 @@ async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
     return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
 
 
+_S700_POST_RAW_REMATCH_LOCK = threading.Lock()
+
+def _schedule_s700_rematch_after_raw_change(source_id: str = None, reason: str = None) -> None:
+    """Re-evaluate unresolved S700 trips after late raw_calls arrive.
+
+    S700 files often arrive before image OCR. Without this hook an UNMATCHED trip
+    stays stale forever even when its exact call row is inserted minutes later.
+    MATCHED rows are excluded by s700_ingest.rematch(), so this cannot flap an
+    already-established identity.
+    """
+    def _worker():
+        if not _S700_POST_RAW_REMATCH_LOCK.acquire(blocking=False):
+            logger.info("[S700] post-raw rematch coalesced source=%s", source_id)
+            return
+        try:
+            result = asyncio.run(s700_rematch_run(False, 500))
+            logger.info(
+                "[S700] post-raw rematch source=%s reason=%s evaluated=%s changed=%s match=%s",
+                source_id, reason, result.get("evaluated"), result.get("changed"),
+                result.get("match"),
+            )
+        except Exception as exc:
+            logger.error(
+                "[S700] post-raw rematch failed source=%s reason=%s error=%s",
+                source_id, reason, type(exc).__name__,
+            )
+        finally:
+            _S700_POST_RAW_REMATCH_LOCK.release()
+
+    threading.Thread(
+        target=_worker,
+        name=f"s700-rematch-{str(source_id or 'raw')[:12]}",
+        daemon=True,
+    ).start()
+
+
 async def gpx_ingest_text_run(
     text: str,
     source_file_id: str,
@@ -1773,16 +1817,48 @@ async def mark_call_image_ingestion(
 
 
 async def delete_partial_source_calls(source_id: str) -> int:
-    """FAILED/stale 재시도 전에 같은 원본파일의 부분저장 row만 제거."""
+    """FAILED/stale retry cleanup through the internal-secret narrow RPC.
+
+    Render's Supabase role is anon and raw_calls intentionally has no anon DELETE
+    RLS policy. A direct DELETE therefore returns an empty representation while
+    deleting nothing. The Task#171 RPC is SECURITY DEFINER, source-scoped and
+    restricted to OCR-generated rows only.
+    """
+    if not source_id:
+        raise RuntimeError("부분 raw_calls 정리 실패: source_id 없음")
     result = await sb_h(
-        "DELETE",
-        "raw_calls",
-        params={"source_id": f"eq.{source_id}", "data_source": "eq.drive_ocr_tesseract"},
-        headers={**HEADERS_SB, "Prefer": "return=representation"},
+        "POST",
+        "rpc/cleanup_call_image_source_rows",
+        json={"p_source_id": source_id},
+        headers=_internal_rpc_headers(),
     )
     if result is None:
-        raise RuntimeError(f"부분 raw_calls 정리 실패: source_id={source_id}")
-    return len(result) if isinstance(result, list) else 0
+        raise RuntimeError(f"부분 raw_calls 정리 RPC 실패: source_id={source_id}")
+    try:
+        deleted = int(result)
+    except (TypeError, ValueError):
+        if isinstance(result, list) and len(result) == 1:
+            item = result[0]
+            if isinstance(item, (int, float, str)):
+                deleted = int(item)
+            elif isinstance(item, dict):
+                deleted = int(
+                    item.get("cleanup_call_image_source_rows")
+                    or item.get("deleted_count")
+                    or 0
+                )
+            else:
+                raise RuntimeError("부분 raw_calls 정리 RPC 응답형식 오류")
+        elif isinstance(result, dict):
+            deleted = int(
+                result.get("cleanup_call_image_source_rows")
+                or result.get("deleted_count")
+                or 0
+            )
+        else:
+            raise RuntimeError("부분 raw_calls 정리 RPC 응답형식 오류")
+    logger.info("[IMAGE_RETRY_CLEANUP] source_id=%s deleted=%s", source_id, deleted)
+    return deleted
 
 
 # ──────────────────────────────────────────────
@@ -3814,6 +3890,8 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
             "콜유형": "우버", "비고": note,
             "결제수단": parsed.get("결제수단"),
+            "운행시간_분": parsed.get("운행시간_분"),
+            "주행거리_km": parsed.get("거리_km"),
             "data_source": "drive_ocr_tesseract",
         }
         if await _save_one_raw_call(payload, source_id=source_id):

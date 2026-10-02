@@ -78,6 +78,59 @@ def find_kakao_overlap_candidates(rows, payloads, source_id):
     return hits
 
 
+
+def partition_kakao_payloads(rows, payloads, source_id):
+    """Partition a validated layout batch by shared canonical identity.
+
+    STRONG identity means the trip is already represented by another source and
+    is skipped, not duplicated. WEAK_TIME_ONLY is ambiguous and blocks the whole
+    batch. This keeps raw provenance append-only without creating known duplicate
+    trips when a full daily-history screenshot overlaps earlier partial uploads.
+    """
+    novel = []
+    covered = []
+    weak = []
+    for index, payload in enumerate(payloads):
+        candidate = dict(payload)
+        candidate.setdefault("콜유형", "카카오T")
+        strong_hits = []
+        weak_hits = []
+        for row in rows or []:
+            if row.get("source_id") == source_id:
+                continue
+            if row.get("raw_row_type") == "daily_total":
+                continue
+            if platform_key(row) != "KAKAO":
+                continue
+            strength = identity_strength(row, candidate)
+            if strength and str(strength).startswith("STRONG_"):
+                strong_hits.append({
+                    "existing_id": row.get("id"),
+                    "existing_source_id": row.get("source_id"),
+                    "strength": strength,
+                })
+            elif strength == "WEAK_TIME_ONLY":
+                weak_hits.append({
+                    "existing_id": row.get("id"),
+                    "existing_source_id": row.get("source_id"),
+                    "strength": strength,
+                })
+        if strong_hits:
+            covered.append({
+                "payload_index": index,
+                "fare": _int_or_none(payload.get("요금")),
+                "hits": strong_hits,
+            })
+        elif weak_hits:
+            weak.append({
+                "payload_index": index,
+                "fare": _int_or_none(payload.get("요금")),
+                "hits": weak_hits,
+            })
+        else:
+            novel.append(payload)
+    return {"novel": novel, "covered": covered, "weak": weak}
+
 def layout_to_daily_history(layout):
     header = layout.get("header") or {}
     cards = layout.get("cards") or []
@@ -158,17 +211,8 @@ async def persist_layout_primary(
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_SUM_MISMATCH"}
 
     date_rows = await select_rows({"날짜": f"eq.{date_value}", "limit": "500"})
-    overlaps = find_kakao_overlap_candidates(date_rows, payloads, source_id)
-    strong = [x for x in overlaps if str(x.get("strength", "")).startswith("STRONG_")]
-    weak = [x for x in overlaps if x.get("strength") == "WEAK_TIME_ONLY"]
-    if strong:
-        return {
-            "ok": False,
-            "quarantine": True,
-            "error_code": "LAYOUT_KAKAO_DUPLICATE_QUARANTINE",
-            "overlap_count": len(strong),
-            "overlap_candidates": strong[:20],
-        }
+    partitioned = partition_kakao_payloads(date_rows, payloads, source_id)
+    weak = partitioned["weak"]
     if weak:
         return {
             "ok": False,
@@ -178,11 +222,19 @@ async def persist_layout_primary(
             "overlap_candidates": weak[:20],
         }
 
+    to_insert = partitioned["novel"]
+    covered = partitioned["covered"]
+    if len(to_insert) + len(covered) != expected:
+        return {
+            "ok": False,
+            "error_code": "LAYOUT_PRIMARY_COVERAGE_COUNT_MISMATCH",
+        }
+
     try:
-        inserted = await bulk_insert(payloads)
-        if not isinstance(inserted, list) or len(inserted) != len(payloads):
+        inserted = [] if not to_insert else await bulk_insert(to_insert)
+        if not isinstance(inserted, list) or len(inserted) != len(to_insert):
             raise RuntimeError("LAYOUT_PRIMARY_BULK_INSERT_MISMATCH")
-        await mark_completed(len(payloads))
+        await mark_completed(len(to_insert))
     except Exception as exc:
         try:
             await rollback_source_rows(source_id)
@@ -195,7 +247,10 @@ async def persist_layout_primary(
 
     return {
         "ok": True,
-        "saved_count": len(payloads),
+        "saved_count": len(to_insert),
+        "covered_count": len(payloads),
+        "duplicate_skipped_count": len(covered),
+        "duplicate_skipped": covered[:20],
         "date": date_value,
         "displayed_count": expected,
         "displayed_amount": expected_sum,
