@@ -201,6 +201,89 @@ def _dedupe_anchors(anchors: list[dict[str, Any]], y_tolerance: float = 0.004) -
             out.append(anchor)
     return out
 
+def plan_missing_anchor_rescue(
+    lines: Iterable[dict[str, Any]],
+    *,
+    original_size: tuple[int, int],
+    expected_count: int,
+    max_missing: int = 2,
+    min_gap_ratio: float = 1.55,
+) -> dict[str, Any]:
+    """Plan bounded re-OCR crops when a whole card time anchor is missing.
+
+    A single missed time row creates an approximately double-height gap between
+    the surrounding anchors. This helper never invents a time. It only returns
+    deterministic crop boxes around statistically large internal gaps so the
+    provider can independently re-read the missing card.
+
+    First/last missing anchors are intentionally not guessed because there is no
+    two-sided geometry to localize them safely.
+    """
+    clean = dedupe_overlap_lines(lines)
+    anchors = _dedupe_anchors([a for a in (_time_anchor(x) for x in clean) if a])
+    missing = int(expected_count) - len(anchors)
+    base = {
+        "ok": False,
+        "detected_anchor_count": len(anchors),
+        "expected_count": int(expected_count),
+        "missing_anchor_count": missing,
+        "crops": [],
+        "error_code": None,
+    }
+    if missing <= 0:
+        return {**base, "ok": True, "error_code": None}
+    if missing > max_missing:
+        return {**base, "error_code": "LAYOUT_MISSING_ANCHOR_RESCUE_LIMIT"}
+    if len(anchors) < 2:
+        return {**base, "error_code": "LAYOUT_MISSING_ANCHOR_GEOMETRY_INSUFFICIENT"}
+
+    gaps = [anchors[i + 1]["y0"] - anchors[i]["y0"] for i in range(len(anchors) - 1)]
+    positive = [g for g in gaps if g > 0]
+    if not positive:
+        return {**base, "error_code": "LAYOUT_INVALID_ANCHOR_GEOMETRY"}
+    median_gap = statistics.median(positive)
+    if median_gap <= 0:
+        return {**base, "error_code": "LAYOUT_INVALID_ANCHOR_GEOMETRY"}
+
+    candidates = []
+    for idx, gap in enumerate(gaps):
+        ratio = gap / median_gap
+        if ratio < min_gap_ratio:
+            continue
+        midpoint = (anchors[idx]["y0"] + anchors[idx + 1]["y0"]) / 2.0
+        half = median_gap * 0.48
+        box = {
+            "x0": 0.0,
+            "y0": _clamp01(midpoint - half),
+            "x1": 1.0,
+            "y1": _clamp01(midpoint + half),
+        }
+        candidates.append({
+            "gap_index": idx,
+            "gap_ratio": round(ratio, 3),
+            "bbox_norm": box,
+            "crop_px": _norm_to_px(box, original_size),
+        })
+
+    candidates.sort(key=lambda x: (-x["gap_ratio"], x["gap_index"]))
+    selected = candidates[:missing]
+    if len(selected) != missing:
+        return {
+            **base,
+            "median_anchor_gap_norm": median_gap,
+            "candidate_gap_count": len(candidates),
+            "error_code": "LAYOUT_MISSING_ANCHOR_NOT_LOCALIZED",
+        }
+    return {
+        **base,
+        "ok": True,
+        "median_anchor_gap_norm": median_gap,
+        "candidate_gap_count": len(candidates),
+        "crops": selected,
+        "error_code": None,
+    }
+
+
 
 def _fare_candidates(text: str) -> list[int]:
     return [int(x.replace(",", "")) for x in FARE_RE.findall(text or "")]
