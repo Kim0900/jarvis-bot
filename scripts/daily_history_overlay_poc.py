@@ -334,7 +334,15 @@ def main() -> int:
             address_problem = any(
                 reason.startswith("ADDRESS_LINES_") for reason in card["reocr_reasons"]
             )
-            box = card["full_crop_px"] if address_problem else card["fare_crop_px"]
+            time_problem = any(
+                reason in ("MISSING_TIME", "AMBIGUOUS_TIME")
+                for reason in card["reocr_reasons"]
+            )
+            box = (
+                card["full_crop_px"]
+                if address_problem or time_problem
+                else card["fare_crop_px"]
+            )
             crop_box = (box["left"], box["top"], box["right"], box["bottom"])
             crop = img.crop(crop_box)
             submitted = resize(crop)
