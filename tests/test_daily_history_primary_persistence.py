@@ -113,6 +113,47 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error_code"], "LAYOUT_KAKAO_IDENTITY_AMBIGUOUS")
         self.assertEqual(result["overlap_count"], 1)
 
+    async def test_strong_cross_source_duplicate_is_covered_not_reinserted(self):
+        async def select_rows(params):
+            if "source_id" in params:
+                return []
+            return [{
+                "id": 77,
+                "raw_row_type": "trip",
+                "콜유형": "카카오T",
+                "날짜": "2026-09-28",
+                "배차시각": "20:00",
+                "하차시각": "20:10",
+                "출발지": "출발 A",
+                "도착지": "도착 A",
+                "요금": 5000,
+                "source_id": "older-source",
+            }]
+
+        async def no_bulk(_):
+            raise AssertionError("strong-covered payload must not be inserted")
+
+        marks = []
+        async def mark(count):
+            marks.append(count)
+            return {"ok": True}
+
+        result = await persist_layout_primary(
+            parsed(), "src-new",
+            select_rows=select_rows,
+            bulk_insert=no_bulk,
+            mark_completed=mark,
+            rollback_source_rows=self.rollback,
+            calc_service_date=self.calc,
+            validate_call_payload=self.validate,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["saved_count"], 0)
+        self.assertEqual(result["covered_count"], 1)
+        self.assertEqual(result["duplicate_skipped_count"], 1)
+        self.assertEqual(marks, [0])
+        self.assertEqual(self.rollback_count, 0)
+
     async def test_db_failure_rolls_back(self):
         async def select_rows(params):
             return []
