@@ -140,7 +140,10 @@ def _classify_control_event(event: dict) -> tuple[bool, str]:
     detail = str(event.get("detail") or "").strip()
     detail_upper = detail.upper()
     old_status = str(event.get("old_status") or "").strip()
-    new_status = str(event.get("new_status") or "").strip()\n    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}\n    severity = str(payload.get("severity") or payload.get("level") or "").strip().upper()\n    priority = str(payload.get("priority") or "").strip().upper()
+    new_status = str(event.get("new_status") or "").strip()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    severity = str(payload.get("severity") or payload.get("level") or "").strip().upper()
+    priority = str(payload.get("priority") or "").strip().upper()
 
     if event_type in _CONTROL_ALWAYS_NOISE_TYPES:
         return False, "provider_backoff_noise"
