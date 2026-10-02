@@ -3616,70 +3616,9 @@ def parse_daily_history(text: str) -> dict:
     return parse_daily_history_text(text)
 
 def parse_uber_trip_detail(text: str) -> dict:
-    """형식④(우버 개별운행상세, "운행 세부사항"/"순수익" 화면) 파서.
-    task93후속(2026-09-09) — 실제 우버 콜카드(1000014294.jpg) Tesseract
-    PSM6 실측 기반. 카카오T와 파일명체계가 달라(10자리 "1000"접두사
-    vs 13자리) 별도 형식으로 분리."""
-    result: dict = {"format": "uber_trip_detail", "parse_errors": [], "콜유형": "우버"}
-
-    # 2026-09-16 개선: OCR.space 도입후 실측(날짜~AM 사이에 "•" 등
-    # 불릿기호가 낌, Tesseract 때는 없었음) — 구분자를 \S* 대신
-    # [^\dAP]*?(숫자·A·P가 아닌 아무 문자나 non-greedy)로 완화.
-    m = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.[^\dAP]*?(AM|PM)\s*(\d{1,2}):(\d{2})', text)
-    if m:
-        y, mo, d, ampm, h, mi = m.groups()
-        h = int(h)
-        if ampm == 'PM' and h != 12:
-            h += 12
-        if ampm == 'AM' and h == 12:
-            h = 0
-        result["날짜"] = f"{y}-{int(mo):02d}-{int(d):02d}"
-        result["배차시각"] = f"{h:02d}:{mi}"
-    else:
-        result["parse_errors"].append("날짜시각 파싱실패")
-
-    m = re.search(r'(\d{1,3})분\s*(\d{1,2})초', text)
-    if m:
-        result["운행시간_분"] = round(int(m.group(1)) + int(m.group(2)) / 60, 1)
-
-    m = re.search(r'([\d.]+)\s*km', text)
-    if m:
-        result["거리_km"] = float(m.group(1))
-
-    matches = re.findall(r'(대구광역시[^\n]*?)\s*KR', text)
-    if len(matches) >= 2:
-        result["출발지"] = matches[0].strip()
-        result["도착지"] = matches[1].strip()
-    else:
-        result["parse_errors"].append(f"출발/도착 파싱실패(찾은건수:{len(matches)})")
-
-    # 2026-09-16 개선: OCR.space는 "요금"/"순수익" 라벨을 값보다 먼저
-    # 몰아서 인식하는 경우가 있어(표 레이아웃 순서 재배열), 같은 줄
-    # 제한(\n 제외)이던 기존 정규식이 실패. 줄바꿈 포함 최대 20자
-    # 이내로 완화하고 원(₩)/역슬래시(Tesseract오인식) 둘 다 허용.
-    m = re.search(r'요금[\s\S]{0,20}?[₩\\]\s*([\d,]{4,})', text)
-    if m:
-        result["요금"] = int(m.group(1).replace(",", ""))
-    else:
-        result["parse_errors"].append("요금 파싱실패")
-
-    # 2026-09-17 실측(대표님 확인: 실제 18,600원인데 418,600원으로
-    # 오저장됨) — 원인: 라벨(순수익/요금/순수익/정산/지급)과 값이
-    # 화면에서 분리되어 OCR이 순서만 유지한 채 뭉쳐서 뱉어내는 경우,
-    # "요금" 바로 다음 값이 실제로는 다른 항목의 값(+OCR 문자인식
-    # 오류가 겹침)일 수 있음. "정산"은 항상 마이너스 부호가 붙어
-    # 식별이 명확하므로 교차검증용으로 사용 — 절댓값이 "요금"과
-    # 크게 다르면 자신있게 틀린 값을 저장하는 대신 명시적으로
-    # "확인필요" 표시만 남기고 값 자체는 보수적으로 건드리지 않는다.
-    m_settle = re.search(r'정산[\s\S]{0,40}?-\s*[₩\\]\s*([\d,]{4,})', text)
-    if m_settle and "요금" in result:
-        settle_amt = int(m_settle.group(1).replace(",", ""))
-        if abs(result["요금"] - settle_amt) > 100:
-            result["parse_errors"].append(
-                f"요금({result['요금']})≠정산액({settle_amt}) 불일치 — OCR오류 의심, 확인필요")
-            result["요금_정산액_참고"] = settle_amt
-
-    return result
+    """Uber individual trip-detail parser (legacy + compact detail v2)."""
+    from uber_trip_parser import parse_uber_trip_detail_text
+    return parse_uber_trip_detail_text(text)
 
 
 def detect_and_parse_call_document(text: str) -> dict:
@@ -3693,7 +3632,8 @@ def detect_and_parse_call_document(text: str) -> dict:
     # 2026-09-11 CASPER_콜카드_파일명비의존_판별 작업지시서 반영: 단일
     # 일반키워드 하나만으로 확정하지 않는다 — OR을 AND로 강화(실측:
     # 실제 우버 운행세부사항 화면엔 두 키워드가 항상 함께 존재함 확인).
-    if "운행 세부사항" in text and "순수익" in text:
+    from uber_trip_parser import looks_like_uber_trip_detail
+    if looks_like_uber_trip_detail(text):
         return parse_uber_trip_detail(text)
     if "배차" in text and ("기사" in text or "운행 정보" in text):
         return parse_kakao_trip_detail(text)
@@ -3827,26 +3767,50 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         if await _save_one_raw_call(payload, source_id=source_id):
             saved += 1
     elif fmt == "uber_trip_detail":
-        # 2026-09-21 P0: 우버 요금-정산액 불일치 시 Fail Closed.
-        # OCR 오독으로 확인된 잘못된 요금을 raw_calls에 저장하지 않는다.
+        from uber_trip_parser import validate_uber_trip_detail
+
+        # Legacy protection: settlement mismatch remains hard Fail-Closed.
         if parsed.get("요금_정산액_참고") is not None:
             return {
                 "success": False,
                 "error": "UBER_FARE_MISMATCH",
+                "error_code": "UBER_FARE_MISMATCH",
                 "format": fmt,
                 "saved_count": 0,
                 "parse_errors": parsed.get("parse_errors", []),
                 "source_id": source_id,
             }
 
-        note = f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km" if parsed.get("운행시간_분") else None
+        # Compact/new UI must have all independent anchors before any DB write.
+        compact_gate = validate_uber_trip_detail(parsed)
+        if not compact_gate.get("ok"):
+            return {
+                "success": False,
+                "error": compact_gate.get("message"),
+                "error_code": compact_gate.get("error_code"),
+                "error_stage": "uber_compact_validation",
+                "format": fmt,
+                "saved_count": 0,
+                "parse_errors": parsed.get("parse_errors", []),
+                "source_id": source_id,
+                "ui_variant": parsed.get("ui_variant"),
+            }
+
+        note_parts = []
+        if parsed.get("운행시간_분") is not None:
+            note_parts.append(f"운행{parsed.get('운행시간_분')}분/{parsed.get('거리_km')}km")
+        if parsed.get("결제방식") == "직접":
+            note_parts.append("직접결제")
+        note_parts.append(str(parsed.get("ui_variant") or "uber_detail"))
         if parsed.get("parse_errors"):
-            warn = " | ⚠️" + "; ".join(parsed["parse_errors"])
-            note = (note or "") + warn
+            note_parts.append("⚠️" + "; ".join(parsed["parse_errors"]))
+        note = " | ".join(note_parts) if note_parts else None
+
         payload = {
             "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"),
             "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
             "콜유형": "우버", "비고": note,
+            "결제수단": parsed.get("결제수단"),
             "data_source": "drive_ocr_tesseract",
         }
         if await _save_one_raw_call(payload, source_id=source_id):

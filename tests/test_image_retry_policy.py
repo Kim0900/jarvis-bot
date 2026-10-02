@@ -25,6 +25,15 @@ class ImageRetryPolicyTests(unittest.TestCase):
             "terminal",
         )
 
+    def test_legacy_uber_missing_field_is_terminal(self):
+        self.assertEqual(
+            classify_result_failure({
+                "format": "uber_trip_detail",
+                "error_code": "UBER_LEGACY_REQUIRED_FIELD_MISSING",
+            }),
+            "terminal",
+        )
+
     def test_unstructured_runtime_failure_is_retryable(self):
         self.assertEqual(
             classify_result_failure({"error": "provider transport failed"}),
