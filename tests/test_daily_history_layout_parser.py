@@ -13,6 +13,7 @@ from daily_history_layout_parser import (
     extract_header_totals,
     map_bbox_to_original,
     ocrspace_overlay_to_lines,
+    plan_missing_anchor_rescue,
 )
 from scripts.daily_history_overlay_poc import (
     build_shadow_comparison,
@@ -232,6 +233,37 @@ class LayoutParserTests(unittest.TestCase):
         )
         self.assertEqual(r["reocr_card_indices"], [])
         self.assertEqual(r["planned_total_ocr_calls"], 2)
+
+    def test_missing_anchor_rescue_localizes_double_gap(self):
+        rows = synthetic_cards(12, 0)
+        # Remove the complete sixth card. The surrounding time-anchor gap becomes ~2x median.
+        missing_y = 0.15 + 5 * 0.06
+        rows = [
+            r for r in rows
+            if not (missing_y - 0.001 <= r["y0"] <= missing_y + 0.05)
+        ]
+        plan = plan_missing_anchor_rescue(
+            rows,
+            original_size=(1080, 8000),
+            expected_count=12,
+        )
+        self.assertTrue(plan["ok"])
+        self.assertEqual(plan["detected_anchor_count"], 11)
+        self.assertEqual(plan["missing_anchor_count"], 1)
+        self.assertEqual(len(plan["crops"]), 1)
+        self.assertGreater(plan["crops"][0]["gap_ratio"], 1.55)
+
+    def test_missing_anchor_rescue_refuses_unlocalized_missing_card(self):
+        rows = synthetic_cards(12, 0)
+        # Remove the first card: there is no two-sided internal geometry for a safe crop.
+        rows = [r for r in rows if r["y0"] > 0.15 + 0.05]
+        plan = plan_missing_anchor_rescue(
+            rows,
+            original_size=(1080, 8000),
+            expected_count=12,
+        )
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["error_code"], "LAYOUT_MISSING_ANCHOR_NOT_LOCALIZED")
 
     def test_expected_count_mismatch_fail_closed(self):
         r = build_card_layout(
