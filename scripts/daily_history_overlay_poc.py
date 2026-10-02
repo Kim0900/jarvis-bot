@@ -36,6 +36,7 @@ from daily_history_layout_parser import (
     _looks_like_address,
     build_card_layout,
     extract_header_date,
+    plan_missing_anchor_rescue,
     extract_header_totals,
     ocrspace_overlay_to_lines,
 )
@@ -292,11 +293,48 @@ def main() -> int:
         }))
         return 3
 
-    layout = build_card_layout(
+    anchor_rescue = plan_missing_anchor_rescue(
         all_lines,
         original_size=img.size,
         expected_count=header["expected_count"],
     )
+    anchor_rescue_calls = 0
+    if (
+        anchor_rescue.get("ok")
+        and anchor_rescue.get("missing_anchor_count", 0) > 0
+    ):
+        for rescue in anchor_rescue.get("crops") or []:
+            if actual_calls >= 8:
+                break
+            box = rescue["crop_px"]
+            crop_box = (box["left"], box["top"], box["right"], box["bottom"])
+            crop = img.crop(crop_box)
+            submitted = resize(crop)
+            call_started = time.monotonic()
+            result = ocr_overlay(crop, key)
+            wall_durations.append(round((time.monotonic() - call_started) * 1000))
+            actual_calls += 1
+            anchor_rescue_calls += 1
+            durations.append(result.get("ProcessingTimeInMilliseconds"))
+            all_lines.extend(ocrspace_overlay_to_lines(
+                result["ParsedResults"][0],
+                chunk_index=actual_calls,
+                crop_box=crop_box,
+                submitted_size=submitted.size,
+                original_size=img.size,
+            ))
+
+    layout = build_card_layout(
+        all_lines,
+        original_size=img.size,
+        expected_count=header["expected_count"],
+        base_ocr_calls=actual_calls,
+    )
+    layout["anchor_rescue"] = {
+        "attempted": bool(anchor_rescue_calls),
+        "calls": anchor_rescue_calls,
+        "plan": anchor_rescue,
+    }
     if layout["ok"]:
         for card in layout["cards"]:
             if not card["reocr_reasons"]:
