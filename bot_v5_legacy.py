@@ -1814,16 +1814,48 @@ async def mark_call_image_ingestion(
 
 
 async def delete_partial_source_calls(source_id: str) -> int:
-    """FAILED/stale 재시도 전에 같은 원본파일의 부분저장 row만 제거."""
+    """FAILED/stale retry cleanup through the internal-secret narrow RPC.
+
+    Render's Supabase role is anon and raw_calls intentionally has no anon DELETE
+    RLS policy. A direct DELETE therefore returns an empty representation while
+    deleting nothing. The Task#171 RPC is SECURITY DEFINER, source-scoped and
+    restricted to OCR-generated rows only.
+    """
+    if not source_id:
+        raise RuntimeError("부분 raw_calls 정리 실패: source_id 없음")
     result = await sb_h(
-        "DELETE",
-        "raw_calls",
-        params={"source_id": f"eq.{source_id}", "data_source": "eq.drive_ocr_tesseract"},
-        headers={**HEADERS_SB, "Prefer": "return=representation"},
+        "POST",
+        "rpc/cleanup_call_image_source_rows",
+        json={"p_source_id": source_id},
+        headers=_internal_rpc_headers(),
     )
     if result is None:
-        raise RuntimeError(f"부분 raw_calls 정리 실패: source_id={source_id}")
-    return len(result) if isinstance(result, list) else 0
+        raise RuntimeError(f"부분 raw_calls 정리 RPC 실패: source_id={source_id}")
+    try:
+        deleted = int(result)
+    except (TypeError, ValueError):
+        if isinstance(result, list) and len(result) == 1:
+            item = result[0]
+            if isinstance(item, (int, float, str)):
+                deleted = int(item)
+            elif isinstance(item, dict):
+                deleted = int(
+                    item.get("cleanup_call_image_source_rows")
+                    or item.get("deleted_count")
+                    or 0
+                )
+            else:
+                raise RuntimeError("부분 raw_calls 정리 RPC 응답형식 오류")
+        elif isinstance(result, dict):
+            deleted = int(
+                result.get("cleanup_call_image_source_rows")
+                or result.get("deleted_count")
+                or 0
+            )
+        else:
+            raise RuntimeError("부분 raw_calls 정리 RPC 응답형식 오류")
+    logger.info("[IMAGE_RETRY_CLEANUP] source_id=%s deleted=%s", source_id, deleted)
+    return deleted
 
 
 # ──────────────────────────────────────────────
