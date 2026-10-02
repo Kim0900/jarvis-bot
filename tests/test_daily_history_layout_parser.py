@@ -233,6 +233,58 @@ class LayoutParserTests(unittest.TestCase):
         self.assertEqual(r["reocr_card_indices"], [])
         self.assertEqual(r["planned_total_ocr_calls"], 2)
 
+    def test_fare_anchor_fallback_recovers_one_missing_time_row(self):
+        rows = [
+            line("2026년 10월 1일", 0.015),
+            line("실시간 운행 12건 / 66,600원", 0.03),
+        ]
+        rows.extend(synthetic_cards(12))
+        # Remove only card 8's time line; all 12 fare rows remain visible.
+        time_seen = 0
+        filtered = []
+        for row in rows:
+            if " - " in str(row.get("text") or "") and "실시간" in str(row.get("text") or ""):
+                time_seen += 1
+                if time_seen == 8:
+                    continue
+            filtered.append(row)
+
+        r = build_card_layout(
+            filtered,
+            original_size=(1080, 8000),
+            expected_count=12,
+            expected_sum=66600,
+        )
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["anchor_strategy"], "FARE_ANCHOR_FALLBACK")
+        self.assertEqual(r["detected_time_anchor_count"], 11)
+        self.assertEqual(r["detected_card_count"], 12)
+        missing = [x for x in r["cards"] if "MISSING_TIME" in x["reocr_reasons"]]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(r["planned_total_ocr_calls"], 3)
+
+        missing_card = missing[0]
+        self.assertTrue(reconcile_reocr(
+            missing_card,
+            [line("19:20 - 19:29 실시간", 0.5)],
+        ))
+        result = verify_layout(r, 12, 66600, None, 3)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "COMPLETE_LAYOUT_VALIDATED")
+
+    def test_fare_anchor_fallback_rejects_wrong_sum(self):
+        rows = synthetic_cards(12)
+        # one missing time row but fare population sum does not agree with header
+        del rows[4 * 7]
+        r = build_card_layout(
+            rows,
+            original_size=(1080, 8000),
+            expected_count=12,
+            expected_sum=99999,
+        )
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error_code"], "LAYOUT_CARD_COUNT_MISMATCH")
+
     def test_expected_count_mismatch_fail_closed(self):
         r = build_card_layout(
             synthetic_cards(10, 0),
