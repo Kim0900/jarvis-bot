@@ -32,6 +32,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from daily_history_layout_parser import (
+    TIME_RE,
+    _card_reocr_reason,
     _fare_candidates,
     _looks_like_address,
     build_card_layout,
@@ -82,23 +84,45 @@ def ocr_overlay(img: Image.Image, api_key: str) -> dict:
 
 
 def reconcile_reocr(card: dict, lines: list[dict]) -> bool:
-    """Accept a selective OCR result only when it uniquely resolves missing fields."""
+    """Accept selective OCR only when every unresolved field becomes unique."""
     texts = [str(line.get("text") or "") for line in lines]
+    original_reasons = list(card.get("reocr_reasons") or [])
+
+    if "MISSING_TIME" in original_reasons or "AMBIGUOUS_TIME" in original_reasons:
+        time_pairs = []
+        for text in texts:
+            for match in TIME_RE.finditer(text):
+                sh, sm, eh, em = map(int, match.groups())
+                if not (0 <= sh < 24 and 0 <= eh < 24 and 0 <= sm < 60 and 0 <= em < 60):
+                    continue
+                pair = (f"{sh:02d}:{sm:02d}", f"{eh:02d}:{em:02d}")
+                if pair not in time_pairs:
+                    time_pairs.append(pair)
+        if len(time_pairs) != 1:
+            return False
+        card["start_time"], card["end_time"] = time_pairs[0]
+        card["time_anchor_count"] = 1
+
     fares = [fare for text in texts for fare in _fare_candidates(text)]
-    if len(set(fares)) != 1:
-        return False
-    if "MISSING_FARE" in card["reocr_reasons"]:
-        card["fare"] = fares[0]
-    elif card["fare"] != fares[0]:
+    unique_fares = sorted(set(fares))
+    if "MISSING_FARE" in original_reasons:
+        if len(unique_fares) != 1:
+            return False
+        card["fare"] = unique_fares[0]
+    elif unique_fares and (
+        len(unique_fares) != 1 or int(card.get("fare") or 0) != unique_fares[0]
+    ):
         return False
 
-    if any(reason.startswith("ADDRESS_LINES_") for reason in card["reocr_reasons"]):
+    if any(reason.startswith("ADDRESS_LINES_") for reason in original_reasons):
         addresses = [text for text in texts if _looks_like_address(text)]
-        if len(addresses) != 2 or len(set(addresses)) != 2:
+        unique_addresses = list(dict.fromkeys(addresses))
+        if len(unique_addresses) != 2:
             return False
-        card["address_lines"] = addresses
-    card["reocr_reasons"] = []
-    return True
+        card["address_lines"] = unique_addresses
+
+    card["reocr_reasons"] = _card_reocr_reason(card)
+    return not card["reocr_reasons"]
 
 
 def verify_layout(layout: dict, expected_count: int, expected_sum: int,
@@ -113,7 +137,8 @@ def verify_layout(layout: dict, expected_count: int, expected_sum: int,
         error = "LAYOUT_REOCR_BUDGET_EXCEEDED"
     elif len(cards) != expected_count:
         error = "LAYOUT_CARD_COUNT_MISMATCH"
-    elif any(card["reocr_reasons"] or card["fare"] is None
+    elif any(card["reocr_reasons"] or not card.get("start_time")
+             or not card.get("end_time") or card["fare"] is None
              or len(card["address_lines"]) != 2 for card in cards):
         error = "LAYOUT_CARD_UNRESOLVED"
     elif sum(card["fare"] for card in cards) != expected_sum:
@@ -296,6 +321,7 @@ def main() -> int:
         all_lines,
         original_size=img.size,
         expected_count=header["expected_count"],
+        expected_sum=header["expected_sum"],
     )
     if layout["ok"]:
         for card in layout["cards"]:
