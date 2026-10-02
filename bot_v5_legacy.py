@@ -868,6 +868,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                             fmt=result.get("format"),
                             inserted_count=result.get("saved_count", 0),
                         ))
+                        _schedule_s700_rematch_after_raw_change(
+                            source_id=source_id,
+                            reason=f"image:{result.get('format')}",
+                        )
                         result["duplicate"] = False
                         send_json(200, result)
                     else:
@@ -933,6 +937,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     )
                                 raise
 
+                            _schedule_s700_rematch_after_raw_change(
+                                source_id=source_id,
+                                reason="daily_history_fare_repair",
+                            )
                             send_json(200, {
                                 "success": True,
                                 "duplicate": False,
@@ -1640,6 +1648,42 @@ async def s700_ingest_jsonl_run(text: str, source_file_id, source_file_name, dry
 async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
     import s700_ingest as _s700
     return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
+
+
+_S700_POST_RAW_REMATCH_LOCK = threading.Lock()
+
+def _schedule_s700_rematch_after_raw_change(source_id: str = None, reason: str = None) -> None:
+    """Re-evaluate unresolved S700 trips after late raw_calls arrive.
+
+    S700 files often arrive before image OCR. Without this hook an UNMATCHED trip
+    stays stale forever even when its exact call row is inserted minutes later.
+    MATCHED rows are excluded by s700_ingest.rematch(), so this cannot flap an
+    already-established identity.
+    """
+    def _worker():
+        if not _S700_POST_RAW_REMATCH_LOCK.acquire(blocking=False):
+            logger.info("[S700] post-raw rematch coalesced source=%s", source_id)
+            return
+        try:
+            result = asyncio.run(s700_rematch_run(False, 500))
+            logger.info(
+                "[S700] post-raw rematch source=%s reason=%s evaluated=%s changed=%s match=%s",
+                source_id, reason, result.get("evaluated"), result.get("changed"),
+                result.get("match"),
+            )
+        except Exception as exc:
+            logger.error(
+                "[S700] post-raw rematch failed source=%s reason=%s error=%s",
+                source_id, reason, type(exc).__name__,
+            )
+        finally:
+            _S700_POST_RAW_REMATCH_LOCK.release()
+
+    threading.Thread(
+        target=_worker,
+        name=f"s700-rematch-{str(source_id or 'raw')[:12]}",
+        daemon=True,
+    ).start()
 
 
 async def gpx_ingest_text_run(
@@ -3811,6 +3855,8 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
             "콜유형": "우버", "비고": note,
             "결제수단": parsed.get("결제수단"),
+            "운행시간_분": parsed.get("운행시간_분"),
+            "주행거리_km": parsed.get("거리_km"),
             "data_source": "drive_ocr_tesseract",
         }
         if await _save_one_raw_call(payload, source_id=source_id):
