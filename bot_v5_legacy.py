@@ -1645,6 +1645,28 @@ async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
     return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
 
 
+async def _best_effort_s700_rematch_after_raw_insert(reason: str) -> dict | None:
+    """Re-evaluate unresolved S700 rows after new raw_calls arrive.
+
+    S700 ingestion can happen before OCR/raw ingestion. Matching is downstream
+    enrichment only, so a rematch failure must never roll back or falsify a
+    successful raw_call write.
+    """
+    try:
+        report = await s700_rematch_run(False, 500)
+        logger.info(
+            "[S700] post-raw rematch reason=%s evaluated=%s changed=%s match=%s",
+            reason,
+            report.get("evaluated"),
+            report.get("changed"),
+            report.get("match"),
+        )
+        return report
+    except Exception as exc:
+        logger.warning("[S700] post-raw rematch failed reason=%s error=%s", reason, exc)
+        return None
+
+
 async def gpx_ingest_text_run(
     text: str,
     source_file_id: str,
@@ -3821,9 +3843,16 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
     else:
         return {"success": False, "error": "형식판별실패", "detail": parsed}
 
+    rematch_report = None
+    if saved > 0:
+        rematch_report = await _best_effort_s700_rematch_after_raw_insert(
+            f"process_call_document:{fmt}:{source_id or 'no-source'}"
+        )
+
     return {
         "success": True, "format": fmt, "saved_count": saved,
         "parse_errors": parsed.get("parse_errors", []), "source_id": source_id,
+        "s700_rematch": rematch_report,
     }
 
 
@@ -4042,6 +4071,9 @@ async def process_call_card(update: Update, image_bytes: bytes):
         logger.warning(f"raw_calls Rule Validation 실패(콜카드): {_reason}")
     result = await sb_insert("raw_calls", payload)
     if result:
+        await _best_effort_s700_rematch_after_raw_insert(
+            f"individual_call:{today}:{배차시각}"
+        )
         if is_direct:
             await update.message.reply_text(
                 f"💳 직접결제 콜카드 저장 (요금 미확인)\n"
