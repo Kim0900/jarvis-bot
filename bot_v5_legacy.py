@@ -5831,6 +5831,35 @@ async def run_geomnuri_patrol_once() -> dict:
                 severity="CRITICAL",
                 cooldown_seconds=3600,
             )
+
+        # v2: inverse invariant. Explicitly critical/priority events must never
+        # disappear as non_control_event (under-posting / false-negative guard).
+        underposted = []
+        for ev in policy_events:
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            severity = str(payload.get("severity") or payload.get("level") or "").upper()
+            priority = str(payload.get("priority") or "").upper()
+            detail_upper = str(ev.get("detail") or "").upper()
+            explicitly_critical = (
+                severity in {"CRITICAL", "ERROR", "HIGH"}
+                or priority in {"P0", "P1"}
+                or any(marker in detail_upper for marker in (
+                    "[CRITICAL]", "🔴", "P0 ", "P0급", "P0격상", "P1 "
+                ))
+            )
+            if explicitly_critical:
+                meaningful, reason = _classify_control_event(ev)
+                if not meaningful:
+                    underposted.append(f"{ev.get('event_id')}:{reason}")
+        if underposted:
+            await emit(
+                "control_classifier_underposting",
+                "meaningful-change Gate 과소게시 회귀: 중요도 명시 event가 게시후보에서 누락됨 → "
+                + ", ".join(underposted[:10]),
+                task_id=GEOMNURI_PATROL_CONTROL_TASK_ID,
+                severity="CRITICAL",
+                cooldown_seconds=3600,
+            )
     except Exception as e:
         await emit(
             "patrol_internal_control_check",
