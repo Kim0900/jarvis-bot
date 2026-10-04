@@ -189,6 +189,7 @@ async def persist_layout_primary(
             "콜유형": "카카오T",
             "비고": "직접결제" if item.get("결제방식") == "직접" else None,
             "data_source": "drive_ocr_layout_v1",
+            "raw_row_type": "trip",
             "source_id": source_id,
         }
         payload.update(calc_service_date(payload["날짜"], payload["배차시각"]))
