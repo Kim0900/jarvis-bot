@@ -198,6 +198,32 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error_code"], "LAYOUT_PRIMARY_PERSISTENCE_FAILED")
         self.assertEqual(self.rollback_count, 1)
 
+    async def test_primary_rows_persist_trip_contract(self):
+        async def select_rows(params):
+            return []
+
+        captured = []
+        async def bulk(rows):
+            captured.extend(rows)
+            return [{"id": 200 + i} for i, _ in enumerate(rows)]
+
+        async def mark(_):
+            return {"ok": True}
+
+        result = await persist_layout_primary(
+            parsed(), "src-trip-contract",
+            select_rows=select_rows,
+            bulk_insert=bulk,
+            mark_completed=mark,
+            rollback_source_rows=self.rollback,
+            calc_service_date=self.calc,
+            validate_call_payload=self.validate,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["raw_row_type"], "trip")
+        self.assertEqual(captured[0]["data_source"], "drive_ocr_layout_v1")
+
     async def test_success_marks_completed_without_rollback(self):
         async def select_rows(params):
             return []
