@@ -1,6 +1,6 @@
 import unittest
 
-from daily_operation_report_v1 import build_daily_operation_report_v1
+from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1
 
 
 class DailyOperationReportV1Tests(unittest.TestCase):
@@ -56,6 +56,44 @@ class DailyOperationReportV1Tests(unittest.TestCase):
         report = build_daily_operation_report_v1("2026-07-15", rows, [])
         self.assertTrue(report["gap"]["partial"])
         self.assertEqual(report["gap"]["missing_time_trip_count"], 1)
+
+
+    def test_briefing_section_a_uses_canonical_report_contract(self):
+        report = build_daily_operation_report_v1(
+            "2026-10-04",
+            [
+                {
+                    "id": 1, "날짜": "2026-10-04", "배차시각": "19:00", "하차시각": "19:10",
+                    "요금": 6000, "canonical_platform": "KAKAO",
+                    "data_source": "drive_ocr_layout_v1", "canonical_weak_candidate_count": 0,
+                },
+                {
+                    "id": 2, "날짜": "2026-10-04", "배차시각": "20:00", "하차시각": "20:10",
+                    "요금": 10000, "canonical_platform": "UBER",
+                    "data_source": "drive_ocr_layout_v1", "canonical_weak_candidate_count": 1,
+                },
+            ],
+            [{"match_status": "UNMATCHED", "fare": 7000}],
+        )
+        section = build_briefing_section_a_v1(report)
+        self.assertEqual(section["source"], "daily_operation_report_v1")
+        self.assertEqual(section["date_basis"], "calendar_day")
+        self.assertEqual(section["calls"], 2)
+        self.assertEqual(section["revenue"], 16000)
+        self.assertEqual(section["avg_fare"], 8000)
+        self.assertEqual(section["platform"]["kakao"], 1)
+        self.assertEqual(section["platform"]["uber"], 1)
+        self.assertEqual(section["platform"]["roam_confirmed"], 0)
+        self.assertEqual(section["weak_identity_candidate_rows"], 1)
+        self.assertEqual(section["roaming_candidate"]["count"], 1)
+        self.assertTrue(section["roaming_candidate"]["candidate_only"])
+
+    def test_briefing_section_a_fails_closed_on_wrong_version(self):
+        with self.assertRaises(ValueError):
+            build_briefing_section_a_v1({
+                "version": "legacy",
+                "date_basis": "calendar_day",
+            })
 
 
 if __name__ == "__main__":
