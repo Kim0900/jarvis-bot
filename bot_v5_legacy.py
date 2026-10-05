@@ -1653,20 +1653,18 @@ async def s700_rematch_run(dry_run: bool, limit: int) -> dict:
     return await _s700.rematch(_S700Sb(), dry_run=dry_run, limit=limit)
 
 
-_S700_POST_RAW_REMATCH_LOCK = threading.Lock()
+from s700_rematch_trigger import CoalescingDrain
+
+_S700_POST_RAW_REMATCH_DRAIN = CoalescingDrain("s700-post-raw-rematch")
 
 def _schedule_s700_rematch_after_raw_change(source_id: str = None, reason: str = None) -> None:
     """Re-evaluate unresolved S700 trips after late raw_calls arrive.
 
-    S700 files often arrive before image OCR. Without this hook an UNMATCHED trip
-    stays stale forever even when its exact call row is inserted minutes later.
-    MATCHED rows are excluded by s700_ingest.rematch(), so this cannot flap an
-    already-established identity.
+    Requests that arrive while a rematch is already running are coalesced into
+    a mandatory trailing pass instead of being discarded. MATCHED rows remain
+    excluded by s700_ingest.rematch(), so established identities do not flap.
     """
-    def _worker():
-        if not _S700_POST_RAW_REMATCH_LOCK.acquire(blocking=False):
-            logger.info("[S700] post-raw rematch coalesced source=%s", source_id)
-            return
+    def _run_once():
         try:
             result = asyncio.run(s700_rematch_run(False, 500))
             logger.info(
@@ -1679,14 +1677,18 @@ def _schedule_s700_rematch_after_raw_change(source_id: str = None, reason: str =
                 "[S700] post-raw rematch failed source=%s reason=%s error=%s",
                 source_id, reason, type(exc).__name__,
             )
-        finally:
-            _S700_POST_RAW_REMATCH_LOCK.release()
 
-    threading.Thread(
-        target=_worker,
-        name=f"s700-rematch-{str(source_id or 'raw')[:12]}",
-        daemon=True,
-    ).start()
+    _S700_POST_RAW_REMATCH_DRAIN.request(
+        _run_once,
+        on_coalesced=lambda: logger.info(
+            "[S700] post-raw rematch coalesced source=%s pending_trailing=true",
+            source_id,
+        ),
+        on_trailing=lambda: logger.info(
+            "[S700] post-raw rematch trailing pass source=%s",
+            source_id,
+        ),
+    )
 
 
 async def gpx_ingest_text_run(
