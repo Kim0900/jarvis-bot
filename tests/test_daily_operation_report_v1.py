@@ -1,6 +1,6 @@
 import unittest
 
-from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1
+from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1, build_month_activity_v1
 
 
 class DailyOperationReportV1Tests(unittest.TestCase):
@@ -94,6 +94,22 @@ class DailyOperationReportV1Tests(unittest.TestCase):
                 "version": "legacy",
                 "date_basis": "calendar_day",
             })
+
+
+    def test_month_activity_uses_calendar_days_and_operating_days(self):
+        rows = [
+            {"날짜": "2026-10-01"},
+            {"날짜": "2026-10-01"},
+            {"날짜": "2026-10-03"},
+            {"날짜": "2026-10-06"},  # future relative to through-date; ignored
+            {"날짜": "2026-09-30"},  # other month; ignored
+        ]
+        stats = build_month_activity_v1("2026-10-05", rows)
+        self.assertEqual(stats["cumulative_calls"], 3)
+        self.assertEqual(stats["calendar_days_elapsed"], 5)
+        self.assertEqual(stats["calendar_avg_calls"], 0.6)
+        self.assertEqual(stats["operating_days"], 2)
+        self.assertEqual(stats["workday_avg_calls"], 1.5)
 
 
 if __name__ == "__main__":

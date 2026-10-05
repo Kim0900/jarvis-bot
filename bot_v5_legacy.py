@@ -2391,63 +2391,72 @@ async def process_daily_history(update, image_bytes: bytes):
 # ══════════════════════════════════════════════
 
 async def calc_official_var_score(날짜: str) -> dict:
-    """카카오 AI 배차 공식 6변수 평가 및 daily_summary 저장"""
-    from datetime import date as _dc
-    today = _dc.today()
+    """Task #27 evidence-backed driver/algorithm context.
+
+    Unsupported algorithm probabilities or driver-quality variables are never
+    synthesized. Canonical trip rows provide only observed activity. Acceptance
+    rate is emitted only when received/accepted counts exist; SEKUTI fields are
+    emitted only when an actual record exists.
+    """
+    from daily_operation_report_v1 import build_month_activity_v1
+
     mo = 날짜[:7]
+    canonical_month = await sb_select_canonical(f"{mo}-01", 날짜)
+    month_stats = build_month_activity_v1(날짜, canonical_month)
+    daily_completed = sum(1 for r in canonical_month if str(r.get("날짜") or "") == 날짜)
 
-    # var_2: 오늘 운행완료수
-    calls_today = await sb_select_calls( {"날짜": f"eq.{날짜}"})
-    daily_completed = len(calls_today)
+    summary_rows = await sb_select("daily_summary", {"날짜": f"eq.{날짜}", "limit": "1"})
+    summary = summary_rows[0] if summary_rows else {}
+    received = _safe_int(summary.get("수신건수")) or 0
+    accepted = _safe_int(summary.get("수락건수")) or 0
+    acceptance_rate = round(accepted / received * 100, 1) if received > 0 else None
 
-    # var_2: 이번달 일평균
-    calls_month = await sb_select_calls( {
-        "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
+    sekuti_rows = await sb_select("sekuti_weekly", {
+        "기록일": f"lte.{날짜}",
+        "order": "기록일.desc",
+        "limit": "1",
     })
-    from datetime import date as _d2
-    days_so_far = (_d2.today() - _d2(int(mo[:4]), int(mo[5:7]), 1)).days + 1
-    # 명령서 #010 대응(2026-07-08): 행 개수가 아닌 건수 가중 합계로 수정
-    month_weighted_count = sum(_extract_count(c) for c in calls_month)
-    monthly_avg = month_weighted_count / max(days_so_far, 1)
-
-    # var_3·4: sekuti에서 조회 (현재 0으로 고정 — 마스터 등급)
-    avoid_count = 0
-    one_star_count = 0
-
-    # var_5: 수락률 (현재 100% 유지 중)
-    acceptance_rate = 100
-
-    # AI 진입 추정 (운행완료수 기반)
-    AREA_AVG_LOW, AREA_AVG_HIGH = 18, 25
-    if monthly_avg >= AREA_AVG_HIGH:
-        ai_estimate = "85%+"
-    elif monthly_avg >= AREA_AVG_LOW:
-        ai_estimate = f"{int(60 + (monthly_avg-AREA_AVG_LOW)/(AREA_AVG_HIGH-AREA_AVG_LOW)*25)}%"
-    else:
-        ai_estimate = f"{int(40 + monthly_avg/AREA_AVG_LOW*20)}%"
+    sekuti = sekuti_rows[0] if sekuti_rows else None
 
     score = {
         "date": 날짜,
+        "status": "EVIDENCE_ONLY_NO_ALGORITHM_MODEL",
         "vars": {
-            "var_1_acceptance_prob": "양호" if len(calls_month) >= 30 else "데이터 축적 중",
+            "var_1_acceptance_prob": None,
             "var_2_daily_completed": daily_completed,
-            "var_2_monthly_avg": round(monthly_avg, 1),
-            "var_2_area_avg_est": f"{AREA_AVG_LOW}~{AREA_AVG_HIGH}",
-            "var_3_avoid_count_monthly": avoid_count,
-            "var_4_one_star_monthly": one_star_count,
+            "var_2_monthly_avg": month_stats["calendar_avg_calls"],
+            "var_2_workday_avg": month_stats["workday_avg_calls"],
+            "var_2_area_avg_est": None,
+            "var_3_avoid_count_monthly": None,
+            "var_4_one_star_monthly": None,
             "var_5_acceptance_rate": acceptance_rate,
-            "var_6_eta_score": "위치 의존"
+            "var_6_eta_score": None,
         },
-        "weak_var": "var_2_daily_completed",
-        "ai_inclusion_estimate": ai_estimate,
-        "improvement_needed": "운행 시간 확대 + 매일 운행" if monthly_avg < AREA_AVG_LOW else "유지"
+        "driver_quality": {
+            "sekuti_record_date": str(sekuti.get("기록일")) if sekuti else None,
+            "kakao_rating": sekuti.get("kakao_평점") if sekuti else None,
+            "overall_score": sekuti.get("종합평점") if sekuti else None,
+            "grade": sekuti.get("등급") if sekuti else None,
+        },
+        "data_quality": {
+            "canonical_activity": "AVAILABLE",
+            "acceptance": "AVAILABLE" if acceptance_rate is not None else "MISSING",
+            "sekuti": "AVAILABLE" if sekuti else "MISSING",
+            "avoid_count": "NO_SOURCE",
+            "one_star_count": "NO_SOURCE",
+            "eta_score": "NO_VALIDATED_MODEL",
+        },
+        "weak_var": None,
+        "ai_inclusion_estimate": None,
+        "improvement_needed": None,
+        "month_activity": month_stats,
     }
 
-    # daily_summary에 upsert
-    await sb_h("POST", f"daily_summary",
+    await sb_h(
+        "POST", "daily_summary",
         json={"날짜": 날짜, "official_var_score": score},
         headers={**HEADERS_SB, "Prefer": "resolution=merge-duplicates,return=minimal"},
-        params={"on_conflict": "날짜"}
+        params={"on_conflict": "날짜"},
     )
     return score
 
@@ -2606,83 +2615,38 @@ def _extract_count(c: dict) -> int:
 
 
 async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
-    """캐스퍼 명령서 #008 §3 반영 — daily_summary KPI 4종 봇 자체 계산
-    (아르고스 브리핑 텍스트 파싱 방식 폐기, raw_calls/daily_summary 원본 직접 집계로 전환)
+    """Task #27 KPI metrics from the same canonical trip population as Section A.
 
-    kpi_7day_avg: 반드시 축B(카카오T, 00시 기준 달력일, 콜 없는 날은 0) 기준.
-    raw_calls의 '날짜'는 축A(영업일, 저녁 시작 기준) 라벨이므로,
-    00~05시 배차 콜은 실제로는 다음 캘린더일 새벽 연장 운행 → 익일로 재귀속해서 집계.
-
-    2026-07-08 수정: 앱(index.html)에서 영수증 하루치를 요약 1행으로 저장하는 경우
-    (예: 12건이 한 행에 뭉쳐 요금 합계만 기록) raw_calls "행 개수"를 그대로 건수로 세면
-    과소집계된다. ①번(누적산출)에서 이미 적용한 것과 동일하게, 비고 텍스트의
-    "건수 N건" 패턴에서 실제 건수를 역추출해서 가중 집계하도록 보정.
+    No legacy raw_calls rows or summary-row weighting are used here. Calendar
+    days with no canonical Kakao trips remain zero in the seven-day denominator.
     """
     from datetime import date as _dc, timedelta as _td
 
     target = _dc.fromisoformat(날짜)
-    window_start = (target - _td(days=7)).isoformat()
+    window_start = (target - _td(days=6)).isoformat()
+    rows = await sb_select_canonical(window_start, 날짜)
 
-    # 명령서 #012 반영(2026-07-09): raw_calls에 축A/축B 라벨이 섞여 있으므로,
-    # 축B 전용 지표(kpi_7day_avg, kpi_longdist_rate)는 date_axis='B' 행만 사용.
-    # kpi_avg_fare(오늘 평일단가)는 오늘 하루치 실적 확인용이라 축 구분 없이
-    # 전체 사용 — 아래에서 today_kakao는 window_calls 전체 기준으로 별도 처리.
-    window_calls_all = await sb_select_calls( {
-        "and": f"(날짜.gte.{window_start},날짜.lte.{날짜})"
-    }) or []
-    # task_id=11 명명표준화 대비(2026-08-22): DB값이 'B'->'calendar_day'로
-    # 리네이밍될 예정이라, 전환기간 안전을 위해 신값/구값 둘 다 인식하도록 처리.
-    window_calls = [c for c in window_calls_all if (c.get("date_axis") or "calendar_day") in ("B", "calendar_day")]
-
-    # 명령서 #009 재검증(2026-07-08) 결과 반영: 자동 +1일 보정 제거.
-    # 이지스가 업로드하는 raw_calls는 아르고스가 명령서#020·#021-rev1 자정분리
-    # 원칙으로 이미 축B(달력일) 확정 처리한 뒤 적재하므로, 날짜 필드가
-    # 이미 정확한 캘린더일이다. 여기에 "00~05시는 +1일" 자동 보정을 또 걸면
-    # 이중 보정이 되어 날짜가 잘못 밀린다(실측 CSV 대조로 확인, 오차 12→8로 개선).
-    # 향후 raw_calls에 날짜 라벨링 기준(축A/축B)을 구분하는 컬럼이 생기기 전까지는
-    # 날짜 필드를 그대로 신뢰하는 것이 자동 보정보다 정확하다.
-    def _axis_b_date(축a_날짜, 배차시각):
-        return 축a_날짜
-
-    # 축B 일별 카카오T 완료건수 (최근 7일, 콜 없는 날은 0으로 유지) — 건수 가중 집계
     axis_b_counts = {(target - _td(days=6 - i)).isoformat(): 0 for i in range(7)}
-    for c in window_calls:
-        if (c.get("콜유형") or "") != "카카오T":
-            continue
-        b_date = _axis_b_date(c.get("날짜"), c.get("배차시각"))
-        if b_date in axis_b_counts:
-            axis_b_counts[b_date] += _extract_count(c)
+    kakao_rows = [r for r in rows if str(r.get("canonical_platform") or "") == "KAKAO"]
+    for r in kakao_rows:
+        d = str(r.get("날짜") or "")
+        if d in axis_b_counts:
+            axis_b_counts[d] += 1
     kpi_7day_avg = round(sum(axis_b_counts.values()) / 7, 2)
 
-    # 평균단가 — 오늘 카카오T 콜 기준(축 구분 없이 전체), 평일(월~금)만 산출. 건수 가중 평균.
-    weekday = target.weekday()  # 0=월 ... 5=토 6=일
-    today_kakao = [c for c in window_calls_all
-                   if c.get("날짜") == 날짜 and (c.get("콜유형") or "") == "카카오T"]
+    today_kakao = [r for r in kakao_rows if str(r.get("날짜") or "") == 날짜]
+    weekday = target.weekday()
     if weekday <= 4 and today_kakao:
-        total_fare = sum(c.get("요금", 0) or 0 for c in today_kakao)
-        total_cnt = sum(_extract_count(c) for c in today_kakao)
-        kpi_avg_fare = int(total_fare / total_cnt) if total_cnt else None
+        kpi_avg_fare = int(sum(_safe_int(r.get("요금")) or 0 for r in today_kakao) / len(today_kakao))
     else:
         kpi_avg_fare = None
 
-    # 장거리 비율 — 7일 윈도우, 카카오T, 15,000원 이상.
-    # 요약행은 건당 평균요금(요금/건수)으로 개별 콜의 장거리 여부를 근사 추정.
-    week_kakao = [c for c in window_calls if (c.get("콜유형") or "") == "카카오T"]
-    if week_kakao:
-        total_trips = 0
-        longdist_trips = 0
-        for c in week_kakao:
-            cnt = _extract_count(c)
-            fare = c.get("요금", 0) or 0
-            per_trip_fare = fare / cnt if cnt else fare
-            total_trips += cnt
-            if per_trip_fare >= 15000:
-                longdist_trips += cnt
-        kpi_longdist_rate = round(longdist_trips / total_trips * 100, 1) if total_trips else None
+    if kakao_rows:
+        longdist_trips = sum(1 for r in kakao_rows if (_safe_int(r.get("요금")) or 0) >= 15000)
+        kpi_longdist_rate = round(longdist_trips / len(kakao_rows) * 100, 1)
     else:
         kpi_longdist_rate = None
 
-    # 시간당 매출
     kpi_hourly_revenue = int(매출 / work_hours) if work_hours and work_hours > 0 else None
 
     return {
@@ -2690,6 +2654,8 @@ async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
         "kpi_avg_fare": kpi_avg_fare,
         "kpi_longdist_rate": kpi_longdist_rate,
         "kpi_hourly_revenue": kpi_hourly_revenue,
+        "source": "canonical_raw_calls_v1",
+        "date_basis": "calendar_day",
     }
 
 
@@ -2707,12 +2673,10 @@ async def handle_briefing(update, date_str: str = None):
     daily_report = await get_daily_operation_report_v1(날짜)
     section_a = build_briefing_section_a_v1(daily_report)
 
-    # Legacy raw_calls population remains only for B~G during the staged
-    # migration. It must never overwrite Section A canonical values.
+    # Legacy same-day rows are retained only to estimate work-span until the
+    # canonical report exposes exact first/last timestamps. They never define
+    # Section A, monthly activity, algorithm claims, or KPI trip population.
     calls = await sb_select_calls( {"날짜": f"eq.{날짜}"})
-    calls_month = await sb_select_calls( {
-        "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
-    })
 
     total = len(calls)
     매출 = sum(c.get("요금", 0) or 0 for c in calls)
@@ -2724,54 +2688,49 @@ async def handle_briefing(update, date_str: str = None):
             날짜, section_a["calls"], section_a["revenue"], total, 매출,
         )
 
-    from datetime import date as _d2
-    days_so_far = (_d2.today() - _d2(int(mo[:4]), int(mo[5:7]), 1)).days + 1
-    # 명령서 #010 대응(2026-07-08): 행 개수가 아닌 건수 가중 합계로 수정.
-    # 또한 아르고스 실측치(일평균 10~15건)와의 괴리 원인이 분모 정의 차이일 가능성이 높아,
-    # 캘린더일 기준 월평균과 별도로 "운행일 기준 평균"도 함께 계산해 브리핑에 병기.
-    # 아르고스 방법론 확정 회신 오기 전까지는 두 수치를 나란히 보여줘서 비교 가능하게 함.
-    month_weighted_count = sum(_extract_count(c) for c in calls_month)
-    monthly_avg_calls = month_weighted_count / max(days_so_far, 1)
-    operating_days = len(set(c.get("날짜") for c in calls_month if c.get("날짜")))
-    workday_avg_calls = month_weighted_count / operating_days if operating_days else 0.0
-
-    # 공식 6변수 평가
+    # Evidence-backed algorithm/driver context. Unsupported variables remain
+    # None/MISSING instead of receiving optimistic defaults.
     var_score = await calc_official_var_score(날짜)
+    month_activity = var_score["month_activity"]
+    monthly_avg_calls = float(month_activity["calendar_avg_calls"])
+    workday_avg_calls = float(month_activity["workday_avg_calls"])
+    acceptance_rate = var_score["vars"].get("var_5_acceptance_rate")
+    acceptance_text = f"{acceptance_rate:.1f}%" if acceptance_rate is not None else "미확인(수신/수락 데이터 없음)"
+    rating = (var_score.get("driver_quality") or {}).get("kakao_rating")
+    rating_text = str(rating) if rating is not None else "미확인(SEKUTI 데이터 없음)"
 
-    # 7섹션 구성
+    # 7섹션 구성 — 관측값과 미검증 영역을 명확히 분리.
     lines = [
         f"═══ 자비스 브리핑 {날짜} ═══",
-        f"",
-        f"[A] 운행 데이터",
+        "",
+        "[A] 운행 데이터",
         f"  콜수: {section_a['calls']}건 | 매출: {fmt(section_a['revenue'])}",
         f"  건당단가: {fmt(section_a['avg_fare'])}원",
-        f"",
-        f"[B] 카카오 알고리즘 관점",
-        f"  ② 오늘 완료수: {total}건 (월평균 {monthly_avg_calls:.1f}건 · 운행일평균 {workday_avg_calls:.1f}건)",
-        f"  ⑤ 수락률: 100% ✅",
-        f"  AI 진입 추정: {var_score['ai_inclusion_estimate']}",
-        f"  약점: {var_score['improvement_needed']}",
-        f"",
-        f"[C] 확률 분포",
-        f"  건당단가 {fmt(avg_fare)}원",
-        f"  {'목표단가 초과 ✅' if avg_fare >= 10000 else '목표단가 미달 (10,000원 목표)'}",
-        f"",
-        f"[D] 운빨 vs 추세",
-        f"  오늘: {total}건 / 월평균: {monthly_avg_calls:.1f}건 / 운행일평균: {workday_avg_calls:.1f}건",
-        f"  {'▲ 추세 우위' if total >= monthly_avg_calls else '▼ 추세 하회'}",
-        f"",
-        f"[E] 종합 진단",
-        f"  운행완료수 약점 {'개선 중 📈' if monthly_avg_calls >= 12 else '강화 필요 ⚠️'}",
-        f"  수락률·평점·만나지않기 모두 최고 ✅",
-        f"",
-        f"[F] 다음 운행 전략",
-        f"  19~21시 수성구 집중 → 21시 성내2동 앵커",
-        f"  수락률 100% 유지 (콜 거절 금지)",
-        f"  목표: {max(0, 18-total)}건 이상 추가 달성",
-        f"",
-        f"[G] 베이지안 업데이트",
-        f"  오늘 {total}건 반영 완료",
-        f"  누적 {len(calls_month)}건 → 모델 정밀도 {min(95, 60 + len(calls_month)//10)}%",
+        "",
+        "[B] 카카오 알고리즘 관점",
+        f"  오늘 완료수: {section_a['calls']}건 (월평균 {monthly_avg_calls:.1f}건 · 운행일평균 {workday_avg_calls:.1f}건)",
+        f"  수락률: {acceptance_text}",
+        f"  카카오 평점: {rating_text}",
+        "  AI 진입 확률: 미검증(검증된 배차 확률 모델 없음)",
+        "",
+        "[C] 단가 현황",
+        f"  건당단가 {fmt(section_a['avg_fare'])}원",
+        f"  {'목표단가 초과 ✅' if section_a['avg_fare'] >= 10000 else '목표단가 미달 (10,000원 목표)'}",
+        "",
+        "[D] 운행 추세",
+        f"  오늘: {section_a['calls']}건 / 월평균: {monthly_avg_calls:.1f}건 / 운행일평균: {workday_avg_calls:.1f}건",
+        f"  {'▲ 월 캘린더 평균 상회' if section_a['calls'] >= monthly_avg_calls else '▼ 월 캘린더 평균 하회'}",
+        "",
+        "[E] 데이터 진단",
+        f"  canonical 운행집합: 사용 중 ({section_a['source']})",
+        f"  수락률: {var_score['data_quality']['acceptance']} | SEKUTI: {var_score['data_quality']['sekuti']}",
+        "  만나지않기·1점평점: 현재 검증 가능한 수집원 없음",
+        "",
+        "[F] 다음 운행 전략",
+        "  자동 고정전략 비활성 — ARGOS 정밀 분석에서 별도 산출",
+        "",
+        "[G] 베이지안 업데이트",
+        "  정식 Bayesian 상태 저장소 미연동 — 정확도/사후확률 수치 미제공",
     ]
 
     # DB 저장
@@ -2779,11 +2738,16 @@ async def handle_briefing(update, date_str: str = None):
         "run_date": 날짜,
         "section_a": section_a,
         "section_b": var_score,
-        "section_c": {"avg_fare": avg_fare, "target": 10000},
-        "section_d": {"today": total, "monthly_avg": round(monthly_avg_calls, 1)},
-        "section_e": f"운행완료수 {'개선중' if monthly_avg_calls >= 12 else '강화필요'}",
-        "section_f": "19~21 수성구 → 21시 성내2동 앵커, 수락률 100% 유지",
-        "section_g": {"cumulative": len(calls_month), "model_accuracy": min(95, 60+len(calls_month)//10)}
+        "section_c": {"avg_fare": section_a["avg_fare"], "target": 10000, "source": section_a["source"]},
+        "section_d": {
+            "today": section_a["calls"],
+            "monthly_avg": round(monthly_avg_calls, 1),
+            "workday_avg": round(workday_avg_calls, 1),
+            "source": "canonical_raw_calls_v1",
+        },
+        "section_e": "관측값과 미검증 변수 분리; 수락률/SEKUTI/행동품질은 실데이터 있을 때만 표시",
+        "section_f": "자동 고정전략 비활성 — ARGOS 정밀 분석에서 별도 산출",
+        "section_g": {"status": "NOT_CONNECTED", "note": "정식 Bayesian 상태 저장소 미연동"},
     }
     await sb_h("POST", "daily_briefing",
         json=briefing_data,
@@ -2822,7 +2786,7 @@ async def handle_briefing(update, date_str: str = None):
                 "work_hours": work_hours
             })
 
-        kpi = await calc_kpi_metrics(날짜, 매출, work_hours)
+        kpi = await calc_kpi_metrics(날짜, section_a["revenue"], work_hours)
         summary_payload.update(kpi)
 
         await sb_upsert("daily_summary", summary_payload, on_conflict="날짜")
@@ -2838,23 +2802,9 @@ async def handle_briefing(update, date_str: str = None):
     uber_n  = section_a["platform"]["uber"]
     bhw_n   = section_a["platform"]["roam_confirmed"]
 
-    # 절벽구간(간이 산정): 오늘 콜 간 40분 이상 공백 — GPX 교차검증 없는 raw_calls 시각만의 근사치.
-    # 아르고스의 정식 Dead Zone 분석(GPX 이동 여부 확인 포함)과는 다른, 봇 자체의 단순 근사값임을 명시.
-    def _gap_stats(calls, threshold_min=40):
-        times = [t for t in (c.get("배차시각") for c in calls) if t]
-        if len(times) < 2:
-            return 0, 0
-        mins_sorted = sorted(_to_virtual_min(t) for t in times)
-        gap_count = 0
-        gap_total = 0
-        for i in range(1, len(mins_sorted)):
-            gap = mins_sorted[i] - mins_sorted[i-1]
-            if gap >= threshold_min:
-                gap_count += 1
-                gap_total += gap
-        return gap_total, gap_count
-
-    gap_total_min, gap_count = _gap_stats(calls)
+    gap_info = daily_report.get("gap") or {}
+    max_gap_min = gap_info.get("max_gap_min")
+    gap_partial = bool(gap_info.get("partial"))
 
     kpi_7day = kpi.get("kpi_7day_avg")
     kpi_fare = kpi.get("kpi_avg_fare")
@@ -2892,7 +2842,7 @@ async def handle_briefing(update, date_str: str = None):
         f"평균단가 {(fmt(kpi_fare) if kpi_fare is not None else '-원')} "
         f"(기준10,000원 대비 {'✅' if (kpi_fare or 0) >= 10000 else '❌'})\n"
         f"KPI 판정: {kpi_met}/4 충족\n"
-        f"절벽구간: {gap_total_min}분 ({gap_count}건, 간이산정)\n"
+        f"최대 운행간극: {(str(max_gap_min) + '분') if max_gap_min is not None else '산출불가'} (하차→다음 배차{' · 부분자료' if gap_partial else ''})\n"
         f"오늘 요약: 콜 {section_a['calls']}건 · 매출 {fmt(section_a['revenue'])} 기록\n"
         f"→ 전체 브리핑은 첨부파일 참고\n"
         f"→ 아르고스 정밀 분석은 별도로 브리핑 확인"

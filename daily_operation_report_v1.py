@@ -187,3 +187,32 @@ def build_briefing_section_a_v1(report):
         },
     }
 
+def build_month_activity_v1(date_value, canonical_rows):
+    """Deterministic calendar-month activity stats from canonical trip rows.
+
+    Rows after date_value are ignored. Empty calendar days remain in the
+    denominator for calendar_avg_calls, while workday_avg_calls uses only dates
+    with at least one canonical trip.
+    """
+    from datetime import date as _date
+
+    target = _date.fromisoformat(str(date_value))
+    month_prefix = target.strftime("%Y-%m")
+    rows = [
+        r for r in (canonical_rows or [])
+        if str(r.get("날짜") or "").startswith(month_prefix)
+        and str(r.get("날짜") or "") <= str(date_value)
+    ]
+    operating_days = sorted({str(r.get("날짜")) for r in rows if r.get("날짜")})
+    count = len(rows)
+    return {
+        "date_basis": "calendar_day",
+        "month": month_prefix,
+        "through_date": str(date_value),
+        "cumulative_calls": count,
+        "calendar_days_elapsed": target.day,
+        "calendar_avg_calls": round(count / max(target.day, 1), 2),
+        "operating_days": len(operating_days),
+        "workday_avg_calls": round(count / len(operating_days), 2) if operating_days else 0.0,
+    }
+
