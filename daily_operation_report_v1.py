@@ -146,3 +146,44 @@ def build_daily_operation_report_v1(date_value, canonical_rows, s700_rows=None):
         "gap": gap_summary,
         "roaming_candidate": roaming_candidate,
     }
+
+def build_briefing_section_a_v1(report):
+    """Map the canonical daily report to the stable briefing Section A contract.
+
+    This function is intentionally pure so Section A can be regression-tested
+    without importing Telegram/bot runtime code. Missing or wrong report
+    versions fail closed; callers must not silently fall back to raw_calls.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("daily_operation_report_v1 report required")
+    if report.get("version") != "daily_operation_report_v1":
+        raise ValueError("unexpected daily operation report version")
+    if report.get("date_basis") != "calendar_day":
+        raise ValueError("Section A requires calendar_day canonical report")
+
+    platform = report.get("platform") or {}
+
+    def _platform_count(name):
+        value = platform.get(name) or {}
+        return _int(value.get("count"))
+
+    roaming = report.get("roaming_candidate") or {}
+    return {
+        "source": "daily_operation_report_v1",
+        "date_basis": "calendar_day",
+        "calls": _int(report.get("total_count")),
+        "revenue": _int(report.get("total_revenue")),
+        "avg_fare": _int(report.get("avg_fare")),
+        "platform": {
+            "kakao": _platform_count("KAKAO"),
+            "uber": _platform_count("UBER"),
+            "roam_confirmed": _platform_count("ROAM"),
+        },
+        "weak_identity_candidate_rows": _int(report.get("weak_identity_candidate_rows")),
+        "roaming_candidate": {
+            "candidate_only": bool(roaming.get("candidate_only", True)),
+            "count": _int(roaming.get("count")),
+            "revenue": _int(roaming.get("revenue")),
+        },
+    }
+
