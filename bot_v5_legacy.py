@@ -2659,6 +2659,18 @@ async def calc_kpi_metrics(날짜: str, 매출: int, work_hours) -> dict:
     }
 
 
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram /briefing [오늘|어제|YYYY-MM-DD]."""
+    from daily_operation_report_v1 import resolve_briefing_date_v1
+    token = context.args[0] if getattr(context, "args", None) else None
+    try:
+        target = resolve_briefing_date_v1(token)
+    except ValueError:
+        await update.message.reply_text("❌ 형식: /briefing [오늘|어제|YYYY-MM-DD]")
+        return
+    await handle_briefing(update, target)
+
+
 async def handle_briefing(update, date_str: str = None):
     """매 운행 후 7섹션 통합 브리핑"""
     from datetime import date as _dc
@@ -8572,6 +8584,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ("브리핑", "오늘브리핑", "오늘 브리핑"):
         await handle_briefing(update)
         return
+    if text in ("어제브리핑", "어제 브리핑"):
+        from daily_operation_report_v1 import resolve_briefing_date_v1
+        await handle_briefing(update, resolve_briefing_date_v1("어제"))
+        return
+    _brief_m = _re.match(r"^브리핑\s+(\d{4}-\d{2}-\d{2})$", text.strip())
+    if _brief_m:
+        from daily_operation_report_v1 import resolve_briefing_date_v1
+        try:
+            await handle_briefing(update, resolve_briefing_date_v1(_brief_m.group(1)))
+        except ValueError:
+            await update.message.reply_text("❌ 형식: 브리핑 YYYY-MM-DD")
+        return
 
     # 운행완료수
     if text in ("운행완료수", "완료수", "ai진입"):
@@ -8779,7 +8803,7 @@ def main():
     app.add_handler(CommandHandler("avoid", cmd_avoid))  # 회피 구역 조회
     app.add_handler(CommandHandler("forecast", lambda u,c: handle_forecast(u, c.args[0] if c.args else None)))
     app.add_handler(CommandHandler("completion_status", lambda u,c: handle_completion_status(u)))
-    app.add_handler(CommandHandler("briefing", lambda u,c: handle_briefing(u)))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

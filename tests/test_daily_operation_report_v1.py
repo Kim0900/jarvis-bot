@@ -1,6 +1,6 @@
 import unittest
 
-from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1, build_month_activity_v1
+from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1, build_month_activity_v1, resolve_briefing_date_v1
 
 
 class DailyOperationReportV1Tests(unittest.TestCase):
@@ -110,6 +110,15 @@ class DailyOperationReportV1Tests(unittest.TestCase):
         self.assertEqual(stats["calendar_avg_calls"], 0.6)
         self.assertEqual(stats["operating_days"], 2)
         self.assertEqual(stats["workday_avg_calls"], 1.5)
+
+
+    def test_resolve_briefing_date_v1(self):
+        self.assertEqual(resolve_briefing_date_v1(None, "2026-10-05"), "2026-10-05")
+        self.assertEqual(resolve_briefing_date_v1("오늘", "2026-10-05"), "2026-10-05")
+        self.assertEqual(resolve_briefing_date_v1("어제", "2026-10-05"), "2026-10-04")
+        self.assertEqual(resolve_briefing_date_v1("2026-10-04", "2026-10-05"), "2026-10-04")
+        with self.assertRaises(ValueError):
+            resolve_briefing_date_v1("10/4", "2026-10-05")
 
 
 if __name__ == "__main__":
