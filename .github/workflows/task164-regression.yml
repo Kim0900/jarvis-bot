@@ -60,5 +60,7 @@ jobs:
           python -m py_compile             uber_trip_parser.py             daily_operation_report_v1.py             canonical_runtime_audit.py             canonical_access_v1.py             canonical_identity_v1.py             daily_history_primary_adapter.py             image_retry_policy.py             bot_v5_legacy.py             s700_rematch_trigger.py             daily_history_layout_parser.py             daily_history_parser.py             scripts/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_layout_parser.py             tesseract-ocr-service/daily_history_overlay_poc.py             tesseract-ocr-service/daily_history_parser.py
       - name: Task164 deterministic regression
         run: python -m unittest tests.test_daily_history_layout_parser -v
+      - name: Task27 daily operation report regression
+        run: python -m unittest tests.test_daily_operation_report_v1 -v
       - name: S700 coalesced rematch regression
         run: python -m unittest tests.test_s700_rematch_trigger -v
