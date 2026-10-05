@@ -1,6 +1,6 @@
 import unittest
 
-from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1, build_month_activity_v1, resolve_briefing_date_v1
+from daily_operation_report_v1 import build_briefing_section_a_v1, build_daily_operation_report_v1, build_month_activity_v1, build_snapshot_briefing_metrics_v1, resolve_briefing_date_v1
 
 
 class DailyOperationReportV1Tests(unittest.TestCase):
@@ -119,6 +119,43 @@ class DailyOperationReportV1Tests(unittest.TestCase):
         self.assertEqual(resolve_briefing_date_v1("2026-10-04", "2026-10-05"), "2026-10-04")
         with self.assertRaises(ValueError):
             resolve_briefing_date_v1("10/4", "2026-10-05")
+
+
+    def test_snapshot_briefing_metrics_v1(self):
+        metrics = build_snapshot_briefing_metrics_v1(
+            "2026-10-04",
+            {
+                "calc_date": "2026-10-04",
+                "axis": "A",
+                "call_count": 8,
+                "avg_fare": "8575.00",
+                "max_interval_min": "72.00",
+                "unclassified_flag": False,
+            },
+            {
+                "calc_date": "2026-10-04",
+                "window_start": "2026-09-28",
+                "window_end": "2026-10-04",
+                "total_count": 48,
+                "daily_average": "6.86",
+                "status": "CRITICAL",
+            },
+        )
+        self.assertEqual(metrics["source"], "daily_calc_snapshot+kpi_7day_snapshot")
+        self.assertEqual(metrics["daily_call_count"], 8)
+        self.assertEqual(metrics["daily_avg_fare"], 8575)
+        self.assertEqual(metrics["daily_max_interval_min"], 72.0)
+        self.assertEqual(metrics["kpi_7day_total"], 48)
+        self.assertEqual(metrics["kpi_7day_avg"], 6.86)
+        self.assertEqual(metrics["kpi_status"], "CRITICAL")
+
+    def test_snapshot_briefing_metrics_fails_closed(self):
+        with self.assertRaises(ValueError):
+            build_snapshot_briefing_metrics_v1(
+                "2026-10-04",
+                {"calc_date": "2026-10-04", "axis": "B"},
+                {"calc_date": "2026-10-04"},
+            )
 
 
 if __name__ == "__main__":

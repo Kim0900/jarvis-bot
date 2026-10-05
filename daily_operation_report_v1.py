@@ -236,3 +236,42 @@ def resolve_briefing_date_v1(arg=None, today_value=None):
         return _date.fromisoformat(token).isoformat()
     except Exception as exc:
         raise ValueError("briefing date must be 오늘/어제/YYYY-MM-DD") from exc
+
+
+def build_snapshot_briefing_metrics_v1(run_date, daily_snapshot, kpi_snapshot):
+    """Normalize official snapshot rows for Task #27 briefing assembly.
+
+    The briefing layer must not recompute these metrics. It only reads the
+    authoritative Render-produced daily_calc_snapshot(axis A) and
+    kpi_7day_snapshot(axis B) rows for the requested date.
+    """
+    if not isinstance(daily_snapshot, dict) or not daily_snapshot:
+        raise ValueError("daily_calc_snapshot axis A row required")
+    if not isinstance(kpi_snapshot, dict) or not kpi_snapshot:
+        raise ValueError("kpi_7day_snapshot row required")
+
+    if str(daily_snapshot.get("calc_date")) != str(run_date):
+        raise ValueError("daily snapshot date mismatch")
+    if str(daily_snapshot.get("axis")) != "A":
+        raise ValueError("daily snapshot axis A required")
+    if str(kpi_snapshot.get("calc_date")) != str(run_date):
+        raise ValueError("kpi snapshot date mismatch")
+
+    avg_fare = daily_snapshot.get("avg_fare")
+    max_interval = daily_snapshot.get("max_interval_min")
+    daily_average = kpi_snapshot.get("daily_average")
+
+    return {
+        "daily_axis": "A",
+        "daily_call_count": _int(daily_snapshot.get("call_count")),
+        "daily_avg_fare": int(round(float(avg_fare))) if avg_fare is not None else None,
+        "daily_max_interval_min": float(max_interval) if max_interval is not None else None,
+        "daily_unclassified": bool(daily_snapshot.get("unclassified_flag")),
+        "kpi_axis": "B",
+        "kpi_7day_total": _int(kpi_snapshot.get("total_count")),
+        "kpi_7day_avg": float(daily_average) if daily_average is not None else None,
+        "kpi_status": kpi_snapshot.get("status"),
+        "window_start": str(kpi_snapshot.get("window_start")) if kpi_snapshot.get("window_start") is not None else None,
+        "window_end": str(kpi_snapshot.get("window_end")) if kpi_snapshot.get("window_end") is not None else None,
+        "source": "daily_calc_snapshot+kpi_7day_snapshot",
+    }
