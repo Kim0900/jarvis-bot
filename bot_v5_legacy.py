@@ -2673,12 +2673,10 @@ async def handle_briefing(update, date_str: str = None):
     daily_report = await get_daily_operation_report_v1(날짜)
     section_a = build_briefing_section_a_v1(daily_report)
 
-    # Legacy raw_calls population remains only for B~G during the staged
-    # migration. It must never overwrite Section A canonical values.
+    # Legacy same-day rows are retained only to estimate work-span until the
+    # canonical report exposes exact first/last timestamps. They never define
+    # Section A, monthly activity, algorithm claims, or KPI trip population.
     calls = await sb_select_calls( {"날짜": f"eq.{날짜}"})
-    calls_month = await sb_select_calls( {
-        "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
-    })
 
     total = len(calls)
     매출 = sum(c.get("요금", 0) or 0 for c in calls)
@@ -2690,54 +2688,49 @@ async def handle_briefing(update, date_str: str = None):
             날짜, section_a["calls"], section_a["revenue"], total, 매출,
         )
 
-    from datetime import date as _d2
-    days_so_far = (_d2.today() - _d2(int(mo[:4]), int(mo[5:7]), 1)).days + 1
-    # 명령서 #010 대응(2026-07-08): 행 개수가 아닌 건수 가중 합계로 수정.
-    # 또한 아르고스 실측치(일평균 10~15건)와의 괴리 원인이 분모 정의 차이일 가능성이 높아,
-    # 캘린더일 기준 월평균과 별도로 "운행일 기준 평균"도 함께 계산해 브리핑에 병기.
-    # 아르고스 방법론 확정 회신 오기 전까지는 두 수치를 나란히 보여줘서 비교 가능하게 함.
-    month_weighted_count = sum(_extract_count(c) for c in calls_month)
-    monthly_avg_calls = month_weighted_count / max(days_so_far, 1)
-    operating_days = len(set(c.get("날짜") for c in calls_month if c.get("날짜")))
-    workday_avg_calls = month_weighted_count / operating_days if operating_days else 0.0
-
-    # 공식 6변수 평가
+    # Evidence-backed algorithm/driver context. Unsupported variables remain
+    # None/MISSING instead of receiving optimistic defaults.
     var_score = await calc_official_var_score(날짜)
+    month_activity = var_score["month_activity"]
+    monthly_avg_calls = float(month_activity["calendar_avg_calls"])
+    workday_avg_calls = float(month_activity["workday_avg_calls"])
+    acceptance_rate = var_score["vars"].get("var_5_acceptance_rate")
+    acceptance_text = f"{acceptance_rate:.1f}%" if acceptance_rate is not None else "미확인(수신/수락 데이터 없음)"
+    rating = (var_score.get("driver_quality") or {}).get("kakao_rating")
+    rating_text = str(rating) if rating is not None else "미확인(SEKUTI 데이터 없음)"
 
-    # 7섹션 구성
+    # 7섹션 구성 — 관측값과 미검증 영역을 명확히 분리.
     lines = [
         f"═══ 자비스 브리핑 {날짜} ═══",
-        f"",
-        f"[A] 운행 데이터",
+        "",
+        "[A] 운행 데이터",
         f"  콜수: {section_a['calls']}건 | 매출: {fmt(section_a['revenue'])}",
         f"  건당단가: {fmt(section_a['avg_fare'])}원",
-        f"",
-        f"[B] 카카오 알고리즘 관점",
-        f"  ② 오늘 완료수: {total}건 (월평균 {monthly_avg_calls:.1f}건 · 운행일평균 {workday_avg_calls:.1f}건)",
-        f"  ⑤ 수락률: 100% ✅",
-        f"  AI 진입 추정: {var_score['ai_inclusion_estimate']}",
-        f"  약점: {var_score['improvement_needed']}",
-        f"",
-        f"[C] 확률 분포",
-        f"  건당단가 {fmt(avg_fare)}원",
-        f"  {'목표단가 초과 ✅' if avg_fare >= 10000 else '목표단가 미달 (10,000원 목표)'}",
-        f"",
-        f"[D] 운빨 vs 추세",
-        f"  오늘: {total}건 / 월평균: {monthly_avg_calls:.1f}건 / 운행일평균: {workday_avg_calls:.1f}건",
-        f"  {'▲ 추세 우위' if total >= monthly_avg_calls else '▼ 추세 하회'}",
-        f"",
-        f"[E] 종합 진단",
-        f"  운행완료수 약점 {'개선 중 📈' if monthly_avg_calls >= 12 else '강화 필요 ⚠️'}",
-        f"  수락률·평점·만나지않기 모두 최고 ✅",
-        f"",
-        f"[F] 다음 운행 전략",
-        f"  19~21시 수성구 집중 → 21시 성내2동 앵커",
-        f"  수락률 100% 유지 (콜 거절 금지)",
-        f"  목표: {max(0, 18-total)}건 이상 추가 달성",
-        f"",
-        f"[G] 베이지안 업데이트",
-        f"  오늘 {total}건 반영 완료",
-        f"  누적 {len(calls_month)}건 → 모델 정밀도 {min(95, 60 + len(calls_month)//10)}%",
+        "",
+        "[B] 카카오 알고리즘 관점",
+        f"  오늘 완료수: {section_a['calls']}건 (월평균 {monthly_avg_calls:.1f}건 · 운행일평균 {workday_avg_calls:.1f}건)",
+        f"  수락률: {acceptance_text}",
+        f"  카카오 평점: {rating_text}",
+        "  AI 진입 확률: 미검증(검증된 배차 확률 모델 없음)",
+        "",
+        "[C] 단가 현황",
+        f"  건당단가 {fmt(section_a['avg_fare'])}원",
+        f"  {'목표단가 초과 ✅' if section_a['avg_fare'] >= 10000 else '목표단가 미달 (10,000원 목표)'}",
+        "",
+        "[D] 운행 추세",
+        f"  오늘: {section_a['calls']}건 / 월평균: {monthly_avg_calls:.1f}건 / 운행일평균: {workday_avg_calls:.1f}건",
+        f"  {'▲ 월 캘린더 평균 상회' if section_a['calls'] >= monthly_avg_calls else '▼ 월 캘린더 평균 하회'}",
+        "",
+        "[E] 데이터 진단",
+        f"  canonical 운행집합: 사용 중 ({section_a['source']})",
+        f"  수락률: {var_score['data_quality']['acceptance']} | SEKUTI: {var_score['data_quality']['sekuti']}",
+        "  만나지않기·1점평점: 현재 검증 가능한 수집원 없음",
+        "",
+        "[F] 다음 운행 전략",
+        "  자동 고정전략 비활성 — ARGOS 정밀 분석에서 별도 산출",
+        "",
+        "[G] 베이지안 업데이트",
+        "  정식 Bayesian 상태 저장소 미연동 — 정확도/사후확률 수치 미제공",
     ]
 
     # DB 저장
@@ -2745,11 +2738,16 @@ async def handle_briefing(update, date_str: str = None):
         "run_date": 날짜,
         "section_a": section_a,
         "section_b": var_score,
-        "section_c": {"avg_fare": avg_fare, "target": 10000},
-        "section_d": {"today": total, "monthly_avg": round(monthly_avg_calls, 1)},
-        "section_e": f"운행완료수 {'개선중' if monthly_avg_calls >= 12 else '강화필요'}",
-        "section_f": "19~21 수성구 → 21시 성내2동 앵커, 수락률 100% 유지",
-        "section_g": {"cumulative": len(calls_month), "model_accuracy": min(95, 60+len(calls_month)//10)}
+        "section_c": {"avg_fare": section_a["avg_fare"], "target": 10000, "source": section_a["source"]},
+        "section_d": {
+            "today": section_a["calls"],
+            "monthly_avg": round(monthly_avg_calls, 1),
+            "workday_avg": round(workday_avg_calls, 1),
+            "source": "canonical_raw_calls_v1",
+        },
+        "section_e": "관측값과 미검증 변수 분리; 수락률/SEKUTI/행동품질은 실데이터 있을 때만 표시",
+        "section_f": "자동 고정전략 비활성 — ARGOS 정밀 분석에서 별도 산출",
+        "section_g": {"status": "NOT_CONNECTED", "note": "정식 Bayesian 상태 저장소 미연동"},
     }
     await sb_h("POST", "daily_briefing",
         json=briefing_data,
@@ -2788,7 +2786,7 @@ async def handle_briefing(update, date_str: str = None):
                 "work_hours": work_hours
             })
 
-        kpi = await calc_kpi_metrics(날짜, 매출, work_hours)
+        kpi = await calc_kpi_metrics(날짜, section_a["revenue"], work_hours)
         summary_payload.update(kpi)
 
         await sb_upsert("daily_summary", summary_payload, on_conflict="날짜")
@@ -2804,23 +2802,9 @@ async def handle_briefing(update, date_str: str = None):
     uber_n  = section_a["platform"]["uber"]
     bhw_n   = section_a["platform"]["roam_confirmed"]
 
-    # 절벽구간(간이 산정): 오늘 콜 간 40분 이상 공백 — GPX 교차검증 없는 raw_calls 시각만의 근사치.
-    # 아르고스의 정식 Dead Zone 분석(GPX 이동 여부 확인 포함)과는 다른, 봇 자체의 단순 근사값임을 명시.
-    def _gap_stats(calls, threshold_min=40):
-        times = [t for t in (c.get("배차시각") for c in calls) if t]
-        if len(times) < 2:
-            return 0, 0
-        mins_sorted = sorted(_to_virtual_min(t) for t in times)
-        gap_count = 0
-        gap_total = 0
-        for i in range(1, len(mins_sorted)):
-            gap = mins_sorted[i] - mins_sorted[i-1]
-            if gap >= threshold_min:
-                gap_count += 1
-                gap_total += gap
-        return gap_total, gap_count
-
-    gap_total_min, gap_count = _gap_stats(calls)
+    gap_info = daily_report.get("gap") or {}
+    max_gap_min = gap_info.get("max_gap_min")
+    gap_partial = bool(gap_info.get("partial"))
 
     kpi_7day = kpi.get("kpi_7day_avg")
     kpi_fare = kpi.get("kpi_avg_fare")
@@ -2858,7 +2842,7 @@ async def handle_briefing(update, date_str: str = None):
         f"평균단가 {(fmt(kpi_fare) if kpi_fare is not None else '-원')} "
         f"(기준10,000원 대비 {'✅' if (kpi_fare or 0) >= 10000 else '❌'})\n"
         f"KPI 판정: {kpi_met}/4 충족\n"
-        f"절벽구간: {gap_total_min}분 ({gap_count}건, 간이산정)\n"
+        f"최대 운행간극: {(str(max_gap_min) + '분') if max_gap_min is not None else '산출불가'} (하차→다음 배차{' · 부분자료' if gap_partial else ''})\n"
         f"오늘 요약: 콜 {section_a['calls']}건 · 매출 {fmt(section_a['revenue'])} 기록\n"
         f"→ 전체 브리핑은 첨부파일 참고\n"
         f"→ 아르고스 정밀 분석은 별도로 브리핑 확인"
