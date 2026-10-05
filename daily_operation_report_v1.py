@@ -216,3 +216,23 @@ def build_month_activity_v1(date_value, canonical_rows):
         "workday_avg_calls": round(count / len(operating_days), 2) if operating_days else 0.0,
     }
 
+
+
+def resolve_briefing_date_v1(arg=None, today_value=None):
+    """Resolve optional briefing date tokens to YYYY-MM-DD.
+
+    Supported: None/today, '오늘', '어제', or explicit YYYY-MM-DD.
+    Raises ValueError for unsupported tokens to keep production E2E explicit.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    today = _date.fromisoformat(str(today_value)) if today_value is not None else _date.today()
+    token = "" if arg is None else str(arg).strip()
+    if not token or token in ("오늘", "today"):
+        return today.isoformat()
+    if token in ("어제", "yesterday"):
+        return (today - _timedelta(days=1)).isoformat()
+    try:
+        return _date.fromisoformat(token).isoformat()
+    except Exception as exc:
+        raise ValueError("briefing date must be 오늘/어제/YYYY-MM-DD") from exc
