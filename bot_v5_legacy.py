@@ -6806,13 +6806,48 @@ async def run_magi_auto_review_once():
     task = None
     for candidate in rows:
         lane = classify_magi_review_lane(candidate)
-        if lane in ("skip", "cassandra"):
+        current_vs = str(candidate.get("verification_status") or "")
+
+        if lane == "skip":
             continue
 
-        # Default path: deterministic routing only. External providers are not
-        # part of the control-plane success path.
+        if lane == "cassandra":
+            # A verification_required task with no explicit state must not be
+            # silently ignored. Route it deterministically to CASSANDRA once.
+            if not (
+                current_vs.startswith("PENDING_CASSANDRA")
+                or current_vs.startswith("CASSANDRA_")
+            ):
+                task_id = candidate["task_id"]
+                await sb_h(
+                    "PATCH",
+                    f"magi_tasks?task_id=eq.{task_id}",
+                    json={
+                        "verification_status": "PENDING_CASSANDRA",
+                        "waiting_for": candidate.get("waiting_for") or "CASSANDRA independent verification",
+                        "updated_at": datetime.now(KST).isoformat(),
+                    },
+                    headers={**HEADERS_SB, "Prefer": "return=minimal"},
+                )
+                await sb_insert("magi_task_events", {
+                    "task_id": task_id,
+                    "event_type": "AUTO_REVIEW_ROUTED_TO_CASSANDRA",
+                    "actor": "검누리",
+                    "detail": (
+                        "Provider-independent routing: verification_required task routed "
+                        "to CASSANDRA without Anthropic/Gemini call."
+                    ),
+                })
+                logger.info(
+                    "마기자동검증 deterministic route(task#%s): PENDING_CASSANDRA, external_provider=false",
+                    task_id,
+                )
+                return task_id
+            continue
+
+        # Default MAGI path: deterministic routing only. External providers are
+        # not part of the control-plane success path.
         if not external_enabled:
-            current_vs = str(candidate.get("verification_status") or "")
             if current_vs == "PENDING_MAGI":
                 continue
             task_id = candidate["task_id"]
