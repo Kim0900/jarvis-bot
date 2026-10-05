@@ -1,0 +1,28 @@
+name: Task176 MAGI Review Routing
+
+on:
+  pull_request:
+    paths:
+      - "magi_review_policy.py"
+      - "bot_v5_legacy.py"
+      - "tests/test_magi_review_policy.py"
+      - ".github/workflows/task176-magi-review.yml"
+  push:
+    branches: [main]
+    paths:
+      - "magi_review_policy.py"
+      - "bot_v5_legacy.py"
+      - "tests/test_magi_review_policy.py"
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax
+        run: python -m py_compile magi_review_policy.py bot_v5_legacy.py
+      - name: Deterministic review policy regression
+        run: python -m unittest tests.test_magi_review_policy -v
