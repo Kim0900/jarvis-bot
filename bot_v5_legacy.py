@@ -6771,15 +6771,17 @@ def _is_magi_review_provider_unavailable_error(exc: Exception) -> bool:
 
 
 async def run_magi_auto_review_once():
-    """task#52: VERIFICATION+verified_by없음 태스크 1건을 찾아 마기(자동)가 검증.
-    Sonnet 사용, 최대 10회 tool호출 제한.
+    """Provider-independent MAGI verification router.
 
-    task#111(2026-09-05) 근본수정: 재시도 횟수 제한 추가. task#80이
-    verified_by 미기재로 8/30~9/5(6일간) 5분마다 무한재시도되며 Sonnet
-    호출 크레딧을 계속 낭비한 사실을 발견(실제로는 8/30에 이미검증완료,
-    "fish_week_stats 존폐판단"이라는 사람판단 대기항목 하나때문에 verified_by
-    미기재 상태로 방치됨). Haiku오케스트레이션(task#78)과 동일한
-    review_attempts 카운터+한도(5회) 초과시 큐이탈+텔레그램알림 적용."""
+    task#176:
+    - Verification ownership is determined before any external AI call.
+    - CASSANDRA-required/final/hold tasks never enter the MAGI LLM queue.
+    - External LLM review is opt-in only via MAGI_EXTERNAL_AUTO_REVIEW_ENABLED.
+      With the default OFF, MAGI-owned rows are routed to PENDING_MAGI without
+      Anthropic/Gemini calls. Provider failure therefore cannot block the
+      verification control plane.
+    - Legacy external review remains available only as an optional advisory path.
+    """
     global _MAGI_REVIEW_PROVIDER_BACKOFF_UNTIL
     global _MAGI_REVIEW_PROVIDER_BACKOFF_LAST_LOG
     global _MAGI_REVIEW_PROVIDER_BACKOFF_REASON
@@ -6789,19 +6791,63 @@ async def run_magi_auto_review_once():
         rows = await sb_select("magi_tasks", {
             "status": "eq.VERIFICATION",
             "verified_by": "is.null",
-            # task#167: 명시적으로 CASSANDRA 검증 대기 중인 태스크는
-            # legacy MAGI 자동검증 큐가 소비하면 안 된다.
-            # NULL은 기존 legacy 태스크 호환을 위해 계속 허용한다.
-            "or": "(verification_status.is.null,verification_status.neq.PENDING_CASSANDRA)",
             "order": "updated_at.asc",
-            "limit": "1",
+            "limit": "50",
         })
     except Exception as e:
         logger.error(f"마기자동검증 - magi_tasks 조회 실패: {e}")
         return None
     if not rows:
         return None
-    task = rows[0]
+
+    from magi_review_policy import classify_magi_review_lane, external_review_enabled
+    external_enabled = external_review_enabled(os.getenv("MAGI_EXTERNAL_AUTO_REVIEW_ENABLED"))
+
+    task = None
+    for candidate in rows:
+        lane = classify_magi_review_lane(candidate)
+        if lane in ("skip", "cassandra"):
+            continue
+
+        # Default path: deterministic routing only. External providers are not
+        # part of the control-plane success path.
+        if not external_enabled:
+            current_vs = str(candidate.get("verification_status") or "")
+            if current_vs == "PENDING_MAGI":
+                continue
+            task_id = candidate["task_id"]
+            payload = {
+                "verification_status": "PENDING_MAGI",
+                "waiting_for": candidate.get("waiting_for") or "MAGI final review",
+                "updated_at": datetime.now(KST).isoformat(),
+            }
+            await sb_h(
+                "PATCH",
+                f"magi_tasks?task_id=eq.{task_id}",
+                json=payload,
+                headers={**HEADERS_SB, "Prefer": "return=minimal"},
+            )
+            await sb_insert("magi_task_events", {
+                "task_id": task_id,
+                "event_type": "AUTO_REVIEW_ROUTED_TO_MAGI",
+                "actor": "검누리",
+                "detail": (
+                    "Provider-independent routing: external LLM auto-review is disabled by default. "
+                    "Task routed to MAGI final review without Anthropic/Gemini call."
+                ),
+            })
+            logger.info(
+                "마기자동검증 deterministic route(task#%s): PENDING_MAGI, external_provider=false",
+                task_id,
+            )
+            return task_id
+
+        task = candidate
+        break
+
+    if task is None:
+        return None
+
     task_id = task["task_id"]
     prior_attempts = task.get("review_attempts") or 0
 
