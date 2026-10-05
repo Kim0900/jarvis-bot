@@ -2681,9 +2681,29 @@ async def handle_briefing(update, date_str: str = None):
 
     # Task #27 Section A: fail-closed canonical daily report is the only
     # source for today's trip population/basic aggregates.
-    from daily_operation_report_v1 import build_briefing_section_a_v1
+    from daily_operation_report_v1 import (
+        build_briefing_section_a_v1,
+        build_snapshot_briefing_metrics_v1,
+    )
     daily_report = await get_daily_operation_report_v1(날짜)
     section_a = build_briefing_section_a_v1(daily_report)
+
+    # Task #27 original contract: ARGOS assembles already-computed snapshots.
+    # It must not reimplement daily/KPI calculations inside the briefing path.
+    daily_snapshot_rows = await sb_select("daily_calc_snapshot", {
+        "calc_date": f"eq.{날짜}",
+        "axis": "eq.A",
+        "limit": "1",
+    })
+    kpi_snapshot_rows = await sb_select("kpi_7day_snapshot", {
+        "calc_date": f"eq.{날짜}",
+        "limit": "1",
+    })
+    snapshot_metrics = build_snapshot_briefing_metrics_v1(
+        날짜,
+        daily_snapshot_rows[0] if daily_snapshot_rows else None,
+        kpi_snapshot_rows[0] if kpi_snapshot_rows else None,
+    )
 
     # Legacy same-day rows are retained only to estimate work-span until the
     # canonical report exposes exact first/last timestamps. They never define
@@ -2756,6 +2776,7 @@ async def handle_briefing(update, date_str: str = None):
             "monthly_avg": round(monthly_avg_calls, 1),
             "workday_avg": round(workday_avg_calls, 1),
             "source": "canonical_raw_calls_v1",
+            "official_snapshots": snapshot_metrics,
         },
         "section_e": "관측값과 미검증 변수 분리; 수락률/SEKUTI/행동품질은 실데이터 있을 때만 표시",
         "section_f": "자동 고정전략 비활성 — ARGOS 정밀 분석에서 별도 산출",
@@ -2774,36 +2795,16 @@ async def handle_briefing(update, date_str: str = None):
     # bot_briefings INSERT를 제거. 소비자(컨슈머) 로직 자체가 처음부터 없었던
     # 죽은 큐였음(task#59에서 확인).
 
-    # 캐스퍼 명령서 #008 §3 — KPI 4종 (봇 자체 계산, 축B 필수)
-    kpi = {}
+    # Task #27: project validated snapshot values only. No KPI recalculation.
+    # daily_summary receives only columns that actually exist in its schema.
     try:
-        def _to_virtual_min(hhmm: str) -> int:
-            h, m = map(int, hhmm.split(":"))
-            minutes = h * 60 + m
-            if h < 6:  # 0~5시는 전날 심야운행의 연장으로 간주
-                minutes += 24 * 60
-            return minutes
-
-        시각목록 = [c.get("배차시각") for c in calls if c.get("배차시각")]
-        summary_payload = {"날짜": 날짜}
-        work_hours = None
-        if 시각목록:
-            정렬됨 = sorted((( _to_virtual_min(t), t) for t in 시각목록))
-            시작 = 정렬됨[0][1]
-            종료 = 정렬됨[-1][1]
-            work_hours = round((정렬됨[-1][0] - 정렬됨[0][0]) / 60, 2)
-            summary_payload.update({
-                "work_start_time": 시작,
-                "work_end_time": 종료,
-                "work_hours": work_hours
-            })
-
-        kpi = await calc_kpi_metrics(날짜, section_a["revenue"], work_hours)
-        summary_payload.update(kpi)
-
-        await sb_upsert("daily_summary", summary_payload, on_conflict="날짜")
+        await sb_upsert("daily_summary", {
+            "날짜": 날짜,
+            "kpi_7day_avg": snapshot_metrics["kpi_7day_avg"],
+            "kpi_avg_fare": snapshot_metrics["daily_avg_fare"],
+        }, on_conflict="날짜")
     except Exception as e:
-        logger.error(f"daily_summary 운행시간/KPI 저장 오류: {e}")
+        logger.error(f"daily_summary snapshot KPI 저장 오류: {e}")
 
     # ══════════════════════════════════════════════
     # 캐스퍼 명령서 #014 반영 (2026-07-10)
@@ -2814,20 +2815,10 @@ async def handle_briefing(update, date_str: str = None):
     uber_n  = section_a["platform"]["uber"]
     bhw_n   = section_a["platform"]["roam_confirmed"]
 
-    gap_info = daily_report.get("gap") or {}
-    max_gap_min = gap_info.get("max_gap_min")
-    gap_partial = bool(gap_info.get("partial"))
-
-    kpi_7day = kpi.get("kpi_7day_avg")
-    kpi_fare = kpi.get("kpi_avg_fare")
-    kpi_long = kpi.get("kpi_longdist_rate")
-    kpi_hourly = kpi.get("kpi_hourly_revenue")
-    kpi_met = sum([
-        (kpi_7day or 0) >= 10,
-        (kpi_fare or 0) >= 10000,
-        (kpi_long or 0) >= 20,
-        (kpi_hourly or 0) >= 20000,
-    ])
+    kpi_7day = snapshot_metrics["kpi_7day_avg"]
+    axis_a_fare = snapshot_metrics["daily_avg_fare"]
+    axis_a_gap = snapshot_metrics["daily_max_interval_min"]
+    kpi_status = snapshot_metrics["kpi_status"]
 
     # 전체 브리핑 markdown 문서 (GitHub 커밋 + 파일첨부용)
     full_md = "\n".join([
@@ -2836,29 +2827,38 @@ async def handle_briefing(update, date_str: str = None):
         briefing_text,
         "",
         "---",
-        f"*bot_v5.py 자동생성 · KPI 판정 {kpi_met}/4 충족*",
+        f"*Task #27 snapshot assembly · 축A daily_calc_snapshot / 축B kpi_7day_snapshot*",
     ])
 
     # GitHub 직접 커밋
     gh_result = await github_commit_briefing(날짜, full_md)
-    if not gh_result["ok"]:
+    gh_optional_unconfigured = (
+        not gh_result["ok"]
+        and gh_result.get("error") == "GITHUB_PAT 환경변수 미설정"
+    )
+    if not gh_result["ok"] and not gh_optional_unconfigured:
         logger.error(f"GitHub 커밋 실패: {gh_result['error']}")
+    elif gh_optional_unconfigured:
+        logger.info("GitHub 브리핑 보관 비활성(GITHUB_PAT 미설정) — Task #27 Telegram/DB E2E에는 영향 없음")
 
-    # 텔레그램 요약 메시지 (명령서 #014 §3 템플릿)
+    axis_a_fare_text = fmt(axis_a_fare) if axis_a_fare is not None else "미산출"
+    axis_a_gap_text = (
+        f"{axis_a_gap:g}분" if axis_a_gap is not None else "미산출"
+    )
+    kpi_7day_text = f"{kpi_7day:.2f}건/일" if kpi_7day is not None else "미산출"
+
+    # Telegram summary makes the two official date axes explicit.
     summary_msg = (
-        f"[봇 자동요약 / 실시간, 검증 전]\n"
+        f"[봇 자동요약 / snapshot 검증형]\n"
         f"[자비스 브리핑 요약 / {날짜}]\n"
-        f"카카오T {kakao_n}건 · 우버{uber_n}건 · 배회{bhw_n}건 | 매출 {fmt(section_a['revenue'])}\n"
-        f"7일평균 {(f'{kpi_7day:.1f}건' if kpi_7day is not None else '-건')} "
-        f"(기준10건 대비 {'✅' if (kpi_7day or 0) >= 10 else '❌'})\n"
-        f"평균단가 {(fmt(kpi_fare) if kpi_fare is not None else '-원')} "
-        f"(기준10,000원 대비 {'✅' if (kpi_fare or 0) >= 10000 else '❌'})\n"
-        f"KPI 판정: {kpi_met}/4 충족\n"
-        f"최대 운행간극: {(str(max_gap_min) + '분') if max_gap_min is not None else '산출불가'} (하차→다음 배차{' · 부분자료' if gap_partial else ''})\n"
-        f"오늘 요약: 콜 {section_a['calls']}건 · 매출 {fmt(section_a['revenue'])} 기록\n"
+        f"캘린더일 canonical: 카카오T {kakao_n}건 · 우버{uber_n}건 · 배회{bhw_n}건 "
+        f"| 매출 {fmt(section_a['revenue'])} | 평균 {fmt(section_a['avg_fare'])}\n"
+        f"7일평균(축B): {kpi_7day_text} · 상태 {kpi_status or '미산출'}\n"
+        f"영업일 평균단가(축A): {axis_a_fare_text}\n"
+        f"영업일 최대 배차간격(축A): {axis_a_gap_text}\n"
         f"→ 전체 브리핑은 첨부파일 참고\n"
         f"→ 아르고스 정밀 분석은 별도로 브리핑 확인"
-        + (f"\nGitHub: {gh_result['url']}" if gh_result["ok"] else "\n⚠️ GitHub 저장 실패 (로그 확인 필요)")
+        + (f"\nGitHub: {gh_result['url']}" if gh_result["ok"] else "")
     )
 
     # 안전장치: 4,096자 초과 시 자동 분할
