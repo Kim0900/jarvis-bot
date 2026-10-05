@@ -2701,7 +2701,14 @@ async def handle_briefing(update, date_str: str = None):
 
     await update.message.reply_text(f"📋 {날짜} 브리핑 생성 중...")
 
-    # 데이터 수집
+    # Task #27 Section A: fail-closed canonical daily report is the only
+    # source for today's trip population/basic aggregates.
+    from daily_operation_report_v1 import build_briefing_section_a_v1
+    daily_report = await get_daily_operation_report_v1(날짜)
+    section_a = build_briefing_section_a_v1(daily_report)
+
+    # Legacy raw_calls population remains only for B~G during the staged
+    # migration. It must never overwrite Section A canonical values.
     calls = await sb_select_calls( {"날짜": f"eq.{날짜}"})
     calls_month = await sb_select_calls( {
         "and": f"(날짜.gte.{mo}-01,날짜.lte.{mo}-31)"
@@ -2710,6 +2717,12 @@ async def handle_briefing(update, date_str: str = None):
     total = len(calls)
     매출 = sum(c.get("요금", 0) or 0 for c in calls)
     avg_fare = int(매출 / total) if total else 0
+
+    if total != section_a["calls"] or 매출 != section_a["revenue"]:
+        logger.warning(
+            "[BRIEFING_CANONICAL_DIFF] date=%s canonical=%s/%s legacy=%s/%s",
+            날짜, section_a["calls"], section_a["revenue"], total, 매출,
+        )
 
     from datetime import date as _d2
     days_so_far = (_d2.today() - _d2(int(mo[:4]), int(mo[5:7]), 1)).days + 1
@@ -2730,8 +2743,8 @@ async def handle_briefing(update, date_str: str = None):
         f"═══ 자비스 브리핑 {날짜} ═══",
         f"",
         f"[A] 운행 데이터",
-        f"  콜수: {total}건 | 매출: {fmt(매출)}",
-        f"  건당단가: {fmt(avg_fare)}원",
+        f"  콜수: {section_a['calls']}건 | 매출: {fmt(section_a['revenue'])}",
+        f"  건당단가: {fmt(section_a['avg_fare'])}원",
         f"",
         f"[B] 카카오 알고리즘 관점",
         f"  ② 오늘 완료수: {total}건 (월평균 {monthly_avg_calls:.1f}건 · 운행일평균 {workday_avg_calls:.1f}건)",
@@ -2764,7 +2777,7 @@ async def handle_briefing(update, date_str: str = None):
     # DB 저장
     briefing_data = {
         "run_date": 날짜,
-        "section_a": {"calls": total, "revenue": 매출, "avg_fare": avg_fare},
+        "section_a": section_a,
         "section_b": var_score,
         "section_c": {"avg_fare": avg_fare, "target": 10000},
         "section_d": {"today": total, "monthly_avg": round(monthly_avg_calls, 1)},
@@ -2821,9 +2834,9 @@ async def handle_briefing(update, date_str: str = None):
     # 완전 자동화: 브리핑 생성 → GitHub 직접 커밋 → 텔레그램 요약+파일 전송
     # ══════════════════════════════════════════════
 
-    kakao_n = sum(1 for c in calls if (c.get("콜유형") or "") == "카카오T")
-    uber_n  = sum(1 for c in calls if (c.get("콜유형") or "") == "우버")
-    bhw_n   = sum(1 for c in calls if (c.get("콜유형") or "") == "배회")
+    kakao_n = section_a["platform"]["kakao"]
+    uber_n  = section_a["platform"]["uber"]
+    bhw_n   = section_a["platform"]["roam_confirmed"]
 
     # 절벽구간(간이 산정): 오늘 콜 간 40분 이상 공백 — GPX 교차검증 없는 raw_calls 시각만의 근사치.
     # 아르고스의 정식 Dead Zone 분석(GPX 이동 여부 확인 포함)과는 다른, 봇 자체의 단순 근사값임을 명시.
@@ -2873,14 +2886,14 @@ async def handle_briefing(update, date_str: str = None):
     summary_msg = (
         f"[봇 자동요약 / 실시간, 검증 전]\n"
         f"[자비스 브리핑 요약 / {날짜}]\n"
-        f"카카오T {kakao_n}건 · 우버{uber_n}건 · 배회{bhw_n}건 | 매출 {fmt(매출)}\n"
+        f"카카오T {kakao_n}건 · 우버{uber_n}건 · 배회{bhw_n}건 | 매출 {fmt(section_a['revenue'])}\n"
         f"7일평균 {(f'{kpi_7day:.1f}건' if kpi_7day is not None else '-건')} "
         f"(기준10건 대비 {'✅' if (kpi_7day or 0) >= 10 else '❌'})\n"
         f"평균단가 {(fmt(kpi_fare) if kpi_fare is not None else '-원')} "
         f"(기준10,000원 대비 {'✅' if (kpi_fare or 0) >= 10000 else '❌'})\n"
         f"KPI 판정: {kpi_met}/4 충족\n"
         f"절벽구간: {gap_total_min}분 ({gap_count}건, 간이산정)\n"
-        f"오늘 요약: 콜 {total}건 · 매출 {fmt(매출)} 기록\n"
+        f"오늘 요약: 콜 {section_a['calls']}건 · 매출 {fmt(section_a['revenue'])} 기록\n"
         f"→ 전체 브리핑은 첨부파일 참고\n"
         f"→ 아르고스 정밀 분석은 별도로 브리핑 확인"
         + (f"\nGitHub: {gh_result['url']}" if gh_result["ok"] else "\n⚠️ GitHub 저장 실패 (로그 확인 필요)")
