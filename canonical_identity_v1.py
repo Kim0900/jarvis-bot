@@ -71,11 +71,30 @@ def identity_strength(a, b):
         return None
     if platform_key(a) != platform_key(b):
         return None
-    if _int_or_none(a.get("요금")) != _int_or_none(b.get("요금")):
+
+    a_fare = _int_or_none(a.get("요금"))
+    b_fare = _int_or_none(b.get("요금"))
+    fare_missing = a_fare is None or b_fare is None
+
+    # Task #174 production Golden finding:
+    # A legacy weak row can have fare=NULL while a replay of the same source is
+    # parsed more completely and recovers a real fare. Missing fare must never
+    # become STRONG evidence, but matching time evidence must still quarantine
+    # the replay instead of treating it as novel.
+    if not fare_missing and a_fare != b_fare:
         return None
 
     a_start, a_end = a.get("배차시각"), a.get("하차시각")
     b_start, b_end = b.get("배차시각"), b.get("하차시각")
+
+    if fare_missing:
+        any_time_overlap = bool(
+            (a_start and a_start in (b_start, b_end))
+            or (a_end and a_end in (b_start, b_end))
+            or (b_start and b_start in (a_start, a_end))
+            or (b_end and b_end in (a_start, a_end))
+        )
+        return "WEAK_TIME_ONLY" if any_time_overlap else None
 
     if a_start and a_end and b_start and b_end:
         if a_start == b_start and a_end == b_end:
