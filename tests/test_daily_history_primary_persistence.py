@@ -224,6 +224,87 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["raw_row_type"], "trip")
         self.assertEqual(captured[0]["data_source"], "drive_ocr_layout_v1")
 
+    async def test_rollover_item_date_is_persisted_and_both_dates_are_scanned(self):
+        rollover = {
+            "날짜": "2026-10-05",
+            "표시건수": 2,
+            "표시금액": 21700,
+            "items": [
+                {
+                    "날짜": "2026-10-06",
+                    "탑승시각": "00:02",
+                    "하차시각": "00:13",
+                    "출발지": "출발 A",
+                    "도착지": "도착 A",
+                    "요금": 12900,
+                    "결제방식": "미확인",
+                },
+                {
+                    "날짜": "2026-10-05",
+                    "탑승시각": "23:50",
+                    "하차시각": "23:59",
+                    "출발지": "출발 B",
+                    "도착지": "도착 B",
+                    "요금": 8800,
+                    "결제방식": "미확인",
+                },
+            ],
+        }
+        selected_dates = []
+        async def select_rows(params):
+            if "source_id" in params:
+                return []
+            selected_dates.append(params["날짜"])
+            return []
+
+        captured = []
+        async def bulk(rows):
+            captured.extend(rows)
+            return [{"id": 500 + i} for i, _ in enumerate(rows)]
+
+        async def mark(_):
+            return {"ok": True}
+
+        result = await persist_layout_primary(
+            rollover, "src-rollover",
+            select_rows=select_rows,
+            bulk_insert=bulk,
+            mark_completed=mark,
+            rollback_source_rows=self.rollback,
+            calc_service_date=self.calc,
+            validate_call_payload=self.validate,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            selected_dates,
+            ["eq.2026-10-05", "eq.2026-10-06"],
+        )
+        self.assertEqual(
+            [row["날짜"] for row in captured],
+            ["2026-10-06", "2026-10-05"],
+        )
+
+    async def test_adapter_date_error_fails_before_write(self):
+        bad = parsed()
+        bad["error_code"] = "LAYOUT_CARD_DATE_OUT_OF_RANGE"
+
+        async def no_select(_):
+            raise AssertionError("select must not run")
+
+        async def no_write(_):
+            raise AssertionError("write must not run")
+
+        result = await persist_layout_primary(
+            bad, "src-bad-date",
+            select_rows=no_select,
+            bulk_insert=no_write,
+            mark_completed=no_write,
+            rollback_source_rows=self.rollback,
+            calc_service_date=self.calc,
+            validate_call_payload=self.validate,
+        )
+        self.assertEqual(result["error_code"], "LAYOUT_CARD_DATE_OUT_OF_RANGE")
+
     async def test_success_marks_completed_without_rollback(self):
         async def select_rows(params):
             return []
