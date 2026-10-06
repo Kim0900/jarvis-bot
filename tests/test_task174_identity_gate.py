@@ -52,26 +52,25 @@ class Task174IdentityGateTests(unittest.TestCase):
         self.assertEqual(result["weak"][0]["hits"][0]["strength"], "WEAK_TIME_ONLY")
 
     def test_uber_null_fare_time_overlap_is_quarantined(self):
+        # Production-shaped fixture from raw_calls id=1557 (2026-09-30):
+        # start time exists, but end/address/fare are all missing.
         existing = [row(
-            콜유형="우버",
-            요금=None,
+            날짜="2026-09-30",
+            배차시각="21:05",
             하차시각=None,
-            출발지="A",
-            도착지="B",
-        )]
-        candidate = row(
-            id=None,
+            출발지=None,
+            도착지=None,
             콜유형="우버",
             요금=None,
-            하차시각="20:12",
-            출발지="C",
-            도착지="D",
-            source_id="new-copy",
-        )
+            raw_row_type="unclassified",
+        )]
+        candidate = dict(existing[0])
+        candidate.update({"id": None, "source_id": "new-copy"})
         result = partition_raw_call_payloads(existing, [candidate], "new-copy")
         self.assertEqual(len(result["novel"]), 0)
         self.assertEqual(len(result["duplicate_skipped"]), 0)
         self.assertEqual(len(result["weak"]), 1)
+        self.assertEqual(result["weak"][0]["hits"][0]["strength"], "WEAK_TIME_ONLY")
 
     def test_meter_receipt_style_time_only_identity_is_quarantined(self):
         existing = [row(하차시각=None, 출발지=None, 도착지=None)]
