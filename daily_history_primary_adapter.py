@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date as _date
+
 from canonical_identity_v1 import identity_strength, platform_key
 
 LAYOUT_COMPLETE_STATUS = "COMPLETE_LAYOUT_VALIDATED"
@@ -35,6 +37,42 @@ def _int_or_none(value):
     except (TypeError, ValueError):
         return None
 
+
+
+def _resolve_card_date(header_date_value, date_hint):
+    """Resolve an explicit M/D card prefix against the independently parsed header date.
+
+    Kakao daily-history pages may include next-calendar-day trips on the prior
+    service-day page. Only the header date itself or the immediately following
+    calendar day is accepted. Anything else fails closed.
+    """
+    try:
+        header_date = _date.fromisoformat(str(header_date_value))
+    except (TypeError, ValueError):
+        return None
+
+    if not date_hint:
+        return header_date.isoformat()
+
+    month = _int_or_none(date_hint.get("month") if isinstance(date_hint, dict) else None)
+    day = _int_or_none(date_hint.get("day") if isinstance(date_hint, dict) else None)
+    if month is None or day is None:
+        return None
+
+    candidates = []
+    for year in (header_date.year - 1, header_date.year, header_date.year + 1):
+        try:
+            candidates.append(_date(year, month, day))
+        except ValueError:
+            continue
+
+    allowed = [
+        candidate for candidate in candidates
+        if 0 <= (candidate - header_date).days <= 1
+    ]
+    if len(allowed) != 1:
+        return None
+    return allowed[0].isoformat()
 
 def independent_header_disagreements(layout, legacy):
     legacy = legacy or {}
@@ -134,12 +172,25 @@ def partition_kakao_payloads(rows, payloads, source_id):
 def layout_to_daily_history(layout):
     header = layout.get("header") or {}
     cards = layout.get("cards") or []
+    header_date = layout.get("date")
     items = []
     for card in cards:
         addresses = list(card.get("address_lines") or [])
         while len(addresses) < 2:
             addresses.append(None)
+        card_date = _resolve_card_date(header_date, card.get("date_hint"))
+        if card_date is None:
+            return {
+                "format": "daily_history",
+                "날짜": header_date,
+                "표시건수": _int_or_none(header.get("expected_count")),
+                "표시금액": _int_or_none(header.get("expected_sum")),
+                "items": [],
+                "error_code": "LAYOUT_CARD_DATE_OUT_OF_RANGE",
+                "error_card_index": card.get("card_index"),
+            }
         items.append({
+            "날짜": card_date,
             "탑승시각": card.get("start_time"),
             "하차시각": card.get("end_time"),
             "출발지": addresses[0],
@@ -149,7 +200,7 @@ def layout_to_daily_history(layout):
         })
     return {
         "format": "daily_history",
-        "날짜": layout.get("date"),
+        "날짜": header_date,
         "표시건수": _int_or_none(header.get("expected_count")),
         "표시금액": _int_or_none(header.get("expected_sum")),
         "items": items,
@@ -169,6 +220,8 @@ async def persist_layout_primary(
 ):
     if not source_id:
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_SOURCE_ID_REQUIRED"}
+    if parsed.get("error_code"):
+        return {"ok": False, "error_code": parsed.get("error_code")}
     date_value = parsed.get("날짜")
     if not date_value:
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_DATE_REQUIRED"}
@@ -179,8 +232,9 @@ async def persist_layout_primary(
 
     payloads = []
     for item in parsed.get("items") or []:
+        item_date = item.get("날짜") or date_value
         payload = {
-            "날짜": date_value,
+            "날짜": item_date,
             "배차시각": item.get("탑승시각"),
             "하차시각": item.get("하차시각"),
             "출발지": item.get("출발지"),
@@ -211,7 +265,11 @@ async def persist_layout_primary(
     if sum(int(p.get("요금") or 0) for p in payloads) != expected_sum:
         return {"ok": False, "error_code": "LAYOUT_PRIMARY_SUM_MISMATCH"}
 
-    date_rows = await select_rows({"날짜": f"eq.{date_value}", "limit": "500"})
+    date_rows = []
+    for candidate_date in sorted({str(p.get("날짜")) for p in payloads if p.get("날짜")}):
+        rows = await select_rows({"날짜": f"eq.{candidate_date}", "limit": "500"})
+        if rows:
+            date_rows.extend(rows)
     partitioned = partition_kakao_payloads(date_rows, payloads, source_id)
     weak = partitioned["weak"]
     if weak:
