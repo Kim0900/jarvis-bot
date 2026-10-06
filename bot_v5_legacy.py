@@ -915,21 +915,40 @@ class HealthHandler(BaseHTTPRequestHandler):
                         if _repair_candidate is not None:
                             _expected = int(_repair_candidate.get("표시건수") or 0)
                             try:
-                                _saved = asyncio.run(
+                                _repair_persist = asyncio.run(
                                     _save_repaired_daily_history_batch(
                                         _repair_candidate, source_id
                                     )
                                 )
-                                if _saved != _expected:
-                                    raise RuntimeError(
-                                        f"REPAIR_SAVED_COUNT_MISMATCH:{_saved}/{_expected}"
-                                    )
-                                asyncio.run(mark_call_image_ingestion(
-                                    source_id,
-                                    "COMPLETED",
-                                    fmt="daily_history",
-                                    inserted_count=_saved,
-                                ))
+                                if not _repair_persist.get("ok"):
+                                    result = {
+                                        "success": False,
+                                        "format": "daily_history",
+                                        "saved_count": 0,
+                                        "source_id": source_id,
+                                        "error": _repair_persist.get("error_code"),
+                                        "error_code": _repair_persist.get("error_code"),
+                                        "error_stage": "cross_source_identity",
+                                        "quarantine": bool(_repair_persist.get("quarantine")),
+                                        "weak_count": _repair_persist.get("weak_count", 0),
+                                        "weak_candidates": _repair_persist.get("weak_candidates", []),
+                                        "duplicate_skipped_count": _repair_persist.get("duplicate_skipped_count", 0),
+                                        "duplicate_skipped": _repair_persist.get("duplicate_skipped", []),
+                                    }
+                                else:
+                                    _saved = int(_repair_persist.get("inserted_count") or 0)
+                                    _dups = int(_repair_persist.get("duplicate_skipped_count") or 0)
+                                    if _saved + _dups != _expected:
+                                        raise RuntimeError(
+                                            "REPAIR_COVERAGE_COUNT_MISMATCH:"
+                                            f"{_saved}+{_dups}/{_expected}"
+                                        )
+                                    asyncio.run(mark_call_image_ingestion(
+                                        source_id,
+                                        "COMPLETED",
+                                        fmt="daily_history",
+                                        inserted_count=_saved,
+                                    ))
                             except Exception:
                                 try:
                                     asyncio.run(delete_partial_source_calls(source_id))
@@ -940,24 +959,26 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     )
                                 raise
 
-                            _schedule_s700_rematch_after_raw_change(
-                                source_id=source_id,
-                                reason="daily_history_fare_repair",
-                            )
-                            send_json(200, {
-                                "success": True,
-                                "duplicate": False,
-                                "source_id": source_id,
-                                "format": "daily_history",
-                                "saved_count": _saved,
-                                "repair_used": True,
-                                "repair_method": "fare_column_probe_ordered",
-                                "displayed_count": _repair_candidate.get("표시건수"),
-                                "displayed_amount": _repair_candidate.get("표시금액"),
-                                "fare_probe_count": len(_probe_amounts),
-                                "fare_probe_sum": sum(_probe_amounts),
-                            })
-                            return
+                            if _repair_persist.get("ok"):
+                                _schedule_s700_rematch_after_raw_change(
+                                    source_id=source_id,
+                                    reason="daily_history_fare_repair",
+                                )
+                                send_json(200, {
+                                    "success": True,
+                                    "duplicate": False,
+                                    "source_id": source_id,
+                                    "format": "daily_history",
+                                    "saved_count": _saved,
+                                    "duplicate_skipped_count": _dups,
+                                    "repair_used": True,
+                                    "repair_method": "fare_column_probe_ordered",
+                                    "displayed_count": _repair_candidate.get("표시건수"),
+                                    "displayed_amount": _repair_candidate.get("표시금액"),
+                                    "fare_probe_count": len(_probe_amounts),
+                                    "fare_probe_sum": sum(_probe_amounts),
+                                })
+                                return
 
                         _err_parts = []
                         _main_error = result.get("error")
@@ -3696,27 +3717,107 @@ def detect_and_parse_call_document(text: str) -> dict:
     return {"format": "unknown", "parse_errors": ["형식 판별 실패 — 4종 어디에도 해당 안 함"]}
 
 
-async def _save_one_raw_call(payload: dict, source_id: str = None) -> bool:
-    """raw_calls 1건 저장 공통헬퍼 — calc_service_date+validate_call_payload
-    거쳐서 저장. Drive 원본 file_id를 provenance로 함께 보존."""
-    if source_id:
-        payload["source_id"] = source_id
-    payload.update(calc_service_date(payload.get("날짜"), payload.get("배차시각")))
-    _valid, _reason = validate_call_payload(payload)
-    if not _valid:
-        payload["raw_row_type"] = "unclassified"
-        payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {_reason}]"
-    r = await sb_insert("raw_calls", payload)
-    return bool(r)
+async def _persist_raw_call_batch(payloads: list[dict], source_id: str = None) -> dict:
+    """Task #174 shared append-only Cross-source Identity Gate.
 
-
-async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> int:
-    """task#164: 엄격 검증을 통과한 daily_history 보정행만 일괄 저장한다.
-
-    - 기존 source_id 행이 남아 있으면 중복 위험으로 중단
-    - 모든 행 validate_call_payload PASS 후에만 PostgREST bulk insert
-    - 개별행 순차저장으로 인한 부분저장을 피한다
+    Identity semantics come exclusively from canonical_identity_v1 through
+    raw_call_identity_gate. For Drive-backed ingestion (source_id present), all
+    candidates are classified before any write:
+      STRONG_* -> duplicate_skipped
+      WEAK_TIME_ONLY -> quarantine / zero writes
+      no match -> INSERT
+    Non-Drive/manual callers retain legacy write behavior.
     """
+    from raw_call_identity_gate import partition_raw_call_payloads
+
+    prepared = []
+    for original in payloads or []:
+        payload = dict(original)
+        if source_id:
+            payload["source_id"] = source_id
+        payload.update(calc_service_date(payload.get("날짜"), payload.get("배차시각")))
+        valid, reason = validate_call_payload(payload)
+        if not valid:
+            payload["raw_row_type"] = "unclassified"
+            payload["비고"] = (payload.get("비고") or "") + f" [검증실패: {reason}]"
+        prepared.append(payload)
+
+    if not prepared:
+        return {
+            "ok": True,
+            "inserted_count": 0,
+            "duplicate_skipped_count": 0,
+            "covered_count": 0,
+            "duplicate_skipped": [],
+        }
+
+    to_insert = prepared
+    duplicate_skipped = []
+
+    if source_id:
+        existing_rows = []
+        dates = sorted({str(p.get("날짜")) for p in prepared if p.get("날짜")})
+        for date_value in dates:
+            rows = await sb_h(
+                "GET",
+                "raw_calls",
+                params={"날짜": f"eq.{date_value}", "limit": "5000"},
+            )
+            if rows is None:
+                raise RuntimeError(f"RAW_CALL_IDENTITY_LOOKUP_FAILED:{date_value}")
+            if isinstance(rows, list):
+                existing_rows.extend(rows)
+
+        partitioned = partition_raw_call_payloads(
+            existing_rows,
+            prepared,
+            source_id=source_id,
+        )
+        if partitioned["weak"]:
+            return {
+                "ok": False,
+                "quarantine": True,
+                "error_code": "RAW_CALL_IDENTITY_AMBIGUOUS",
+                "inserted_count": 0,
+                "duplicate_skipped_count": len(partitioned["duplicate_skipped"]),
+                "covered_count": len(prepared),
+                "weak_count": len(partitioned["weak"]),
+                "weak_candidates": partitioned["weak"][:20],
+                "duplicate_skipped": partitioned["duplicate_skipped"][:20],
+            }
+
+        to_insert = partitioned["novel"]
+        duplicate_skipped = partitioned["duplicate_skipped"]
+
+    inserted = []
+    if to_insert:
+        inserted = await sb_h("POST", "raw_calls", json=to_insert)
+        if not isinstance(inserted, list) or len(inserted) != len(to_insert):
+            raise RuntimeError(
+                "RAW_CALL_BATCH_INSERT_MISMATCH:"
+                f"expected={len(to_insert)} "
+                f"actual={len(inserted) if isinstance(inserted, list) else 'non_list'}"
+            )
+
+    return {
+        "ok": True,
+        "inserted_count": len(to_insert),
+        "duplicate_skipped_count": len(duplicate_skipped),
+        "covered_count": len(prepared),
+        "duplicate_skipped": duplicate_skipped[:20],
+    }
+
+
+async def _save_one_raw_call(payload: dict, source_id: str = None) -> bool:
+    """Compatibility wrapper over the Task #174 batch identity gate."""
+    result = await _persist_raw_call_batch([payload], source_id=source_id)
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error_code") or "RAW_CALL_IDENTITY_GATE_FAILED")
+    return bool(result.get("inserted_count"))
+
+
+async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> dict:
+    """Task #164 repair persistence with Task #174 cross-source idempotency."""
     if not source_id:
         raise RuntimeError("REPAIR_SOURCE_ID_REQUIRED")
     if not parsed.get("날짜"):
@@ -3756,32 +3857,26 @@ async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> in
     if not payloads:
         raise RuntimeError("REPAIR_NO_ROWS")
 
-    inserted = await sb_h("POST", "raw_calls", json=payloads)
-    if not isinstance(inserted, list) or len(inserted) != len(payloads):
-        raise RuntimeError(
-            f"REPAIR_BULK_INSERT_MISMATCH: expected={len(payloads)} "
-            f"actual={len(inserted) if isinstance(inserted, list) else 'non_list'}"
-        )
-    return len(inserted)
+    return await _persist_raw_call_batch(payloads, source_id=source_id)
 
 
 async def process_and_save_call_document(text: str, source_id: str = None) -> dict:
-    """task93 Drive일괄처리(2026-09-03) — OCR텍스트→형식판별→파싱→
-    raw_calls저장까지 한번에 처리하는 통합함수. Render `/mcp/process_call_image`
-    엔드포인트에서 호출됨. AI 판단 없이 정규식 파서+Rule Validation만 사용."""
+    """OCR text -> deterministic parse -> Task #174 identity gate -> raw_calls."""
     parsed = detect_and_parse_call_document(text)
     fmt = parsed.get("format")
-    saved = 0
+    payloads = []
 
     if fmt == "meter_receipt":
         for item in parsed.get("items", []):
-            payload = {
-                "날짜": item.get("날짜"), "배차시각": item["시각"], "요금": item["요금"],
-                "콜유형": "카카오T", "비고": f"{item['결제유형']}결제({item['결제수단']})",
+            payloads.append({
+                "날짜": item.get("날짜"),
+                "배차시각": item["시각"],
+                "요금": item["요금"],
+                "콜유형": "카카오T",
+                "비고": f"{item['결제유형']}결제({item['결제수단']})",
                 "data_source": "drive_ocr_tesseract",
-            }
-            if await _save_one_raw_call(payload, source_id=source_id):
-                saved += 1
+            })
+
     elif fmt == "daily_history":
         from daily_history_parser import validate_daily_history_document
 
@@ -3805,27 +3900,34 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             }
 
         for item in parsed.get("items", []):
-            payload = {
-                "날짜": parsed.get("날짜"), "배차시각": item["탑승시각"], "하차시각": item["하차시각"],
-                "출발지": item["출발지"], "도착지": item["도착지"], "요금": item["요금"],
-                "콜유형": "카카오T", "비고": "직접결제" if item["결제방식"] == "직접" else None,
+            payloads.append({
+                "날짜": parsed.get("날짜"),
+                "배차시각": item["탑승시각"],
+                "하차시각": item["하차시각"],
+                "출발지": item["출발지"],
+                "도착지": item["도착지"],
+                "요금": item["요금"],
+                "콜유형": "카카오T",
+                "비고": "직접결제" if item["결제방식"] == "직접" else None,
                 "data_source": "drive_ocr_tesseract",
-            }
-            if await _save_one_raw_call(payload, source_id=source_id):
-                saved += 1
+            })
+
     elif fmt == "kakao_trip_detail":
-        payload = {
-            "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"), "하차시각": parsed.get("하차시각"),
-            "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
-            "콜유형": "카카오T", "비고": parsed.get("결제수단"),
+        payloads.append({
+            "날짜": parsed.get("날짜"),
+            "배차시각": parsed.get("배차시각"),
+            "하차시각": parsed.get("하차시각"),
+            "출발지": parsed.get("출발지"),
+            "도착지": parsed.get("도착지"),
+            "요금": parsed.get("요금"),
+            "콜유형": "카카오T",
+            "비고": parsed.get("결제수단"),
             "data_source": "drive_ocr_tesseract",
-        }
-        if await _save_one_raw_call(payload, source_id=source_id):
-            saved += 1
+        })
+
     elif fmt == "uber_trip_detail":
         from uber_trip_parser import validate_uber_trip_detail
 
-        # Legacy protection: settlement mismatch remains hard Fail-Closed.
         if parsed.get("요금_정산액_참고") is not None:
             return {
                 "success": False,
@@ -3837,7 +3939,6 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
                 "source_id": source_id,
             }
 
-        # Compact/new UI must have all independent anchors before any DB write.
         compact_gate = validate_uber_trip_detail(parsed)
         if not compact_gate.get("ok"):
             return {
@@ -3862,23 +3963,50 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             note_parts.append("⚠️" + "; ".join(parsed["parse_errors"]))
         note = " | ".join(note_parts) if note_parts else None
 
-        payload = {
-            "날짜": parsed.get("날짜"), "배차시각": parsed.get("배차시각"),
-            "출발지": parsed.get("출발지"), "도착지": parsed.get("도착지"), "요금": parsed.get("요금"),
-            "콜유형": "우버", "비고": note,
+        payloads.append({
+            "날짜": parsed.get("날짜"),
+            "배차시각": parsed.get("배차시각"),
+            "출발지": parsed.get("출발지"),
+            "도착지": parsed.get("도착지"),
+            "요금": parsed.get("요금"),
+            "콜유형": "우버",
+            "비고": note,
             "결제수단": parsed.get("결제수단"),
             "운행시간_분": parsed.get("운행시간_분"),
             "주행거리_km": parsed.get("거리_km"),
             "data_source": "drive_ocr_tesseract",
-        }
-        if await _save_one_raw_call(payload, source_id=source_id):
-            saved += 1
+        })
+
     else:
         return {"success": False, "error": "형식판별실패", "detail": parsed}
 
+    persisted = await _persist_raw_call_batch(payloads, source_id=source_id)
+    if not persisted.get("ok"):
+        return {
+            "success": False,
+            "error": persisted.get("error_code") or "RAW_CALL_IDENTITY_GATE_FAILED",
+            "error_code": persisted.get("error_code"),
+            "error_stage": "cross_source_identity",
+            "format": fmt,
+            "saved_count": 0,
+            "source_id": source_id,
+            "quarantine": bool(persisted.get("quarantine")),
+            "weak_count": persisted.get("weak_count", 0),
+            "weak_candidates": persisted.get("weak_candidates", []),
+            "duplicate_skipped_count": persisted.get("duplicate_skipped_count", 0),
+            "duplicate_skipped": persisted.get("duplicate_skipped", []),
+            "parse_errors": parsed.get("parse_errors", []),
+        }
+
     return {
-        "success": True, "format": fmt, "saved_count": saved,
-        "parse_errors": parsed.get("parse_errors", []), "source_id": source_id,
+        "success": True,
+        "format": fmt,
+        "saved_count": persisted.get("inserted_count", 0),
+        "covered_count": persisted.get("covered_count", len(payloads)),
+        "duplicate_skipped_count": persisted.get("duplicate_skipped_count", 0),
+        "duplicate_skipped": persisted.get("duplicate_skipped", []),
+        "parse_errors": parsed.get("parse_errors", []),
+        "source_id": source_id,
     }
 
 
