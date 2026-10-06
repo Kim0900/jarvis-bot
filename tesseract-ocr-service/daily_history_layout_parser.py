@@ -19,7 +19,7 @@ TIME_RE = re.compile(
     r"(\d{1,2})\s*:\s*(\d{2})(?!\d)"
 )
 CARD_DATE_PREFIX_RE = re.compile(
-    r"(?<!\\d)(\\d{1,2})\\s*[/.-]\\s*(\\d{1,2})\\s*$"
+    r"(?<!\d)(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*$"
 )
 FARE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,6})\s*원")
 HANGUL_RE = re.compile(r"[가-힣]")
