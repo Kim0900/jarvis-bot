@@ -91,6 +91,37 @@ class PrimaryPolicyTests(unittest.TestCase):
         self.assertEqual(parsed["표시금액"], 12000)
         self.assertEqual(parsed["items"][0]["결제방식"], "미확인")
         self.assertEqual(parsed["items"][1]["결제방식"], "직접")
+        self.assertEqual(parsed["items"][0]["날짜"], "2026-09-28")
+
+    def test_rollover_card_date_overrides_header_date(self):
+        layout = sample_layout()
+        layout["date"] = "2026-10-05"
+        layout["cards"][0]["date_hint"] = {
+            "month": 10, "day": 6, "source": "TIME_LINE_PREFIX"
+        }
+        parsed = layout_to_daily_history(layout)
+        self.assertNotIn("error_code", parsed)
+        self.assertEqual(parsed["items"][0]["날짜"], "2026-10-06")
+        self.assertEqual(parsed["items"][1]["날짜"], "2026-10-05")
+
+    def test_year_rollover_card_date_is_next_calendar_day(self):
+        layout = sample_layout()
+        layout["date"] = "2026-12-31"
+        layout["cards"][0]["date_hint"] = {
+            "month": 1, "day": 1, "source": "TIME_LINE_PREFIX"
+        }
+        parsed = layout_to_daily_history(layout)
+        self.assertEqual(parsed["items"][0]["날짜"], "2027-01-01")
+
+    def test_out_of_range_card_date_fails_closed(self):
+        layout = sample_layout()
+        layout["date"] = "2026-10-05"
+        layout["cards"][0]["date_hint"] = {
+            "month": 10, "day": 8, "source": "TIME_LINE_PREFIX"
+        }
+        parsed = layout_to_daily_history(layout)
+        self.assertEqual(parsed["error_code"], "LAYOUT_CARD_DATE_OUT_OF_RANGE")
+        self.assertEqual(parsed["items"], [])
 
 
 if __name__ == "__main__":
