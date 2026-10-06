@@ -1,6 +1,6 @@
 import unittest
 
-from raw_call_identity_gate import partition_raw_call_payloads
+from raw_call_identity_gate import partition_raw_call_payloads, persist_raw_call_batch
 
 
 def row(**kw):
