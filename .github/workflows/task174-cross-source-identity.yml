@@ -1,0 +1,48 @@
+name: Task174 cross-source identity regression
+
+on:
+  pull_request:
+    paths:
+      - "raw_call_identity_gate.py"
+      - "bot_v5_legacy.py"
+      - "canonical_identity_v1.py"
+      - "daily_history_primary_adapter.py"
+      - "s700_rematch_trigger.py"
+      - "gpx_ingest.py"
+      - "tests/test_task174_identity_gate.py"
+      - "tests/test_daily_history_primary_persistence.py"
+      - "tests/test_s700_rematch_trigger.py"
+      - "tests/test_gpx_ingest.py"
+      - ".github/workflows/task174-cross-source-identity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "raw_call_identity_gate.py"
+      - "bot_v5_legacy.py"
+      - "canonical_identity_v1.py"
+      - "tests/test_task174_identity_gate.py"
+      - ".github/workflows/task174-cross-source-identity.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: |
+          python -m py_compile canonical_identity_v1.py raw_call_identity_gate.py bot_v5_legacy.py gpx_ingest.py s700_rematch_trigger.py
+      - name: Task174 identity gate
+        run: python -m unittest tests.test_task174_identity_gate -v
+      - name: Daily-history canonical identity regression
+        run: python -m unittest tests.test_daily_history_primary_persistence -v
+      - name: S700 coalesced rematch regression
+        run: python -m unittest tests.test_s700_rematch_trigger -v
+      - name: GPX idempotency regression
+        run: python -m unittest tests.test_gpx_ingest -v
