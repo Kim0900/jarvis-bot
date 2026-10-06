@@ -18,6 +18,9 @@ TIME_RE = re.compile(
     r"(?<!\d)(\d{1,2})\s*:\s*(\d{2})\s*[-~–—]\s*"
     r"(\d{1,2})\s*:\s*(\d{2})(?!\d)"
 )
+CARD_DATE_PREFIX_RE = re.compile(
+    r"(?<!\\d)(\\d{1,2})\\s*[/.-]\\s*(\\d{1,2})\\s*$"
+)
 FARE_RE = re.compile(r"(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,6})\s*원")
 HANGUL_RE = re.compile(r"[가-힣]")
 CONTROL_WORDS = (
@@ -173,21 +176,38 @@ def dedupe_overlap_lines(
 
 
 def _time_anchor(line: dict[str, Any]) -> dict[str, Any] | None:
-    m = TIME_RE.search(str(line.get("text") or ""))
+    text = str(line.get("text") or "")
+    m = TIME_RE.search(text)
     if not m:
         return None
     start_hour, start_minute, end_hour, end_minute = map(int, m.groups())
     if not (0 <= start_hour < 24 and 0 <= end_hour < 24
             and 0 <= start_minute < 60 and 0 <= end_minute < 60):
         return None
+
+    # Kakao daily-history may prefix only rollover cards with M/D, e.g.
+    # "10/6 00:02 - 00:13". Preserve that explicit per-card date evidence.
+    # Full-year resolution is deferred until the independently parsed header
+    # date is available in the primary adapter.
+    date_hint = None
+    prefix = text[:m.start()]
+    dm = CARD_DATE_PREFIX_RE.search(prefix)
+    if dm:
+        month, day = map(int, dm.groups())
+        try:
+            _date(2000, month, day)
+        except ValueError:
+            return None
+        date_hint = {"month": month, "day": day, "source": "TIME_LINE_PREFIX"}
+
     return {
         "start": f"{start_hour:02d}:{start_minute:02d}",
         "end": f"{end_hour:02d}:{end_minute:02d}",
+        "date_hint": date_hint,
         "y0": float(line["y0"]),
         "y1": float(line["y1"]),
         "line": line,
     }
-
 
 def _dedupe_anchors(anchors: list[dict[str, Any]], y_tolerance: float = 0.004) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -199,8 +219,11 @@ def _dedupe_anchors(anchors: list[dict[str, Any]], y_tolerance: float = 0.004) -
         ), None)
         if same is None:
             out.append(anchor)
+        elif same.get("date_hint") is None and anchor.get("date_hint") is not None:
+            # Split-overlap OCR can produce one duplicate with the M/D prefix
+            # and another without it. Retain the explicit date evidence.
+            same["date_hint"] = anchor.get("date_hint")
     return out
-
 
 def _fare_candidates(text: str) -> list[int]:
     return [int(x.replace(",", "")) for x in FARE_RE.findall(text or "")]
@@ -401,6 +424,7 @@ def _fare_anchored_cards(
             "card_index": idx + 1,
             "start_time": chosen["start"] if chosen else None,
             "end_time": chosen["end"] if chosen else None,
+            "date_hint": chosen.get("date_hint") if chosen else None,
             "time_anchor_count": len(card_anchors),
             "bbox_norm": {"x0": 0.0, "y0": y0, "x1": 1.0, "y1": y1},
             "fare": int(fare_anchor["fare"]),
@@ -531,6 +555,7 @@ def build_card_layout(
             "card_index": idx + 1,
             "start_time": anchor["start"],
             "end_time": anchor["end"],
+            "date_hint": anchor.get("date_hint"),
             "time_anchor_count": 1,
             "bbox_norm": {"x0": 0.0, "y0": y0, "x1": 1.0, "y1": y1},
             "fare": fare,
