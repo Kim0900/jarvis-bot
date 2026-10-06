@@ -93,6 +93,18 @@ class Task174IdentityGateTests(unittest.TestCase):
         self.assertEqual(len(result["weak"]), 1)
         self.assertEqual(result["weak"][0]["hits"][0]["strength"], "WEAK_TIME_ONLY")
 
+    def test_both_missing_fares_keep_existing_v1_strong_semantics(self):
+        existing = [row(요금=None)]
+        candidate = row(id=None, 요금=None, source_id="new-copy")
+        result = partition_raw_call_payloads(existing, [candidate], "new-copy")
+        self.assertEqual(len(result["novel"]), 0)
+        self.assertEqual(len(result["weak"]), 0)
+        self.assertEqual(len(result["duplicate_skipped"]), 1)
+        self.assertEqual(
+            result["duplicate_skipped"][0]["hits"][0]["strength"],
+            "STRONG_FULL_INTERVAL",
+        )
+
     def test_known_different_fares_are_not_identity_match(self):
         existing = [row(요금=7000)]
         candidate = row(id=None, 요금=8000, source_id="new-copy")
