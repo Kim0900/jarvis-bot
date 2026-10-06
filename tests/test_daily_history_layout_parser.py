@@ -133,6 +133,18 @@ class LayoutParserTests(unittest.TestCase):
         self.assertEqual(result["cards"][0]["start_time"], "22:32")
         self.assertEqual(result["cards"][0]["end_time"], "22:40")
 
+    def test_rollover_time_line_preserves_month_day_hint(self):
+        rows = synthetic_cards(1)
+        rows[0] = line("10/6 00:02 - 00:13 실시간", 0.15)
+        result = build_card_layout(rows, original_size=(1080, 7749), expected_count=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["cards"][0]["start_time"], "00:02")
+        self.assertEqual(result["cards"][0]["end_time"], "00:13")
+        self.assertEqual(
+            result["cards"][0]["date_hint"],
+            {"month": 10, "day": 6, "source": "TIME_LINE_PREFIX"},
+        )
+
     def test_invalid_spaced_clock_is_not_anchor(self):
         rows = synthetic_cards(1)
         rows[0] = line("25 : 32 - 22 : 40 실시간", 0.15)
