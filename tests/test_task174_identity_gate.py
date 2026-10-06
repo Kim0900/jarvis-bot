@@ -145,5 +145,68 @@ class Task174IdentityGateTests(unittest.TestCase):
         self.assertEqual(result["novel"], [candidate])
 
 
+class Task174WeakPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovered_fare_weak_replay_is_zero_write_quarantine(self):
+        existing = [row(
+            id=1557,
+            날짜="2026-09-30",
+            배차시각="21:05",
+            하차시각=None,
+            출발지=None,
+            도착지=None,
+            콜유형="우버",
+            요금=None,
+            raw_row_type="unclassified",
+            source_id="legacy-source",
+            data_source="drive_ocr_tesseract",
+        )]
+        payload = row(
+            id=None,
+            날짜="2026-09-30",
+            배차시각="21:05",
+            하차시각=None,
+            출발지="대구광역시 동구 신천동",
+            도착지="경상북도 칠곡군 지천면 송정리",
+            콜유형="우버",
+            요금=27700,
+            source_id="new-source",
+            data_source="drive_ocr_tesseract",
+        )
+        writes = []
+
+        async def select_rows(date_value):
+            self.assertEqual(date_value, "2026-09-30")
+            return existing
+
+        async def bulk_insert(rows):
+            writes.extend(rows)
+            return [{"id": 9999} for _ in rows]
+
+        def calc_service_date(date_value, _time_value):
+            return {
+                "platform_date": date_value,
+                "business_date": date_value,
+                "business_session_id": f"{date_value}-NIGHT",
+            }
+
+        def validate_call_payload(_payload):
+            return True, ""
+
+        result = await persist_raw_call_batch(
+            [payload],
+            "new-source",
+            select_rows=select_rows,
+            bulk_insert=bulk_insert,
+            calc_service_date=calc_service_date,
+            validate_call_payload=validate_call_payload,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["quarantine"])
+        self.assertEqual(result["error_code"], "RAW_CALL_IDENTITY_AMBIGUOUS")
+        self.assertEqual(result["inserted_count"], 0)
+        self.assertEqual(result["weak_count"], 1)
+        self.assertEqual(writes, [])
+
+
 if __name__ == "__main__":
     unittest.main()
