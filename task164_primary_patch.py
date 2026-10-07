@@ -224,6 +224,16 @@ def install(bot):
             return await bot.sb_h("POST", "raw_calls", json=payloads)
 
         async def mark_completed(saved_count):
+            expected = int(parsed.get("표시건수") or 0)
+            await bot.record_kakao_daily_page_evidence(
+                source_id=source_id,
+                page_date=parsed.get("날짜"),
+                displayed_count=expected,
+                covered_count=expected,
+                inserted_count=int(saved_count or 0),
+                duplicate_skipped_count=max(expected - int(saved_count or 0), 0),
+                displayed_amount=parsed.get("표시금액"),
+            )
             return await original_mark(
                 source_id,
                 "COMPLETED",
