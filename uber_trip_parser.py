@@ -229,6 +229,29 @@ def parse_uber_trip_detail_text(text: str) -> dict:
     return result
 
 
+def apply_compact_verified_amount(
+    parsed: dict,
+    verified_amount: int,
+    method: str = "LOCAL_TESSERACT_CROPPED_DUAL_CONSENSUS_V1",
+) -> dict:
+    """Apply independently verified compact-Uber amount with audit evidence."""
+    if parsed.get("ui_variant") != "compact_detail_v2":
+        return parsed
+    verified_amount = int(verified_amount)
+    if not 1000 <= verified_amount <= 1000000:
+        raise ValueError("verified_amount out of range")
+    primary_amount = parsed.get("요금")
+    if primary_amount is not None and int(primary_amount) != verified_amount:
+        parsed.setdefault("parse_errors", []).append(
+            f"상단요금 1차OCR({primary_amount})→독립검증({verified_amount}) 교정"
+        )
+    parsed["요금_1차OCR"] = primary_amount
+    parsed["요금"] = verified_amount
+    parsed["요금근거"] = method
+    parsed["요금독립검증"] = True
+    return parsed
+
+
 def validate_uber_trip_detail(parsed: dict) -> dict:
     """Strict pre-save gate for both compact and legacy Uber detail UIs."""
     variant = parsed.get("ui_variant")
