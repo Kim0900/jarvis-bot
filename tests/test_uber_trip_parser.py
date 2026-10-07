@@ -4,6 +4,7 @@ from uber_trip_parser import (
     looks_like_uber_trip_detail,
     parse_uber_trip_detail_text,
     validate_uber_trip_detail,
+    apply_compact_verified_amount,
 )
 
 
@@ -129,6 +130,27 @@ class UberTripParserV2Tests(unittest.TestCase):
         self.assertEqual(parsed["도착지"], "대구광역시 북구 산격동")
         self.assertEqual(parsed["주소표기"], "KOREAN_OR_MIXED")
         self.assertEqual(parsed["결제수단"], "직접결제")
+        self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
+    def test_independent_amount_consensus_corrects_leading_won_glyph_error(self):
+        sample = COMPACT_SAMPLE.replace("₩18,600", "W418,600")
+        parsed = parse_uber_trip_detail_text(sample)
+        self.assertEqual(parsed["요금"], 418600)
+        apply_compact_verified_amount(parsed, 18600)
+        self.assertEqual(parsed["요금_1차OCR"], 418600)
+        self.assertEqual(parsed["요금"], 18600)
+        self.assertTrue(parsed["요금독립검증"])
+        self.assertIn("418600", parsed["parse_errors"][-1])
+        self.assertIn("18600", parsed["parse_errors"][-1])
+        self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
+    def test_independent_amount_consensus_fills_missing_primary_amount(self):
+        sample = COMPACT_SAMPLE.replace("₩18,600\n", "")
+        parsed = parse_uber_trip_detail_text(sample)
+        self.assertNotIn("요금", parsed)
+        apply_compact_verified_amount(parsed, 12805)
+        self.assertIsNone(parsed["요금_1차OCR"])
+        self.assertEqual(parsed["요금"], 12805)
         self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
 
     def test_foreign_rider_english_kor_addresses(self):
