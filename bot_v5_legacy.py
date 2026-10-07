@@ -5827,7 +5827,8 @@ _PATROL_SCHEDULER_MAX_AGE_SECONDS = {
     # 5분 주기
     "run_magi_auto_review_once": 15 * 60,
     # ChatGPT MAGI Slack 관제는 매시간 실행. 3시간 무heartbeat면 이상.
-    "magi_slack_control": 3 * 3600,
+    # magi_slack_control retired: ChatGPT automation is disabled after repeated Slack write failures.
+    # Do not patrol stale/fail heartbeat from the retired external scheduler.
     # 일 1회 계열 — 재배포/약간의 지연을 감안해 36시간
     "notify_pending_simple_tasks": 36 * 3600,
     "dual_verify_7day_average": 36 * 3600,
