@@ -16,7 +16,7 @@ import re
 from datetime import datetime, timedelta
 
 
-_CURRENCY_RE = re.compile(r"(?:₩|￦|\\|[Ww])\s*([\d,]{4,})")
+_CURRENCY_RE = re.compile(r"(?:₩|￦|¥|\\|[Ww])\s*([\d,]{4,})")
 _DATE_TIME_RE = re.compile(
     r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.[^\dAP]*?(AM|PM)\s*(\d{1,2}):(\d{2})",
     re.IGNORECASE,
@@ -58,6 +58,43 @@ def _amounts(text: str) -> list[int]:
     for raw in _CURRENCY_RE.findall(text or ""):
         try:
             value = int(raw.replace(",", ""))
+        except ValueError:
+            continue
+        if 1000 <= value <= 1000000:
+            out.append(value)
+    return out
+
+
+def _header_bare_amounts(text: str) -> list[int]:
+    """Fallback for compact Uber screens when OCR drops the currency glyph.
+
+    Only inspect the text AFTER the parsed trip datetime and BEFORE the metrics
+    block. Accept a standalone numeric line, optionally using comma or dot as
+    a thousands separator. This deliberately excludes date/time, duration,
+    distance, and later point/reward numbers.
+    """
+    header = _header_section(text)
+    dm = _DATE_TIME_RE.search(header)
+    if not dm:
+        return []
+
+    tail = header[dm.end():]
+    out = []
+    for raw_line in tail.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = re.fullmatch(
+            r"[^\dA-Za-z가-힣]{0,3}"
+            r"(\d{1,3}(?:\s*[,\.]\s*\d{3})+|\d{4,6})"
+            r"[^\dA-Za-z가-힣]{0,3}",
+            line,
+        )
+        if not m:
+            continue
+        raw = re.sub(r"[,\.\s]", "", m.group(1))
+        try:
+            value = int(raw)
         except ValueError:
             continue
         if 1000 <= value <= 1000000:
@@ -182,6 +219,20 @@ def _parse_fare(text: str, result: dict) -> None:
     if len(header_amounts) > 1:
         result["parse_errors"].append(
             "상단요금 다중후보:" + ",".join(map(str, header_amounts))
+        )
+        return
+
+    # Some foreign-rider / XL OCR results preserve the amount digits but drop
+    # the currency glyph. Use only a unique standalone numeric line between the
+    # datetime anchor and the metrics block.
+    bare_amounts = sorted(set(_header_bare_amounts(text)))
+    if len(bare_amounts) == 1:
+        result["요금"] = bare_amounts[0]
+        result["요금근거"] = "COMPACT_HEADER_UNIQUE_BARE_AMOUNT"
+        return
+    if len(bare_amounts) > 1:
+        result["parse_errors"].append(
+            "상단요금 숫자후보 다중:" + ",".join(map(str, bare_amounts))
         )
     else:
         result["parse_errors"].append("요금 파싱실패")
