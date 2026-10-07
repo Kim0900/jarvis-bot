@@ -1,0 +1,40 @@
+name: Task181 Kakao completeness gate
+
+on:
+  pull_request:
+    paths:
+      - "kakao_monthly_history_parser.py"
+      - "bot_v5_legacy.py"
+      - "task164_primary_patch.py"
+      - "tests/test_kakao_monthly_history_parser.py"
+      - ".github/workflows/task181-kakao-completeness.yml"
+  push:
+    branches: [main]
+    paths:
+      - "kakao_monthly_history_parser.py"
+      - "bot_v5_legacy.py"
+      - "task164_primary_patch.py"
+      - "tests/test_kakao_monthly_history_parser.py"
+      - ".github/workflows/task181-kakao-completeness.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: |
+          python -m py_compile kakao_monthly_history_parser.py bot_v5_legacy.py task164_primary_patch.py daily_history_primary_adapter.py
+      - name: Monthly control parser
+        run: python -m unittest tests.test_kakao_monthly_history_parser -v
+      - name: Daily-history primary persistence regression
+        run: python -m unittest tests.test_daily_history_primary_persistence -v
+      - name: Task174 identity regression
+        run: python -m unittest tests.test_task174_identity_gate -v
