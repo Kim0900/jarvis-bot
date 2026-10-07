@@ -19,6 +19,7 @@ task93(2026-09-03) 3단계 — MAGI DATA CORE 비LLM OCR 서비스.
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ from io import BytesIO
 
 import pytesseract
 from flask import Flask, jsonify, request
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 app = Flask(__name__)
 
@@ -204,6 +205,117 @@ def smart_ocr(img: Image.Image, lang: str) -> tuple:
     text = pytesseract.image_to_string(
         resized, lang=lang, config=TESSERACT_CONFIG, timeout=TESSERACT_TIMEOUT_SEC)
     return text, meta
+
+
+
+def _parse_uber_amount_digits(text: str):
+    digits = re.sub(r"[^0-9]", "", str(text or ""))
+    if not digits:
+        return None
+    try:
+        value = int(digits)
+    except ValueError:
+        return None
+    if not 1000 <= value <= 1000000:
+        return None
+    return value
+
+
+def _uber_amount_local_consensus(img: Image.Image) -> dict:
+    """Independent compact-Uber amount reader.
+
+    The crop intentionally starts to the right of the Won glyph. OCR.space has
+    repeatedly interpreted the ₩ strokes as a leading '4' (18,600->418,600 and
+    4,800->44,800). Two local Tesseract preprocessing variants must agree.
+    """
+    w, h = img.size
+    if w < 200 or h < 400:
+        return {"ok": False, "error_code": "UBER_AMOUNT_IMAGE_TOO_SMALL"}
+
+    box = (
+        int(w * 0.13),
+        int(h * 0.158),
+        int(w * 0.80),
+        int(h * 0.233),
+    )
+    crop = img.crop(box)
+    crop = crop.resize((max(1, crop.width * 3), max(1, crop.height * 3)), Image.LANCZOS)
+    gray = ImageEnhance.Contrast(ImageOps.grayscale(crop)).enhance(2.5)
+    binary = gray.point(lambda px: 255 if px > 160 else 0)
+
+    config = "--psm 7 -c tessedit_char_whitelist=0123456789,"
+    readings = []
+    for variant in (gray, binary):
+        try:
+            txt = pytesseract.image_to_string(
+                variant,
+                lang="eng",
+                config=config,
+                timeout=8,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error_code": "UBER_AMOUNT_LOCAL_OCR_ERROR",
+                "error_type": type(exc).__name__,
+            }
+        readings.append({
+            "text": re.sub(r"\s+", " ", txt or "").strip()[:40],
+            "amount": _parse_uber_amount_digits(txt),
+        })
+
+    amounts = [r["amount"] for r in readings]
+    if None in amounts:
+        return {
+            "ok": False,
+            "error_code": "UBER_AMOUNT_LOCAL_OCR_MISSING",
+            "readings": readings,
+        }
+    if amounts[0] != amounts[1]:
+        return {
+            "ok": False,
+            "error_code": "UBER_AMOUNT_LOCAL_OCR_DISAGREE",
+            "readings": readings,
+        }
+    return {
+        "ok": True,
+        "amount": amounts[0],
+        "readings": readings,
+        "method": "LOCAL_TESSERACT_CROPPED_DUAL_CONSENSUS_V1",
+    }
+
+
+@app.route("/uber_header_amount", methods=["POST"])
+def uber_header_amount():
+    """Read-only independent verifier for the large compact-Uber header amount."""
+    ok, err = _check_auth()
+    if not ok:
+        return jsonify({"success": False, "error": err, "error_code": "AUTH_FAILED"}), 401
+
+    payload = request.get_json(force=True, silent=True) or {}
+    image_b64 = payload.get("image_base64")
+    if not image_b64:
+        return jsonify({
+            "success": False,
+            "error": "image_base64 필드 필요",
+            "error_code": "BAD_REQUEST",
+        }), 400
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        result = _uber_amount_local_consensus(img)
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": type(exc).__name__,
+            "error_code": "UBER_AMOUNT_VERIFY_ERROR",
+        }), 400
+
+    if not result.get("ok"):
+        return jsonify({"success": False, **result}), 422
+
+    return jsonify({"success": True, **result})
 
 
 @app.route("/", methods=["GET"])
