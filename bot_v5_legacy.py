@@ -846,17 +846,60 @@ class HealthHandler(BaseHTTPRequestHandler):
                         return
 
                     _shadow_parsed = None
+                    _preparsed_candidate = None
                     try:
-                        _shadow_candidate = detect_and_parse_call_document(text)
-                        if _shadow_candidate.get("format") == "daily_history":
-                            _shadow_parsed = _shadow_candidate
+                        _preparsed_candidate = detect_and_parse_call_document(text)
+                        if _preparsed_candidate.get("format") == "daily_history":
+                            _shadow_parsed = _preparsed_candidate
                     except Exception as _shadow_parse_err:
                         logger.warning(
                             "[TASK164_LAYOUT_SHADOW] legacy summary parse failed: %s",
                             type(_shadow_parse_err).__name__,
                         )
 
-                    result = asyncio.run(process_and_save_call_document(text, source_id=source_id))
+                    _verified_uber_amount = None
+                    _verified_uber_amount_method = None
+                    if (
+                        isinstance(_preparsed_candidate, dict)
+                        and _preparsed_candidate.get("format") == "uber_trip_detail"
+                        and _preparsed_candidate.get("ui_variant") == "compact_detail_v2"
+                    ):
+                        _amount_check = asyncio.run(
+                            verify_uber_header_amount(image_bytes)
+                        )
+                        if not _amount_check.get("ok"):
+                            result = {
+                                "success": False,
+                                "format": "uber_trip_detail",
+                                "error": "Uber compact amount verification failed",
+                                "error_code": (
+                                    _amount_check.get("error_code")
+                                    or "UBER_COMPACT_AMOUNT_VERIFY_FAILED"
+                                ),
+                                "saved_count": 0,
+                                "source_id": source_id,
+                            }
+                        else:
+                            _verified_uber_amount = int(_amount_check["amount"])
+                            _verified_uber_amount_method = _amount_check.get("method")
+                            logger.info(
+                                "[UBER_AMOUNT_VERIFY] source_id=%s amount=%s method=%s primary_ocr=%s",
+                                source_id,
+                                _verified_uber_amount,
+                                _verified_uber_amount_method,
+                                _preparsed_candidate.get("요금"),
+                            )
+                            result = asyncio.run(process_and_save_call_document(
+                                text,
+                                source_id=source_id,
+                                verified_uber_amount=_verified_uber_amount,
+                                uber_amount_verification_method=_verified_uber_amount_method,
+                            ))
+                    else:
+                        result = asyncio.run(process_and_save_call_document(
+                            text,
+                            source_id=source_id,
+                        ))
                     if _shadow_parsed is not None:
                         _schedule_daily_history_layout_shadow(
                             image_bytes=image_bytes,
@@ -3517,6 +3560,41 @@ async def google_vision_ocr(image_bytes: bytes) -> str:
     return data.get("text", "")
 
 
+async def verify_uber_header_amount(image_bytes: bytes) -> dict:
+    """Task#182 independent compact-Uber header amount verification."""
+    service_url = os.getenv("OCR_SERVICE_URL")
+    mcp_key = os.getenv("OCR_MCP_KEY")
+    if not service_url or not mcp_key:
+        raise RuntimeError("OCR_SERVICE_URL/OCR_MCP_KEY 환경변수 없음")
+    b64 = base64.b64encode(image_bytes).decode()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{service_url}/uber_header_amount",
+            headers={"X-MCP-Key": mcp_key},
+            json={"image_base64": b64},
+        )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"success": False, "error_code": "NON_JSON_RESPONSE"}
+    if resp.status_code >= 400 or not data.get("success"):
+        return {
+            "ok": False,
+            "http_status": resp.status_code,
+            "error_code": data.get("error_code") or "UBER_AMOUNT_VERIFY_FAILED",
+        }
+    try:
+        amount = int(data.get("amount"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error_code": "UBER_AMOUNT_VERIFY_BAD_AMOUNT"}
+    return {
+        "ok": True,
+        "amount": amount,
+        "method": data.get("method"),
+        "readings": data.get("readings") or [],
+    }
+
+
 async def _run_daily_history_layout_shadow(
     image_bytes: bytes,
     source_id: str,
@@ -3868,12 +3946,39 @@ async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> di
     return await _persist_raw_call_batch(payloads, source_id=source_id)
 
 
-async def process_and_save_call_document(text: str, source_id: str = None) -> dict:
+async def process_and_save_call_document(
+    text: str,
+    source_id: str = None,
+    verified_uber_amount: int = None,
+    uber_amount_verification_method: str = None,
+) -> dict:
     """OCR text -> deterministic parse -> Task #174 identity gate -> raw_calls."""
     parsed = detect_and_parse_call_document(text)
     fmt = parsed.get("format")
     payloads = []
     daily_validation = None
+
+    if fmt == "uber_trip_detail" and parsed.get("ui_variant") == "compact_detail_v2":
+        if verified_uber_amount is None:
+            return {
+                "success": False,
+                "format": fmt,
+                "error": "compact Uber amount independent verification required",
+                "error_code": "UBER_COMPACT_AMOUNT_VERIFICATION_REQUIRED",
+                "saved_count": 0,
+                "source_id": source_id,
+            }
+        primary_amount = parsed.get("요금")
+        if primary_amount is not None and int(primary_amount) != int(verified_uber_amount):
+            parsed.setdefault("parse_errors", []).append(
+                f"상단요금 1차OCR({primary_amount})→독립검증({verified_uber_amount}) 교정"
+            )
+        parsed["요금_1차OCR"] = primary_amount
+        parsed["요금"] = int(verified_uber_amount)
+        parsed["요금근거"] = (
+            uber_amount_verification_method
+            or "LOCAL_TESSERACT_CROPPED_DUAL_CONSENSUS_V1"
+        )
 
     if fmt == "kakao_monthly_history_control":
         if not parsed.get("success"):
@@ -3994,6 +4099,8 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         if parsed.get("결제방식") == "직접":
             note_parts.append("직접결제")
         note_parts.append(str(parsed.get("ui_variant") or "uber_detail"))
+        if parsed.get("ui_variant") == "compact_detail_v2":
+            note_parts.append("금액독립검증")
         if parsed.get("parse_errors"):
             note_parts.append("⚠️" + "; ".join(parsed["parse_errors"]))
         note = " | ".join(note_parts) if note_parts else None
