@@ -3968,16 +3968,12 @@ async def process_and_save_call_document(
                 "saved_count": 0,
                 "source_id": source_id,
             }
-        primary_amount = parsed.get("요금")
-        if primary_amount is not None and int(primary_amount) != int(verified_uber_amount):
-            parsed.setdefault("parse_errors", []).append(
-                f"상단요금 1차OCR({primary_amount})→독립검증({verified_uber_amount}) 교정"
-            )
-        parsed["요금_1차OCR"] = primary_amount
-        parsed["요금"] = int(verified_uber_amount)
-        parsed["요금근거"] = (
+        from uber_trip_parser import apply_compact_verified_amount
+        apply_compact_verified_amount(
+            parsed,
+            int(verified_uber_amount),
             uber_amount_verification_method
-            or "LOCAL_TESSERACT_CROPPED_DUAL_CONSENSUS_V1"
+            or "LOCAL_TESSERACT_CROPPED_DUAL_CONSENSUS_V1",
         )
 
     if fmt == "kakao_monthly_history_control":
