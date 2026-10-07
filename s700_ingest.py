@@ -258,23 +258,47 @@ def _num(v):
 
 
 def evaluate_candidate(trip, call):
-    """단일 후보 평가 → dict(verdict, method, evidence, ...). verdict: MATCH / PROVISIONAL / NO."""
+    """단일 후보 평가 → dict(verdict, method, evidence, ...).
+
+    Uber note:
+    - Uber 화면 상단 금액은 플랫폼 정산/세금 반영 수입액일 수 있어 S700
+      meter_fare와 동일값을 강제하지 않는다.
+    - Uber 자동확정은 기존 15분 후보창 + 구조화 운행시간/거리 일치로만 한다.
+    - 요금은 audit evidence로만 남긴다.
+    """
     t_start = datetime.fromisoformat(trip["trip_start"])
     t_end = datetime.fromisoformat(trip["trip_end"])
     c_start, c_end = _call_datetimes(call)
-    ev = {"call_id": call.get("id"), "call_type": call.get("콜유형"),
-          "fare_exact": call.get("요금") == trip["fare"]}
+    call_amount = call.get("요금")
+    meter_fare = trip.get("fare")
+    ev = {
+        "call_id": call.get("id"),
+        "call_type": call.get("콜유형"),
+        "fare_exact": call_amount == meter_fare,
+        "uber_amount": call_amount,
+        "meter_fare": meter_fare,
+    }
+    if (
+        isinstance(call_amount, (int, float))
+        and isinstance(meter_fare, (int, float))
+    ):
+        ev["fare_delta"] = call_amount - meter_fare
+
     if c_start is None:
         return {"verdict": "NO", "evidence": {**ev, "reason": "call_time_unparseable"}}
-    ev["start_delta_sec"] = int(abs((t_start - c_start).total_seconds()))
+
+    signed_start_delta = int((t_start - c_start).total_seconds())
+    ev["start_delta_sec"] = abs(signed_start_delta)
+    ev["call_to_meter_start_sec"] = signed_start_delta
     if c_end is not None:
         ev["end_delta_sec"] = int(abs((t_end - c_end).total_seconds()))
-    if not ev["fare_exact"]:
-        return {"verdict": "NO", "evidence": {**ev, "reason": "fare_mismatch"}}
 
     ctype = call.get("콜유형")
+
     if ctype == "카카오T":
-        # TAEO 검증(2026-09-02 9/9): fare exact + start<=180s + end<=180s(존재 시). Kakao 한정 규칙.
+        if not ev["fare_exact"]:
+            return {"verdict": "NO", "evidence": {**ev, "reason": "fare_mismatch"}}
+        # TAEO 검증(2026-09-02 9/9): fare exact + start<=180s + end<=180s(존재 시).
         ok_start = ev["start_delta_sec"] <= KAKAO_START_TOL_SEC
         ok_end = ("end_delta_sec" not in ev) or ev["end_delta_sec"] <= KAKAO_END_TOL_SEC
         ev["rule"] = "kakao_fare_exact+start<=180s+end<=180s"
@@ -283,29 +307,65 @@ def evaluate_candidate(trip, call):
         return {"verdict": "NO", "evidence": {**ev, "reason": "kakao_time_out_of_tolerance"}}
 
     if ctype == "우버":
-        # TAEO §I: 구조필드(운행시간_분/주행거리_km) 가용성을 먼저 확인. 비고 텍스트는 canonical로 보지 않는다.
-        dur_call, dist_call = _num(call.get("운행시간_분")), _num(call.get("주행거리_km"))
+        # Uber 호출은 픽업 이동 때문에 미터 시작보다 선행할 수 있다.
+        # 후보창은 기존 15분을 유지하고, 실제 동일운행 확정은 duration+distance로 한다.
+        dur_call = _num(call.get("운행시간_분"))
+        dist_call = _num(call.get("주행거리_km"))
         if dist_call is None:
             dist_call = _num(call.get("영업거리_km"))
-        ev["rule"] = "uber_fare_exact+duration+distance(structured)"
+
+        ev["rule"] = "uber_start<=15m+duration<=1m+distance<=3pct;fare_advisory_only"
+
         if ev["start_delta_sec"] > UBER_CANDIDATE_START_TOL_SEC:
-            return {"verdict": "NO", "evidence": {**ev, "reason": "uber_start_outside_candidate_window"}}
+            return {
+                "verdict": "NO",
+                "evidence": {**ev, "reason": "uber_start_outside_candidate_window"},
+            }
+
         if dur_call is None or dist_call is None:
             ev["structured_fields_available"] = False
-            return {"verdict": "PROVISIONAL", "method": "uber_fare_only_structured_missing", "evidence": ev}
+            return {
+                "verdict": "PROVISIONAL",
+                "method": "uber_time_only_structured_missing",
+                "evidence": ev,
+            }
+
         dur_trip = (t_end - t_start).total_seconds() / 60.0
         ev["duration_diff_min"] = round(abs(dur_trip - dur_call), 2)
-        ev["distance_diff_ratio"] = round(abs(trip["distance_km"] - dist_call) / max(dist_call, 0.01), 4)
-        if ev["duration_diff_min"] <= UBER_DURATION_TOL_MIN and ev["distance_diff_ratio"] <= UBER_DISTANCE_TOL_RATIO:
-            return {"verdict": "MATCH", "method": "uber_fare_duration_distance", "evidence": ev}
-        return {"verdict": "NO", "evidence": {**ev, "reason": "uber_duration_or_distance_mismatch"}}
+        ev["distance_diff_ratio"] = round(
+            abs(trip["distance_km"] - dist_call) / max(dist_call, 0.01),
+            4,
+        )
 
-    # 그 외 콜유형(NULL/배회 등): 근거 부족 → 자동확정 금지.
+        if (
+            ev["duration_diff_min"] <= UBER_DURATION_TOL_MIN
+            and ev["distance_diff_ratio"] <= UBER_DISTANCE_TOL_RATIO
+        ):
+            return {
+                "verdict": "MATCH",
+                "method": "uber_time_duration_distance",
+                "evidence": ev,
+            }
+
+        return {
+            "verdict": "NO",
+            "evidence": {**ev, "reason": "uber_duration_or_distance_mismatch"},
+        }
+
+    # 그 외 콜유형(NULL/배회 등): 기존대로 fare exact + 시간창만으로도 자동확정 금지.
+    if not ev["fare_exact"]:
+        return {"verdict": "NO", "evidence": {**ev, "reason": "fare_mismatch"}}
     ev["rule"] = "other_type_requires_manual_review"
     if ev["start_delta_sec"] <= UBER_CANDIDATE_START_TOL_SEC:
-        return {"verdict": "PROVISIONAL", "method": "other_type_fare_only", "evidence": ev}
-    return {"verdict": "NO", "evidence": {**ev, "reason": "other_type_time_out_of_window"}}
-
+        return {
+            "verdict": "PROVISIONAL",
+            "method": "other_type_fare_only",
+            "evidence": ev,
+        }
+    return {
+        "verdict": "NO",
+        "evidence": {**ev, "reason": "other_type_time_out_of_window"},
+    }
 
 def match_trip(trip, calls, claimed_call_ids=frozenset()):
     """S700 Trip 1건 vs raw_calls 후보들 → (match_status, matched_raw_call_id, match_method, match_detail).
