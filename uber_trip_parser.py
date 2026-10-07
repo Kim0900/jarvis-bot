@@ -23,10 +23,34 @@ _DATE_TIME_RE = re.compile(
 )
 _DURATION_RE = re.compile(r"(\d{1,3})분\s*(\d{1,2})초")
 _DISTANCE_RE = re.compile(r"([\d.]+)\s*km", re.IGNORECASE)
-_ADDRESS_RE = re.compile(
-    r"([가-힣]{2,}(?:특별시|광역시|특별자치시|특별자치도|도)[^\n]{0,80}?)\s*KR",
+_ADDRESS_LINE_RE = re.compile(
+    r"^\s*(?P<addr>.+?)\s+(?:KR|KOR)\s*$",
     re.IGNORECASE,
 )
+
+
+def _address_candidates(text: str) -> list[str]:
+    """Return address-like lines ending in KR/KOR, Korean or English.
+
+    Foreign-rider Uber screens can localize addresses to English (for example
+    "Daegu Suseong District KOR"). The country suffix is the stable anchor;
+    no Korean administrative-token requirement is imposed.
+    """
+    out = []
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        m = _ADDRESS_LINE_RE.match(line)
+        if not m:
+            continue
+        addr = m.group("addr").strip(" ·•")
+        if len(addr) < 5:
+            continue
+        if re.search(r"(?:₩|￦|\b(?:AM|PM)\b|\bkm\b|\d+분|\d+초)", addr, re.IGNORECASE):
+            continue
+        if not re.search(r"[가-힣A-Za-z]", addr):
+            continue
+        out.append(addr)
+    return out
 
 
 def _amounts(text: str) -> list[int]:
@@ -52,7 +76,7 @@ def looks_like_uber_trip_detail(text: str) -> bool:
     has_datetime = bool(_DATE_TIME_RE.search(text))
     has_duration = bool(_DURATION_RE.search(text))
     has_distance = bool(_DISTANCE_RE.search(text))
-    has_two_addresses = len(_ADDRESS_RE.findall(text)) >= 2
+    has_two_addresses = len(_address_candidates(text)) >= 2
     has_currency = bool(_amounts(text))
     independent_anchor_count = sum([
         has_datetime,
@@ -104,10 +128,16 @@ def _parse_duration_distance(text: str, result: dict) -> None:
 
 
 def _parse_addresses(text: str, result: dict) -> None:
-    matches = [m.strip() for m in _ADDRESS_RE.findall(text)]
+    matches = _address_candidates(text)
     if len(matches) >= 2:
         result["출발지"] = matches[0]
         result["도착지"] = matches[1]
+        result["주소표기"] = (
+            "ENGLISH"
+            if re.search(r"[A-Za-z]", matches[0] + " " + matches[1])
+            and not re.search(r"[가-힣]", matches[0] + " " + matches[1])
+            else "KOREAN_OR_MIXED"
+        )
     else:
         result["parse_errors"].append(f"출발/도착 파싱실패(찾은건수:{len(matches)})")
 

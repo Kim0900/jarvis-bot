@@ -107,6 +107,54 @@ class UberTripParserV2Tests(unittest.TestCase):
         text = "운행 세부사항\n2026. 9. 15. PM 11:57\n11.81 km"
         self.assertFalse(looks_like_uber_trip_detail(text))
 
+    def test_kor_korean_address_variant(self):
+        text = """운행 세부사항
+일반 콜 · 2026. 10. 3. · PM 8:36
+₩4,800
+시간
+4분 46초
+거리
+1.69 km
+대구광역시 북구 침산동 KOR
+대구광역시 북구 산격동 KOR
+3포인트 수익을 달성했습니다
+직접 결제
+"""
+        self.assertTrue(looks_like_uber_trip_detail(text))
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertEqual(parsed["날짜"], "2026-10-03")
+        self.assertEqual(parsed["배차시각"], "20:36")
+        self.assertEqual(parsed["요금"], 4800)
+        self.assertEqual(parsed["출발지"], "대구광역시 북구 침산동")
+        self.assertEqual(parsed["도착지"], "대구광역시 북구 산격동")
+        self.assertEqual(parsed["주소표기"], "KOREAN_OR_MIXED")
+        self.assertEqual(parsed["결제수단"], "직접결제")
+        self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
+    def test_foreign_rider_english_kor_addresses(self):
+        text = """운행 세부사항
+XL · 2026. 10. 4. · AM 5:20
+₩12,805
+시간
+22분 59초
+거리
+9.57 km
+Daegu Suseong District KOR
+Daegu Dong-gu Jijeo-dong KOR
+3포인트 수익을 달성했습니다
+"""
+        self.assertTrue(looks_like_uber_trip_detail(text))
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertEqual(parsed["날짜"], "2026-10-04")
+        self.assertEqual(parsed["배차시각"], "05:20")
+        self.assertEqual(parsed["요금"], 12805)
+        self.assertEqual(parsed["운행시간_분"], 23.0)
+        self.assertEqual(parsed["거리_km"], 9.57)
+        self.assertEqual(parsed["출발지"], "Daegu Suseong District")
+        self.assertEqual(parsed["도착지"], "Daegu Dong-gu Jijeo-dong")
+        self.assertEqual(parsed["주소표기"], "ENGLISH")
+        self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
 
 if __name__ == "__main__":
     unittest.main()

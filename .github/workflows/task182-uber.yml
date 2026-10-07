@@ -1,0 +1,39 @@
+name: Task182 Uber parser and S700 matching
+
+on:
+  pull_request:
+    paths:
+      - "uber_trip_parser.py"
+      - "s700_ingest.py"
+      - "tests/test_uber_trip_parser.py"
+      - "tests/test_s700.py"
+      - ".github/workflows/task182-uber.yml"
+  push:
+    branches: [main]
+    paths:
+      - "uber_trip_parser.py"
+      - "s700_ingest.py"
+      - "tests/test_uber_trip_parser.py"
+      - "tests/test_s700.py"
+      - ".github/workflows/task182-uber.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile uber_trip_parser.py s700_ingest.py
+      - name: Uber parser regression
+        run: python -m unittest tests.test_uber_trip_parser -v
+      - name: S700 deterministic regression
+        run: python tests/test_s700.py
+      - name: Task174 identity regression
+        run: python -m unittest tests.test_task174_identity_gate -v

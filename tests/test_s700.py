@@ -178,10 +178,50 @@ s_, m_, meth, det = S.match_trip(uber_trip, [uber_call])
 check("우버: 구조필드 NULL(비고에만 값) → PROVISIONAL, MATCHED 금지", s_ == "PROVISIONAL" and m_ is None, (s_, meth))
 uc2 = dict(uber_call); uc2.update({"운행시간_분": 17.1, "주행거리_km": 12.37})
 s_, m_, meth, det = S.match_trip(uber_trip, [uc2])
-check("우버: 구조필드 확보 시 요금+운행시간+거리로 MATCHED(시작 6분차에도)", s_ == "MATCHED" and m_ == 1440, (s_, meth, det.get("chosen")))
-uc3 = dict(uber_call); uc3.update({"운행시간_분": 30.0, "주행거리_km": 12.37})
+check("우버: 구조필드 확보 시 시간+운행시간+거리로 MATCHED(시작 6분차에도)",
+      s_ == "MATCHED" and m_ == 1440 and meth == "uber_time_duration_distance",
+      (s_, meth, det.get("chosen")))
+
+# Task#182 natural XL shape: Uber payout != S700 meter fare is normal; fare is advisory only.
+xl_call = {
+    "id": 1820, "날짜": "2026-10-04", "배차시각": "05:20", "하차시각": None,
+    "요금": 12805, "콜유형": "우버", "운행시간_분": 23.0, "주행거리_km": 9.57,
+    "영업거리_km": None, "raw_row_type": None,
+    "data_source": "drive_ocr_tesseract", "verify_status": "unverified",
+}
+xl_trip = {
+    "trip_start": "2026-10-04T05:29:12+09:00",
+    "trip_end": "2026-10-04T05:51:12+09:00",
+    "fare": 12600,
+    "distance_km": 9.359,
+}
+s_, m_, meth, det = S.match_trip(xl_trip, [xl_call])
+check("우버 XL: payout 12,805 != meter 12,600이어도 15분창+duration+distance면 MATCHED",
+      s_ == "MATCHED" and m_ == 1820 and meth == "uber_time_duration_distance",
+      (s_, meth, det.get("chosen")))
+check("우버 요금차이는 evidence로만 보존",
+      det["chosen"]["fare_exact"] is False and det["chosen"]["fare_delta"] == 205,
+      det.get("chosen"))
+
+xl_late = dict(xl_call); xl_late.update({"id": 1821, "배차시각": "05:13"})
+s_, _, _, _ = S.match_trip(xl_trip, [xl_late])
+check("우버: 기존 15분 후보창 초과는 요금과 무관하게 UNMATCHED", s_ == "UNMATCHED", s_)
+
+xl_dup = dict(xl_call); xl_dup.update({"id": 1822, "요금": 11990})
+s_, m_, meth, det = S.match_trip(xl_trip, [xl_call, xl_dup])
+check("우버: 시간/운행시간/거리 동등 후보 2개면 AMBIGUOUS", s_ == "AMBIGUOUS" and m_ is None,
+      (s_, meth, det.get("ambiguous_call_ids")))
+
+uc3 = dict(uber_call); uc3.update({"운행시간_분": 30.0, "주행거리_km": 12.37, "요금": 15000})
 s_, _, _, _ = S.match_trip(uber_trip, [uc3])
-check("우버: 운행시간 불일치 → UNMATCHED", s_ == "UNMATCHED", s_)
+check("우버: 요금이 달라도 운행시간 불일치면 UNMATCHED", s_ == "UNMATCHED", s_)
+
+uc_missing = dict(uber_call); uc_missing.update({"요금": 15000})
+s_, m_, meth, _ = S.match_trip(uber_trip, [uc_missing])
+check("우버: 요금 불일치만으로 거절하지 않고 구조필드 없으면 PROVISIONAL",
+      s_ == "PROVISIONAL" and m_ is None and meth == "uber_time_only_structured_missing",
+      (s_, meth))
+
 uc4 = dict(uber_call); uc4.update({"콜유형": "카카오T", "하차시각": "02:31"})
 s_, _, _, _ = S.match_trip(uber_trip, [uc4])
 check("전역 ±3분 규칙 미적용: 카카오T였다면 6분 차이는 불일치", s_ == "UNMATCHED", s_)
