@@ -865,16 +865,30 @@ class HealthHandler(BaseHTTPRequestHandler):
                         )
 
                     if result.get("success"):
+                        if (
+                            result.get("format") == "daily_history"
+                            and not result.get("layout_primary")
+                        ):
+                            asyncio.run(record_kakao_daily_page_evidence(
+                                source_id=source_id,
+                                page_date=result.get("page_date"),
+                                displayed_count=result.get("displayed_count"),
+                                covered_count=result.get("covered_count"),
+                                inserted_count=result.get("saved_count", 0),
+                                duplicate_skipped_count=result.get("duplicate_skipped_count", 0),
+                                displayed_amount=result.get("displayed_amount"),
+                            ))
                         asyncio.run(mark_call_image_ingestion(
                             source_id,
                             "COMPLETED",
                             fmt=result.get("format"),
                             inserted_count=result.get("saved_count", 0),
                         ))
-                        _schedule_s700_rematch_after_raw_change(
-                            source_id=source_id,
-                            reason=f"image:{result.get('format')}",
-                        )
+                        if result.get("format") != "kakao_monthly_history_control":
+                            _schedule_s700_rematch_after_raw_change(
+                                source_id=source_id,
+                                reason=f"image:{result.get('format')}",
+                            )
                         result["duplicate"] = False
                         send_json(200, result)
                     else:
@@ -943,6 +957,15 @@ class HealthHandler(BaseHTTPRequestHandler):
                                             "REPAIR_COVERAGE_COUNT_MISMATCH:"
                                             f"{_saved}+{_dups}/{_expected}"
                                         )
+                                    asyncio.run(record_kakao_daily_page_evidence(
+                                        source_id=source_id,
+                                        page_date=_repair_candidate.get("날짜"),
+                                        displayed_count=_expected,
+                                        covered_count=_expected,
+                                        inserted_count=_saved,
+                                        duplicate_skipped_count=_dups,
+                                        displayed_amount=_repair_candidate.get("표시금액"),
+                                    ))
                                     asyncio.run(mark_call_image_ingestion(
                                         source_id,
                                         "COMPLETED",
@@ -1836,6 +1859,54 @@ async def mark_call_image_ingestion(
         raise RuntimeError(
             f"ingestion 상태기록 실패: source_id={source_id}, status={status}, result={result}"
         )
+    return result
+
+
+async def record_kakao_daily_page_evidence(
+    source_id: str,
+    page_date: str,
+    displayed_count: int,
+    covered_count: int,
+    inserted_count: int,
+    duplicate_skipped_count: int,
+    displayed_amount: int = None,
+) -> dict:
+    """Task #181: record fully-covered Kakao daily page evidence."""
+    result = await sb_h(
+        "POST",
+        "rpc/record_kakao_daily_page_evidence",
+        json={
+            "p_source_id": source_id,
+            "p_page_date": page_date,
+            "p_displayed_count": int(displayed_count or 0),
+            "p_covered_count": int(covered_count or 0),
+            "p_inserted_count": int(inserted_count or 0),
+            "p_duplicate_skipped_count": int(duplicate_skipped_count or 0),
+            "p_displayed_amount": (
+                int(displayed_amount) if displayed_amount is not None else None
+            ),
+        },
+        headers=_internal_rpc_headers(),
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"kakao daily evidence record failed: {result}")
+    return result
+
+
+async def upsert_kakao_monthly_controls(source_id: str, items: list[dict]) -> dict:
+    """Task #181: atomically store monthly control totals."""
+    result = await sb_h(
+        "POST",
+        "rpc/upsert_kakao_monthly_controls",
+        json={
+            "p_source_id": source_id,
+            "p_items": items or [],
+            "p_source_kind": "monthly_history",
+        },
+        headers=_internal_rpc_headers(),
+    )
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"kakao monthly control upsert failed: {result}")
     return result
 
 
@@ -3699,11 +3770,15 @@ def parse_uber_trip_detail(text: str) -> dict:
 
 
 def detect_and_parse_call_document(text: str) -> dict:
-    """task93 Drive일괄처리 — OCR 텍스트만 보고 4형식 중 자동판별 후
-    해당 파서 적용. 우선순위: 헤더가 뚜렷한 ①②④를 먼저 체크,
-    나머지는 ③(카카오T 개별운행상세)로 판정 — AI 판단 아닌 키워드 매칭."""
+    """Deterministic document classifier for Drive ingestion."""
     if "매출" in text and "집계" in text:
         return parse_meter_receipt(text)
+    from kakao_monthly_history_parser import (
+        looks_like_kakao_monthly_history,
+        parse_kakao_monthly_history_text,
+    )
+    if looks_like_kakao_monthly_history(text):
+        return parse_kakao_monthly_history_text(text)
     if "일별" in text and "운행" in text and "이력" in text:
         return parse_daily_history(text)
     # 2026-09-11 CASPER_콜카드_파일명비의존_판별 작업지시서 반영: 단일
@@ -3798,6 +3873,32 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
     parsed = detect_and_parse_call_document(text)
     fmt = parsed.get("format")
     payloads = []
+    daily_validation = None
+
+    if fmt == "kakao_monthly_history_control":
+        if not parsed.get("success"):
+            return {
+                "success": False,
+                "format": fmt,
+                "error": parsed.get("error_code") or "KAKAO_MONTHLY_PARSE_FAILED",
+                "error_code": parsed.get("error_code") or "KAKAO_MONTHLY_PARSE_FAILED",
+                "saved_count": 0,
+                "source_id": source_id,
+            }
+        control = await upsert_kakao_monthly_controls(
+            source_id,
+            parsed.get("items") or [],
+        )
+        return {
+            "success": True,
+            "format": fmt,
+            "saved_count": 0,
+            "source_id": source_id,
+            "control_updated_count": int(control.get("updated_count") or 0),
+            "monthly_total": parsed.get("monthly_total"),
+            "year": parsed.get("year"),
+            "month": parsed.get("month"),
+        }
 
     if fmt == "meter_receipt":
         for item in parsed.get("items", []):
@@ -3814,6 +3915,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         from daily_history_parser import validate_daily_history_document
 
         validation = validate_daily_history_document(parsed)
+        daily_validation = validation
         if not validation.get("ok"):
             return {
                 "success": False,
@@ -3931,7 +4033,7 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
             "parse_errors": parsed.get("parse_errors", []),
         }
 
-    return {
+    response = {
         "success": True,
         "format": fmt,
         "saved_count": persisted.get("inserted_count", 0),
@@ -3941,6 +4043,17 @@ async def process_and_save_call_document(text: str, source_id: str = None) -> di
         "parse_errors": parsed.get("parse_errors", []),
         "source_id": source_id,
     }
+    if fmt == "daily_history":
+        response.update({
+            "page_date": parsed.get("날짜"),
+            "displayed_count": (
+                daily_validation.get("displayed_count") if daily_validation else len(payloads)
+            ),
+            "displayed_amount": (
+                daily_validation.get("displayed_amount") if daily_validation else None
+            ),
+        })
+    return response
 
 
 def calc_service_date(날짜_str: str, 배차시각_str: str) -> dict:
