@@ -6212,6 +6212,49 @@ async def run_geomnuri_patrol_once() -> dict:
     except Exception as e:
         await emit("patrol_internal_ingestion_check", f"순라 ingestion 점검 자체 실패: {e}", severity="CRITICAL")
 
+    # 4-B) Task#181 Kakao A-axis completeness mismatch
+    # OPEN은 control total 미확보 상태이므로 장애가 아니다. 월별 control이
+    # 존재하는데 daily page evidence가 불완전한 MISMATCH만 하루 1회 경고한다.
+    try:
+        end_date = today_kst()
+        start_date = end_date - timedelta(days=45)
+        completeness_rows = await sb_h(
+            "POST",
+            "rpc/get_kakao_daily_completeness_v1",
+            json={
+                "p_start_date": str(start_date),
+                "p_end_date": str(end_date),
+            },
+            headers=_internal_rpc_headers(),
+        )
+        if not isinstance(completeness_rows, list):
+            completeness_rows = []
+        for row in completeness_rows:
+            if str(row.get("completeness_status") or "").upper() != "MISMATCH":
+                continue
+            page_date = str(row.get("page_date") or "unknown")
+            expected = int(row.get("expected_count") or 0)
+            observed = int(row.get("observed_count") or 0)
+            missing = int(row.get("missing_count") or 0)
+            extra = int(row.get("extra_count") or 0)
+            await emit(
+                f"kakao_completeness::{page_date}::{expected}::{observed}",
+                f"카카오 A축 완결성 불일치: {page_date}, "
+                f"월별 정본={expected}건 / 일별 evidence={observed}건 "
+                f"(누락={missing}, 초과={extra}). 최종 일별 화면 재업로드 필요.",
+                task_id=181,
+                severity="WARN",
+                cooldown_seconds=24 * 3600,
+            )
+    except Exception as e:
+        await emit(
+            "patrol_internal_kakao_completeness_check",
+            f"순라 Kakao A축 완결성 점검 자체 실패: {e}",
+            task_id=181,
+            severity="CRITICAL",
+            cooldown_seconds=3600,
+        )
+
     # 5) task-linked domain NULL 재발 — task#83 회귀 감시
     try:
         cutoff = now - timedelta(hours=1)
