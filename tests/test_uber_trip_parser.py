@@ -131,6 +131,54 @@ class UberTripParserV2Tests(unittest.TestCase):
         self.assertEqual(parsed["결제수단"], "직접결제")
         self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
 
+    def test_foreign_rider_english_kor_addresses_without_currency_glyph(self):
+        text = """운행 세부사항
+XL · 2026. 10. 4. · AM 5:20
+12,805
+시간
+22분 59초
+거리
+9.57 km
+Daegu Suseong District KOR
+Daegu Dong-gu Jijeo-dong KOR
+3포인트 수익을 달성했습니다
+"""
+        self.assertTrue(looks_like_uber_trip_detail(text))
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertEqual(parsed["요금"], 12805)
+        self.assertEqual(parsed["요금근거"], "COMPACT_HEADER_UNIQUE_BARE_AMOUNT")
+        self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
+    def test_foreign_rider_xl_period_thousands_fallback(self):
+        text = """운행 세부사항
+XL · 2026. 10. 4. · AM 5:20
+12.805
+시간
+22분 59초
+거리
+9.57 km
+Daegu Suseong District KOR
+Daegu Dong-gu Jijeo-dong KOR
+"""
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertEqual(parsed["요금"], 12805)
+        self.assertEqual(parsed["요금근거"], "COMPACT_HEADER_UNIQUE_BARE_AMOUNT")
+
+    def test_bare_amount_fallback_does_not_use_later_distance_or_points(self):
+        text = """운행 세부사항
+XL · 2026. 10. 4. · AM 5:20
+시간
+22분 59초
+거리
+9.57 km
+Daegu Suseong District KOR
+Daegu Dong-gu Jijeo-dong KOR
+3포인트 수익을 달성했습니다
+"""
+        parsed = parse_uber_trip_detail_text(text)
+        self.assertNotIn("요금", parsed)
+        self.assertIn("요금 파싱실패", parsed["parse_errors"])
+
     def test_foreign_rider_english_kor_addresses(self):
         text = """운행 세부사항
 XL · 2026. 10. 4. · AM 5:20
