@@ -5,6 +5,10 @@ on:
     paths:
       - "uber_trip_parser.py"
       - "s700_ingest.py"
+      - "bot_v5_legacy.py"
+      - "tesseract-ocr-service/app.py"
+      - "bot_v5_legacy.py"
+      - "tesseract-ocr-service/app.py"
       - "tests/test_uber_trip_parser.py"
       - "tests/test_s700.py"
       - ".github/workflows/task182-uber.yml"
@@ -30,7 +34,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile uber_trip_parser.py s700_ingest.py
+        run: python -m py_compile uber_trip_parser.py s700_ingest.py bot_v5_legacy.py tesseract-ocr-service/app.py
       - name: Uber parser regression
         run: python -m unittest tests.test_uber_trip_parser -v
       - name: S700 deterministic regression
