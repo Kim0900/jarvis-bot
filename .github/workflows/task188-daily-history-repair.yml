@@ -1,0 +1,37 @@
+name: Task188 daily history repair
+
+on:
+  pull_request:
+    paths:
+      - "daily_history_parser.py"
+      - "bot_v5_legacy.py"
+      - "tests/test_daily_history_parser.py"
+      - ".github/workflows/task188-daily-history-repair.yml"
+  push:
+    branches: [main]
+    paths:
+      - "daily_history_parser.py"
+      - "bot_v5_legacy.py"
+      - "tests/test_daily_history_parser.py"
+      - ".github/workflows/task188-daily-history-repair.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile daily_history_parser.py bot_v5_legacy.py
+      - name: Daily parser repair regression
+        run: python -m unittest tests.test_daily_history_parser -v
+      - name: Primary persistence regression
+        run: python -m unittest tests.test_daily_history_primary_persistence -v
+      - name: Cross-source identity regression
+        run: python -m unittest tests.test_task174_identity_gate -v
