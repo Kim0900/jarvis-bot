@@ -238,6 +238,20 @@ def parse_daily_history_text(text: str) -> dict[str, Any]:
         result["parse_errors"].append("콜 목록 파싱실패")
     return result
 
+FARE_PROBE_REPAIRABLE_ERROR_CODES = {
+    "DAILY_HISTORY_COUNT_MISMATCH",
+    "DAILY_HISTORY_ANCHOR_MISMATCH",
+    "DAILY_HISTORY_AMOUNT_MISMATCH",
+    # Task#188: layout-primary can fail card re-OCR while legacy header/body
+    # and the independent fare-column probe remain fully consistent.
+    "LAYOUT_CARD_REOCR_UNRESOLVED",
+}
+
+
+def should_try_fare_probe_repair(error_code: str | None) -> bool:
+    return str(error_code or "") in FARE_PROBE_REPAIRABLE_ERROR_CODES
+
+
 def repair_daily_history_with_fare_probe(text: str, fare_amounts: list[int]) -> dict[str, Any]:
     """본문 OCR 주소/시간과 요금전용 OCR을 엄격히 결합한다.
 
