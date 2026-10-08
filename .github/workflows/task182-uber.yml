@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "uber_trip_parser.py"
+      - "bot_v5_legacy.py"
       - "s700_ingest.py"
       - "tests/test_uber_trip_parser.py"
       - "tests/test_s700.py"
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - "uber_trip_parser.py"
+      - "bot_v5_legacy.py"
       - "s700_ingest.py"
       - "tests/test_uber_trip_parser.py"
       - "tests/test_s700.py"
@@ -30,7 +32,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile uber_trip_parser.py s700_ingest.py
+        run: python -m py_compile uber_trip_parser.py bot_v5_legacy.py s700_ingest.py
       - name: Uber parser regression
         run: python -m unittest tests.test_uber_trip_parser -v
       - name: S700 deterministic regression
