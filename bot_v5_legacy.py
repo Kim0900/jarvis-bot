@@ -944,12 +944,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 result["fare_probe_sum"] = sum(_probe_amounts)
                                 result["fare_probe_amounts"] = _probe_amounts[:20]
 
-                                if result.get("error_code") in (
-                                    "DAILY_HISTORY_COUNT_MISMATCH",
-                                    "DAILY_HISTORY_ANCHOR_MISMATCH",
-                                    "DAILY_HISTORY_AMOUNT_MISMATCH",
-                                ):
-                                    from daily_history_parser import repair_daily_history_with_fare_probe
+                                from daily_history_parser import (
+                                    repair_daily_history_with_fare_probe,
+                                    should_try_fare_probe_repair,
+                                )
+                                if should_try_fare_probe_repair(result.get("error_code")):
                                     _repair = repair_daily_history_with_fare_probe(text, _probe_amounts)
                                     result["fare_repair_error_code"] = _repair.get("error_code")
                                     result["fare_repair_message"] = _repair.get("message")

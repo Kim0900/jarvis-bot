@@ -4,6 +4,7 @@ from daily_history_parser import (
     extract_fare_probe_amounts,
     parse_daily_history_text,
     repair_daily_history_with_fare_probe,
+    should_try_fare_probe_repair,
     validate_daily_history_document,
 )
 
@@ -189,6 +190,35 @@ class TestDailyHistoryParser(unittest.TestCase):
         repaired = repair_daily_history_with_fare_probe(GOLDEN_10, fares)
         self.assertFalse(repaired["repaired"])
         self.assertEqual(repaired["error_code"], "REPAIR_EXISTING_FARE_MISMATCH")
+
+    def test_task188_layout_reocr_failure_is_repair_eligible_only(self):
+        self.assertTrue(
+            should_try_fare_probe_repair("LAYOUT_CARD_REOCR_UNRESOLVED")
+        )
+        self.assertFalse(
+            should_try_fare_probe_repair("LAYOUT_CARD_DATE_OUT_OF_RANGE")
+        )
+        self.assertFalse(
+            should_try_fare_probe_repair("LAYOUT_INDEPENDENT_HEADER_DISAGREEMENT")
+        )
+
+    def test_task188_single_row_7200_strict_repair(self):
+        text = """일별 운행 이력
+2026년 10월 8일(목) 1건
+실시간 운행 1건 / 7,200원
+00:05 - 00:13 실시간
+대구 달서구 죽전동
+대구 서구 상중이동
+"""
+        repaired = repair_daily_history_with_fare_probe(text, [7200])
+        self.assertTrue(repaired["repaired"])
+        parsed = repaired["parsed"]
+        self.assertEqual(parsed["날짜"], "2026-10-08")
+        self.assertEqual(len(parsed["items"]), 1)
+        self.assertEqual(parsed["items"][0]["요금"], 7200)
+        self.assertEqual(parsed["items"][0]["탑승시각"], "00:05")
+        self.assertEqual(parsed["items"][0]["하차시각"], "00:13")
+        self.assertTrue(validate_daily_history_document(parsed)["ok"])
 
     def test_amount_mismatch_is_fail_closed(self):
         p = parse_daily_history_text(ONE_ROW.replace("7,700원\n00:05", "8,000원\n00:05", 1))
