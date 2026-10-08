@@ -65,6 +65,90 @@ def _amounts(text: str) -> list[int]:
     return out
 
 
+def extract_focused_uber_fare_amounts(text: str) -> list[int]:
+    """Extract fare candidates from a spatially isolated Uber header crop.
+
+    The crop is expected to contain the trip header/date and large fare only.
+    Date/time, duration, distance, and arbitrary body numbers are rejected.
+    A caller must treat more than one unique amount as ambiguous.
+    """
+    out = []
+    for raw_line in str(text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if re.search(
+            r"(?:\b(?:AM|PM)\b|\bkm\b|\d{1,2}:\d{2}|\d+\s*분|\d+\s*초|"
+            r"\b20\d{2}\b|운행|일반\s*콜|XL)",
+            line,
+            re.IGNORECASE,
+        ):
+            continue
+        nums = re.findall(
+            r"(?<!\d)(\d{1,3}(?:\s*[,\.]\s*\d{3})+|\d{4,6})(?!\d)",
+            line,
+        )
+        if len(nums) != 1:
+            continue
+        raw = re.sub(r"[,\.\s]", "", nums[0])
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if 1000 <= value <= 1000000:
+            out.append(value)
+    return sorted(set(out))
+
+
+def reconcile_compact_fare_with_probe(parsed: dict, probe_text: str | None) -> dict:
+    """Cross-check compact Uber fare against focused header OCR.
+
+    No probe evidence means compatibility fallback to the existing whole-image
+    parse. More than one focused candidate fails closed. Exactly one focused
+    candidate is spatially stronger fare evidence and may replace a conflicting
+    whole-image amount without changing any structural trip field.
+    """
+    out = dict(parsed or {})
+    if out.get("ui_variant") != "compact_detail_v2" or probe_text is None:
+        return {"ok": True, "parsed": out, "probe_status": "NOT_APPLICABLE"}
+
+    amounts = extract_focused_uber_fare_amounts(probe_text)
+    if not amounts:
+        return {"ok": True, "parsed": out, "probe_status": "NO_EVIDENCE"}
+    if len(amounts) != 1:
+        return {
+            "ok": False,
+            "error_code": "UBER_FOCUSED_FARE_AMBIGUOUS",
+            "message": "집중 요금 OCR 후보가 유일하지 않음",
+            "probe_amounts": amounts,
+        }
+
+    focused = amounts[0]
+    whole = out.get("요금")
+    if whole is not None and int(whole) != focused:
+        out["요금_whole_ocr_참고"] = int(whole)
+        out["요금"] = focused
+        out["요금근거"] = "COMPACT_HEADER_FOCUSED_REOCR"
+        return {
+            "ok": True,
+            "parsed": out,
+            "probe_status": "CORRECTED",
+            "focused_amount": focused,
+            "whole_amount": int(whole),
+        }
+
+    out["요금"] = focused
+    if whole is None:
+        out["요금근거"] = "COMPACT_HEADER_FOCUSED_REOCR"
+    return {
+        "ok": True,
+        "parsed": out,
+        "probe_status": "AGREED" if whole is not None else "RECOVERED",
+        "focused_amount": focused,
+        "whole_amount": int(whole) if whole is not None else None,
+    }
+
+
 def _header_bare_amounts(text: str) -> list[int]:
     """Fallback for compact Uber screens when OCR drops the currency glyph.
 

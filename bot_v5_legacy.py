@@ -887,7 +887,30 @@ class HealthHandler(BaseHTTPRequestHandler):
                             type(_shadow_parse_err).__name__,
                         )
 
-                    result = asyncio.run(process_and_save_call_document(text, source_id=source_id))
+                    _uber_fare_probe_text = None
+                    try:
+                        _preparsed = detect_and_parse_call_document(text)
+                        if (
+                            _preparsed.get("format") == "uber_trip_detail"
+                            and _preparsed.get("ui_variant") == "compact_detail_v2"
+                        ):
+                            _uber_probe_bytes = crop_uber_compact_header(image_bytes)
+                            _uber_fare_probe_text = asyncio.run(
+                                google_vision_ocr(_uber_probe_bytes, lang="eng")
+                            )
+                    except Exception as _uber_probe_err:
+                        logger.warning(
+                            "[TASK190_UBER_FARE_PROBE] optional focused OCR unavailable "
+                            "source_id=%s error=%s",
+                            source_id,
+                            f"{type(_uber_probe_err).__name__}:{str(_uber_probe_err)[:220]}",
+                        )
+
+                    result = asyncio.run(process_and_save_call_document(
+                        text,
+                        source_id=source_id,
+                        uber_fare_probe_text=_uber_fare_probe_text,
+                    ))
                     if _shadow_parsed is not None:
                         _schedule_daily_history_layout_shadow(
                             image_bytes=image_bytes,
@@ -2382,6 +2405,26 @@ def merge_split_ocr_results(top_data: dict, bottom_data: dict) -> dict:
     return merged
 
 
+def crop_uber_compact_header(image_bytes: bytes) -> bytes:
+    """task#190: compact Uber header/fare 영역만 공간적으로 격리한다.
+
+    Whole-image OCR이 visible 4,800을 44,800으로 읽은 production 재현을
+    막기 위한 focused second pass. 날짜/요금 아래의 지도·거리영역은 가능한
+    한 제외하고 원본 화면 상단 10~27%만 사용한다.
+    """
+    from PIL import Image
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.width, img.height
+    y0 = max(0, int(h * 0.10))
+    y1 = min(h, max(y0 + 1, int(h * 0.27)))
+    crop = img.crop((0, y0, w, y1))
+    if crop.mode not in ("RGB", "L"):
+        crop = crop.convert("RGB")
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=95, optimize=True)
+    return buf.getvalue()
+
+
 def crop_daily_history_fare_column(image_bytes: bytes) -> bytes:
     """task#164 진단용: 일별운행이력 우측 요금영역만 잘라 OCR 밀도를 높인다.
 
@@ -3690,10 +3733,11 @@ async def auto_cross_check_recent_days(days_back: int = 3) -> str:
 # 교체(commit 708ac09)가 통째로 Google Vision 버전으로 되돌아갔던
 # 것을 발견·복구. 재발방지: 이번엔 GitHub에서 즉시 전 새로 curl.
 # ──────────────────────────────────────────────
-async def google_vision_ocr(image_bytes: bytes) -> str:
+async def google_vision_ocr(image_bytes: bytes, lang: str = "kor+eng") -> str:
     """비LLM OCR — 순수 문자인식만 수행(AI 판단·해석 없음).
     실제로는 자체 Tesseract Docker서비스(jarvis-ocr-tesseract)를
-    호출한다. 함수명은 호출부(3단계 파서들) 변경 최소화를 위해 유지."""
+    호출한다. 함수명은 호출부(3단계 파서들) 변경 최소화를 위해 유지.
+    lang 기본값은 기존 kor+eng이며 focused numeric probes may request eng."""
     service_url = os.getenv("OCR_SERVICE_URL")
     mcp_key = os.getenv("OCR_MCP_KEY")
     if not service_url or not mcp_key:
@@ -3706,7 +3750,7 @@ async def google_vision_ocr(image_bytes: bytes) -> str:
         resp = await client.post(
             f"{service_url}/ocr",
             headers={"X-MCP-Key": mcp_key},
-            json={"image_base64": b64, "lang": "kor+eng"},
+            json={"image_base64": b64, "lang": lang},
         )
     if resp.status_code >= 400:
         raise RuntimeError(f"Tesseract OCR서비스 HTTP {resp.status_code}: {resp.text[:300]}")
@@ -4067,10 +4111,34 @@ async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> di
     return await _persist_raw_call_batch(payloads, source_id=source_id)
 
 
-async def process_and_save_call_document(text: str, source_id: str = None) -> dict:
-    """OCR text -> deterministic parse -> Task #174 identity gate -> raw_calls."""
+async def process_and_save_call_document(
+    text: str,
+    source_id: str = None,
+    uber_fare_probe_text: str = None,
+) -> dict:
+    """OCR text -> deterministic parse -> focused Uber fare check -> identity gate."""
     parsed = detect_and_parse_call_document(text)
     fmt = parsed.get("format")
+
+    if fmt == "uber_trip_detail" and parsed.get("ui_variant") == "compact_detail_v2":
+        from uber_trip_parser import reconcile_compact_fare_with_probe
+        fare_probe = reconcile_compact_fare_with_probe(parsed, uber_fare_probe_text)
+        if not fare_probe.get("ok"):
+            return {
+                "success": False,
+                "error": fare_probe.get("message"),
+                "error_code": fare_probe.get("error_code"),
+                "error_stage": "uber_focused_fare_probe",
+                "format": fmt,
+                "saved_count": 0,
+                "source_id": source_id,
+                "probe_amounts": fare_probe.get("probe_amounts", []),
+            }
+        parsed = fare_probe.get("parsed") or parsed
+        parsed["fare_probe_status"] = fare_probe.get("probe_status")
+        if fare_probe.get("focused_amount") is not None:
+            parsed["fare_probe_amount"] = fare_probe.get("focused_amount")
+
     payloads = []
     daily_validation = None
 
