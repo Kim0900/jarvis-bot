@@ -10,6 +10,7 @@ import time
 import asyncio
 import logging
 import threading
+import queue
 import base64
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1368,22 +1369,117 @@ def run_health_server():
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
 async def send_telegram_broadcast(text: str):
-    """긴급수정(2026-08-23): 기존 send_all()은 main() 함수 내부의 지역함수(closure)라
-    모듈레벨 함수(check_ingestion_gap, ask_operated_status_telegram, task#52 마기자동
-    검증 등)에서 호출하면 NameError로 조용히 실패하고 있었음(task#52 실기기검증중
-    "텔레그램에 아무것도 안 옴"으로 발견 — 대표님 지적). 모듈레벨에서 독립적으로
-    작동하는 전역 발송함수로 대체, app 객체 의존 없이 별도 Bot 인스턴스 사용."""
+    """모듈레벨 Telegram broadcast. 호출자는 반환값을 무시해도 된다."""
     from telegram import Bot
     chat_ids = [x for x in [os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")] if x]
     if not chat_ids:
         logger.error("send_telegram_broadcast: ALLOWED_CHAT_ID 미설정")
-        return
+        return {"sent": 0, "failed": 0}
     bot = Bot(token=TELEGRAM_TOKEN)
+    sent = 0
+    failed = 0
     for cid in chat_ids:
         try:
             await bot.send_message(chat_id=cid, text=text)
+            sent += 1
         except Exception as e:
+            failed += 1
             logger.error(f"텔레그램 발송 실패(chat_id={cid}): {e}")
+    return {"sent": sent, "failed": failed}
+
+
+# task#187: ingestion visibility — Telegram failure must never fail data ingestion.
+_INGEST_NOTIFY_QUEUE = queue.Queue()
+_INGEST_NOTIFY_SEEN = set()
+_INGEST_NOTIFY_LOCK = threading.Lock()
+_INGEST_NOTIFY_WORKER_STARTED = False
+
+
+def _ingestion_notify_worker():
+    while True:
+        item = _INGEST_NOTIFY_QUEUE.get()
+        if item is None:
+            _INGEST_NOTIFY_QUEUE.task_done()
+            return
+        message, meta = item
+        try:
+            result = asyncio.run(send_telegram_broadcast(message)) or {}
+            logger.info(
+                "[INGEST_NOTIFY_SENT] stage=%s kind=%s source=%s sent=%s failed=%s",
+                meta.get("stage"), meta.get("kind"), meta.get("source_id"),
+                result.get("sent", 0), result.get("failed", 0),
+            )
+        except Exception as e:
+            logger.error(
+                "[INGEST_NOTIFY_FAILED] stage=%s kind=%s source=%s error=%s",
+                meta.get("stage"), meta.get("kind"), meta.get("source_id"),
+                f"{type(e).__name__}:{str(e)[:300]}",
+            )
+        finally:
+            _INGEST_NOTIFY_QUEUE.task_done()
+
+
+def queue_ingestion_notification(
+    *,
+    stage: str,
+    kind: str,
+    source_id: str = None,
+    file_name: str = None,
+    result: dict = None,
+    error: str = None,
+    retryable: bool = None,
+):
+    """Best-effort FIFO Telegram notification, deduped per process.
+
+    Never raises to ingestion callers. RECEIVED is sent once per source per process;
+    COMPLETED and identical ERROR are likewise deduped.
+    """
+    global _INGEST_NOTIFY_WORKER_STARTED
+    try:
+        from ingestion_notify import format_ingestion_message
+
+        _result = result or {}
+        _fingerprint = (
+            str(_result.get("format") or "")
+            if str(stage).upper() == "COMPLETED"
+            else str(error or _result.get("error") or _result.get("error_code") or "")[:180]
+        )
+        key = (str(stage).upper(), str(kind), str(source_id or ""), _fingerprint)
+        with _INGEST_NOTIFY_LOCK:
+            if key in _INGEST_NOTIFY_SEEN:
+                return False
+            _INGEST_NOTIFY_SEEN.add(key)
+            if len(_INGEST_NOTIFY_SEEN) > 5000:
+                _INGEST_NOTIFY_SEEN.clear()
+                _INGEST_NOTIFY_SEEN.add(key)
+            if not _INGEST_NOTIFY_WORKER_STARTED:
+                threading.Thread(
+                    target=_ingestion_notify_worker,
+                    name="ingestion-telegram-notify",
+                    daemon=True,
+                ).start()
+                _INGEST_NOTIFY_WORKER_STARTED = True
+
+        message = format_ingestion_message(
+            stage=stage,
+            kind=kind,
+            source_id=source_id,
+            file_name=file_name,
+            result=_result,
+            error=error,
+            retryable=retryable,
+        )
+        _INGEST_NOTIFY_QUEUE.put((
+            message,
+            {"stage": str(stage).upper(), "kind": kind, "source_id": source_id},
+        ))
+        return True
+    except Exception as e:
+        logger.error(
+            "[INGEST_NOTIFY_QUEUE_FAILED] stage=%s kind=%s source=%s error=%s",
+            stage, kind, source_id, f"{type(e).__name__}:{str(e)[:300]}",
+        )
+        return False
 
 
 async def sb_h(method: str, path: str, **kwargs) -> dict | list | None:
