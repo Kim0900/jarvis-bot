@@ -1,0 +1,39 @@
+name: Task187 ingestion Telegram notifications
+
+on:
+  pull_request:
+    paths:
+      - "bot_v5_legacy.py"
+      - "ingestion_notify.py"
+      - "tests/test_ingestion_notify.py"
+      - ".github/workflows/task187-ingestion-notify.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bot_v5_legacy.py"
+      - "ingestion_notify.py"
+      - "tests/test_ingestion_notify.py"
+      - ".github/workflows/task187-ingestion-notify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check
+        run: python -m py_compile bot_v5_legacy.py ingestion_notify.py
+      - name: Notification formatter tests
+        run: python -m unittest tests.test_ingestion_notify -v
+      - name: Daily-history persistence regression
+        run: python -m unittest tests.test_daily_history_primary_persistence -v
+      - name: Cross-source identity regression
+        run: python -m unittest tests.test_task174_identity_gate -v
+      - name: S700 deterministic regression
+        run: python tests/test_s700.py
