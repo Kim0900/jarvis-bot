@@ -1,8 +1,10 @@
 import unittest
 
 from uber_trip_parser import (
+    extract_focused_uber_fare_amounts,
     looks_like_uber_trip_detail,
     parse_uber_trip_detail_text,
+    reconcile_compact_fare_with_probe,
     validate_uber_trip_detail,
 )
 
@@ -130,6 +132,71 @@ class UberTripParserV2Tests(unittest.TestCase):
         self.assertEqual(parsed["주소표기"], "KOREAN_OR_MIXED")
         self.assertEqual(parsed["결제수단"], "직접결제")
         self.assertEqual(validate_uber_trip_detail(parsed), {"ok": True})
+
+    def test_task190_focused_probe_corrects_duplicated_leading_digit(self):
+        whole = """운행 세부사항
+일반 콜 · 2026. 10. 3. · PM 8:36
+₩44,800
+시간
+4분 46초
+거리
+1.69 km
+대구광역시 북구 침산동 KOR
+대구광역시 북구 산격동 KOR
+3포인트 수익을 달성했습니다
+직접 결제
+"""
+        parsed = parse_uber_trip_detail_text(whole)
+        self.assertEqual(parsed["요금"], 44800)
+        reconciled = reconcile_compact_fare_with_probe(
+            parsed,
+            "2026. 10. 3. PM 8:36\n¥#4,800\n",
+        )
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(reconciled["probe_status"], "CORRECTED")
+        self.assertEqual(reconciled["parsed"]["요금"], 4800)
+        self.assertEqual(reconciled["parsed"]["요금_whole_ocr_참고"], 44800)
+        self.assertEqual(
+            reconciled["parsed"]["요금근거"],
+            "COMPACT_HEADER_FOCUSED_REOCR",
+        )
+        self.assertEqual(validate_uber_trip_detail(reconciled["parsed"]), {"ok": True})
+
+    def test_task190_focused_probe_agreement_keeps_amount(self):
+        parsed = parse_uber_trip_detail_text(COMPACT_SAMPLE)
+        reconciled = reconcile_compact_fare_with_probe(
+            parsed,
+            "2026. 9. 15. PM 11:57\n₩18,600\n",
+        )
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(reconciled["probe_status"], "AGREED")
+        self.assertEqual(reconciled["parsed"]["요금"], 18600)
+        self.assertNotIn("요금_whole_ocr_참고", reconciled["parsed"])
+
+    def test_task190_focused_probe_ambiguous_fails_closed(self):
+        parsed = parse_uber_trip_detail_text(COMPACT_SAMPLE)
+        reconciled = reconcile_compact_fare_with_probe(
+            parsed,
+            "₩18,600\n17,900\n",
+        )
+        self.assertFalse(reconciled["ok"])
+        self.assertEqual(
+            reconciled["error_code"],
+            "UBER_FOCUSED_FARE_AMBIGUOUS",
+        )
+
+    def test_task190_probe_excludes_datetime_and_metrics(self):
+        amounts = extract_focused_uber_fare_amounts(
+            "2026. 10. 3. PM 8:36\n4,800\n01:41\n1.69 km\n4분 46초\n"
+        )
+        self.assertEqual(amounts, [4800])
+
+    def test_task190_no_probe_evidence_preserves_compatibility(self):
+        parsed = parse_uber_trip_detail_text(COMPACT_SAMPLE)
+        reconciled = reconcile_compact_fare_with_probe(parsed, "운행 세부사항\n")
+        self.assertTrue(reconciled["ok"])
+        self.assertEqual(reconciled["probe_status"], "NO_EVIDENCE")
+        self.assertEqual(reconciled["parsed"]["요금"], 18600)
 
     def test_foreign_rider_english_kor_addresses_without_currency_glyph(self):
         text = """운행 세부사항
