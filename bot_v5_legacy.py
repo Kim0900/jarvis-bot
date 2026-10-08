@@ -1135,13 +1135,48 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_file_id 또는 source_file_name 필요(provenance)"})
                         return
                     dry_run = bool(payload.get("dry_run", False))
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="RECEIVED", kind="s700",
+                            source_id=str(fid or fname), file_name=fname,
+                        )
                     result = asyncio.run(s700_ingest_jsonl_run(text, fid, fname, dry_run))
                     logger.info(f"[S700] ingest file={fname or fid} dry_run={dry_run} inserted={result.get('inserted')} "
                                 f"dup={result.get('duplicates_existing')} conflicts={len(result.get('conflicts_existing', []))} "
                                 f"failed={len(result.get('insert_failed', []))} match={result.get('match')}")
+                    if not dry_run:
+                        _s700_conflicts = result.get("conflicts_existing") or []
+                        _s700_failed = result.get("insert_failed") or []
+                        if _s700_conflicts or _s700_failed:
+                            _s700_err = []
+                            if _s700_conflicts:
+                                _s700_err.append(f"trip_start 충돌 {len(_s700_conflicts)}건")
+                            if _s700_failed:
+                                _s700_err.append(
+                                    "DB 저장 실패 " + str(len(_s700_failed)) + "건: " +
+                                    "; ".join(str(x.get("error") or "")[:160] for x in _s700_failed[:3])
+                                )
+                            queue_ingestion_notification(
+                                stage="ERROR", kind="s700",
+                                source_id=str(fid or fname), file_name=fname,
+                                result=result, error=" | ".join(_s700_err), retryable=False,
+                            )
+                        else:
+                            queue_ingestion_notification(
+                                stage="COMPLETED", kind="s700",
+                                source_id=str(fid or fname), file_name=fname, result=result,
+                            )
                     send_json(200, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/ingest_s700_jsonl 오류: {e}")
+                    _fid = locals().get("fid")
+                    _fname = locals().get("fname")
+                    if _fid or _fname:
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="s700",
+                            source_id=str(_fid or _fname), file_name=_fname,
+                            error=f"{type(e).__name__}: {str(e)[:900]}", retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e)[:300]})
                 return
 
@@ -1173,6 +1208,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_file_id/source_file_name 필요"})
                         return
                     dry_run = bool(payload.get("dry_run", False))
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="RECEIVED", kind="gpx",
+                            source_id=str(fid), file_name=str(fname),
+                        )
                     result = asyncio.run(gpx_ingest_text_run(text, str(fid), str(fname), dry_run=dry_run))
                     logger.info(
                         f"[GPX] ingest file={fname} dry_run={dry_run} "
@@ -1180,9 +1220,22 @@ class HealthHandler(BaseHTTPRequestHandler):
                         f"date={(result.get('session') or {}).get('service_date')} "
                         f"points={(result.get('session') or {}).get('point_count')}"
                     )
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="gpx",
+                            source_id=str(fid), file_name=str(fname), result=result,
+                        )
                     send_json(200, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/ingest_gpx 오류: {e}")
+                    _fid = locals().get("fid")
+                    _fname = locals().get("fname")
+                    if _fid or _fname:
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="gpx",
+                            source_id=str(_fid or _fname), file_name=_fname,
+                            error=f"{type(e).__name__}: {str(e)[:900]}", retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e)[:300]})
                 return
 
