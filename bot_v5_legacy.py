@@ -791,6 +791,14 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_id 필요"})
                         return
 
+                    image_file_name = payload.get("source_file_name") or payload.get("file_name")
+                    queue_ingestion_notification(
+                        stage="RECEIVED",
+                        kind="call_image",
+                        source_id=source_id,
+                        file_name=image_file_name,
+                    )
+
                     force_retry = bool(payload.get("force_retry"))
                     if not force_retry:
                         prior_state = asyncio.run(get_call_image_ingestion_state(source_id))
@@ -799,7 +807,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                             and prior_state.get("status") == "FAILED"
                             and is_terminal_last_error(prior_state.get("last_error"))
                         ):
-                            send_json(422, {
+                            _terminal_result = {
                                 "success": False,
                                 "terminal": True,
                                 "retryable": False,
@@ -807,22 +815,39 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 "source_id": source_id,
                                 "format": prior_state.get("format"),
                                 "saved_count": prior_state.get("inserted_count", 0),
-                            })
+                            }
+                            queue_ingestion_notification(
+                                stage="ERROR", kind="call_image", source_id=source_id,
+                                file_name=image_file_name, result=_terminal_result,
+                                error="이 원본은 이전 처리에서 재시도 불가 오류로 종료됨",
+                                retryable=False,
+                            )
+                            send_json(422, _terminal_result)
                             return
 
                     claim = asyncio.run(acquire_call_image_ingestion(source_id))
                     if not claim or not claim.get("ok"):
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, error="INGESTION_CLAIM_FAILED",
+                            retryable=True,
+                        )
                         send_json(400, {"success": False, "error": "INGESTION_CLAIM_FAILED", "source_id": source_id})
                         return
 
                     if claim.get("duplicate"):
-                        send_json(200, {
+                        _dup_result = {
                             "success": True,
                             "duplicate": True,
                             "source_id": source_id,
                             "format": claim.get("format"),
                             "saved_count": claim.get("inserted_count", 0),
-                        })
+                        }
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=_dup_result,
+                        )
+                        send_json(200, _dup_result)
                         return
 
                     if not claim.get("acquired"):
@@ -843,6 +868,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                         asyncio.run(mark_call_image_ingestion(
                             source_id, "FAILED", last_error=mark_retryable("OCR_EMPTY")
                         ))
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, error="OCR 결과가 비어 있음",
+                            retryable=True,
+                        )
                         send_json(400, {"success": False, "error": "OCR결과 비어있음", "source_id": source_id})
                         return
 
@@ -891,6 +921,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 reason=f"image:{result.get('format')}",
                             )
                         result["duplicate"] = False
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=result,
+                        )
                         send_json(200, result)
                     else:
                         # task#164: daily_history 본문 OCR이 Fail-Closed 된 경우에만
@@ -988,7 +1022,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     source_id=source_id,
                                     reason="daily_history_fare_repair",
                                 )
-                                send_json(200, {
+                                _repair_result = {
                                     "success": True,
                                     "duplicate": False,
                                     "source_id": source_id,
@@ -997,11 +1031,17 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     "duplicate_skipped_count": _dups,
                                     "repair_used": True,
                                     "repair_method": "fare_column_probe_ordered",
+                                    "page_date": _repair_candidate.get("날짜"),
                                     "displayed_count": _repair_candidate.get("표시건수"),
                                     "displayed_amount": _repair_candidate.get("표시금액"),
                                     "fare_probe_count": len(_probe_amounts),
                                     "fare_probe_sum": sum(_probe_amounts),
-                                })
+                                }
+                                queue_ingestion_notification(
+                                    stage="COMPLETED", kind="call_image", source_id=source_id,
+                                    file_name=image_file_name, result=_repair_result,
+                                )
+                                send_json(200, _repair_result)
                                 return
 
                         _err_parts = []
@@ -1050,6 +1090,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                             inserted_count=result.get("saved_count", 0),
                             last_error=_last_error,
                         ))
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=result,
+                            error=_last_error, retryable=result.get("retryable"),
+                        )
                         send_json(_http_status, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/process_call_image 오류: {e}")
@@ -1062,6 +1107,12 @@ class HealthHandler(BaseHTTPRequestHandler):
                             ))
                         except Exception as mark_err:
                             logger.error(f"ingestion FAILED 상태기록 실패(source_id={source_id}): {mark_err}")
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=locals().get("image_file_name"),
+                            error=f"{type(e).__name__}: {str(e)[:900]}",
+                            retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e), "source_id": source_id})
                 return
 
