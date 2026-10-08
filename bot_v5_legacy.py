@@ -10,6 +10,7 @@ import time
 import asyncio
 import logging
 import threading
+import queue
 import base64
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -790,6 +791,14 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_id 필요"})
                         return
 
+                    image_file_name = payload.get("source_file_name") or payload.get("file_name")
+                    queue_ingestion_notification(
+                        stage="RECEIVED",
+                        kind="call_image",
+                        source_id=source_id,
+                        file_name=image_file_name,
+                    )
+
                     force_retry = bool(payload.get("force_retry"))
                     if not force_retry:
                         prior_state = asyncio.run(get_call_image_ingestion_state(source_id))
@@ -798,7 +807,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                             and prior_state.get("status") == "FAILED"
                             and is_terminal_last_error(prior_state.get("last_error"))
                         ):
-                            send_json(422, {
+                            _terminal_result = {
                                 "success": False,
                                 "terminal": True,
                                 "retryable": False,
@@ -806,22 +815,39 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 "source_id": source_id,
                                 "format": prior_state.get("format"),
                                 "saved_count": prior_state.get("inserted_count", 0),
-                            })
+                            }
+                            queue_ingestion_notification(
+                                stage="ERROR", kind="call_image", source_id=source_id,
+                                file_name=image_file_name, result=_terminal_result,
+                                error="이 원본은 이전 처리에서 재시도 불가 오류로 종료됨",
+                                retryable=False,
+                            )
+                            send_json(422, _terminal_result)
                             return
 
                     claim = asyncio.run(acquire_call_image_ingestion(source_id))
                     if not claim or not claim.get("ok"):
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, error="INGESTION_CLAIM_FAILED",
+                            retryable=True,
+                        )
                         send_json(400, {"success": False, "error": "INGESTION_CLAIM_FAILED", "source_id": source_id})
                         return
 
                     if claim.get("duplicate"):
-                        send_json(200, {
+                        _dup_result = {
                             "success": True,
                             "duplicate": True,
                             "source_id": source_id,
                             "format": claim.get("format"),
                             "saved_count": claim.get("inserted_count", 0),
-                        })
+                        }
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=_dup_result,
+                        )
+                        send_json(200, _dup_result)
                         return
 
                     if not claim.get("acquired"):
@@ -842,6 +868,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                         asyncio.run(mark_call_image_ingestion(
                             source_id, "FAILED", last_error=mark_retryable("OCR_EMPTY")
                         ))
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, error="OCR 결과가 비어 있음",
+                            retryable=True,
+                        )
                         send_json(400, {"success": False, "error": "OCR결과 비어있음", "source_id": source_id})
                         return
 
@@ -890,6 +921,10 @@ class HealthHandler(BaseHTTPRequestHandler):
                                 reason=f"image:{result.get('format')}",
                             )
                         result["duplicate"] = False
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=result,
+                        )
                         send_json(200, result)
                     else:
                         # task#164: daily_history 본문 OCR이 Fail-Closed 된 경우에만
@@ -987,7 +1022,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     source_id=source_id,
                                     reason="daily_history_fare_repair",
                                 )
-                                send_json(200, {
+                                _repair_result = {
                                     "success": True,
                                     "duplicate": False,
                                     "source_id": source_id,
@@ -996,11 +1031,17 @@ class HealthHandler(BaseHTTPRequestHandler):
                                     "duplicate_skipped_count": _dups,
                                     "repair_used": True,
                                     "repair_method": "fare_column_probe_ordered",
+                                    "page_date": _repair_candidate.get("날짜"),
                                     "displayed_count": _repair_candidate.get("표시건수"),
                                     "displayed_amount": _repair_candidate.get("표시금액"),
                                     "fare_probe_count": len(_probe_amounts),
                                     "fare_probe_sum": sum(_probe_amounts),
-                                })
+                                }
+                                queue_ingestion_notification(
+                                    stage="COMPLETED", kind="call_image", source_id=source_id,
+                                    file_name=image_file_name, result=_repair_result,
+                                )
+                                send_json(200, _repair_result)
                                 return
 
                         _err_parts = []
@@ -1049,6 +1090,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                             inserted_count=result.get("saved_count", 0),
                             last_error=_last_error,
                         ))
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=image_file_name, result=result,
+                            error=_last_error, retryable=result.get("retryable"),
+                        )
                         send_json(_http_status, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/process_call_image 오류: {e}")
@@ -1061,6 +1107,12 @@ class HealthHandler(BaseHTTPRequestHandler):
                             ))
                         except Exception as mark_err:
                             logger.error(f"ingestion FAILED 상태기록 실패(source_id={source_id}): {mark_err}")
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="call_image", source_id=source_id,
+                            file_name=locals().get("image_file_name"),
+                            error=f"{type(e).__name__}: {str(e)[:900]}",
+                            retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e), "source_id": source_id})
                 return
 
@@ -1083,13 +1135,48 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_file_id 또는 source_file_name 필요(provenance)"})
                         return
                     dry_run = bool(payload.get("dry_run", False))
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="RECEIVED", kind="s700",
+                            source_id=str(fid or fname), file_name=fname,
+                        )
                     result = asyncio.run(s700_ingest_jsonl_run(text, fid, fname, dry_run))
                     logger.info(f"[S700] ingest file={fname or fid} dry_run={dry_run} inserted={result.get('inserted')} "
                                 f"dup={result.get('duplicates_existing')} conflicts={len(result.get('conflicts_existing', []))} "
                                 f"failed={len(result.get('insert_failed', []))} match={result.get('match')}")
+                    if not dry_run:
+                        _s700_conflicts = result.get("conflicts_existing") or []
+                        _s700_failed = result.get("insert_failed") or []
+                        if _s700_conflicts or _s700_failed:
+                            _s700_err = []
+                            if _s700_conflicts:
+                                _s700_err.append(f"trip_start 충돌 {len(_s700_conflicts)}건")
+                            if _s700_failed:
+                                _s700_err.append(
+                                    "DB 저장 실패 " + str(len(_s700_failed)) + "건: " +
+                                    "; ".join(str(x.get("error") or "")[:160] for x in _s700_failed[:3])
+                                )
+                            queue_ingestion_notification(
+                                stage="ERROR", kind="s700",
+                                source_id=str(fid or fname), file_name=fname,
+                                result=result, error=" | ".join(_s700_err), retryable=False,
+                            )
+                        else:
+                            queue_ingestion_notification(
+                                stage="COMPLETED", kind="s700",
+                                source_id=str(fid or fname), file_name=fname, result=result,
+                            )
                     send_json(200, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/ingest_s700_jsonl 오류: {e}")
+                    _fid = locals().get("fid")
+                    _fname = locals().get("fname")
+                    if _fid or _fname:
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="s700",
+                            source_id=str(_fid or _fname), file_name=_fname,
+                            error=f"{type(e).__name__}: {str(e)[:900]}", retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e)[:300]})
                 return
 
@@ -1121,6 +1208,11 @@ class HealthHandler(BaseHTTPRequestHandler):
                         send_json(400, {"success": False, "error": "source_file_id/source_file_name 필요"})
                         return
                     dry_run = bool(payload.get("dry_run", False))
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="RECEIVED", kind="gpx",
+                            source_id=str(fid), file_name=str(fname),
+                        )
                     result = asyncio.run(gpx_ingest_text_run(text, str(fid), str(fname), dry_run=dry_run))
                     logger.info(
                         f"[GPX] ingest file={fname} dry_run={dry_run} "
@@ -1128,9 +1220,22 @@ class HealthHandler(BaseHTTPRequestHandler):
                         f"date={(result.get('session') or {}).get('service_date')} "
                         f"points={(result.get('session') or {}).get('point_count')}"
                     )
+                    if not dry_run:
+                        queue_ingestion_notification(
+                            stage="COMPLETED", kind="gpx",
+                            source_id=str(fid), file_name=str(fname), result=result,
+                        )
                     send_json(200, result)
                 except Exception as e:
                     logger.error(f"MCP /mcp/ingest_gpx 오류: {e}")
+                    _fid = locals().get("fid")
+                    _fname = locals().get("fname")
+                    if _fid or _fname:
+                        queue_ingestion_notification(
+                            stage="ERROR", kind="gpx",
+                            source_id=str(_fid or _fname), file_name=_fname,
+                            error=f"{type(e).__name__}: {str(e)[:900]}", retryable=True,
+                        )
                     send_json(400, {"success": False, "error": str(e)[:300]})
                 return
 
@@ -1368,22 +1473,117 @@ def run_health_server():
 # Supabase 헬퍼
 # ──────────────────────────────────────────────
 async def send_telegram_broadcast(text: str):
-    """긴급수정(2026-08-23): 기존 send_all()은 main() 함수 내부의 지역함수(closure)라
-    모듈레벨 함수(check_ingestion_gap, ask_operated_status_telegram, task#52 마기자동
-    검증 등)에서 호출하면 NameError로 조용히 실패하고 있었음(task#52 실기기검증중
-    "텔레그램에 아무것도 안 옴"으로 발견 — 대표님 지적). 모듈레벨에서 독립적으로
-    작동하는 전역 발송함수로 대체, app 객체 의존 없이 별도 Bot 인스턴스 사용."""
+    """모듈레벨 Telegram broadcast. 호출자는 반환값을 무시해도 된다."""
     from telegram import Bot
     chat_ids = [x for x in [os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")] if x]
     if not chat_ids:
         logger.error("send_telegram_broadcast: ALLOWED_CHAT_ID 미설정")
-        return
+        return {"sent": 0, "failed": 0}
     bot = Bot(token=TELEGRAM_TOKEN)
+    sent = 0
+    failed = 0
     for cid in chat_ids:
         try:
             await bot.send_message(chat_id=cid, text=text)
+            sent += 1
         except Exception as e:
+            failed += 1
             logger.error(f"텔레그램 발송 실패(chat_id={cid}): {e}")
+    return {"sent": sent, "failed": failed}
+
+
+# task#187: ingestion visibility — Telegram failure must never fail data ingestion.
+_INGEST_NOTIFY_QUEUE = queue.Queue()
+_INGEST_NOTIFY_SEEN = set()
+_INGEST_NOTIFY_LOCK = threading.Lock()
+_INGEST_NOTIFY_WORKER_STARTED = False
+
+
+def _ingestion_notify_worker():
+    while True:
+        item = _INGEST_NOTIFY_QUEUE.get()
+        if item is None:
+            _INGEST_NOTIFY_QUEUE.task_done()
+            return
+        message, meta = item
+        try:
+            result = asyncio.run(send_telegram_broadcast(message)) or {}
+            logger.info(
+                "[INGEST_NOTIFY_SENT] stage=%s kind=%s source=%s sent=%s failed=%s",
+                meta.get("stage"), meta.get("kind"), meta.get("source_id"),
+                result.get("sent", 0), result.get("failed", 0),
+            )
+        except Exception as e:
+            logger.error(
+                "[INGEST_NOTIFY_FAILED] stage=%s kind=%s source=%s error=%s",
+                meta.get("stage"), meta.get("kind"), meta.get("source_id"),
+                f"{type(e).__name__}:{str(e)[:300]}",
+            )
+        finally:
+            _INGEST_NOTIFY_QUEUE.task_done()
+
+
+def queue_ingestion_notification(
+    *,
+    stage: str,
+    kind: str,
+    source_id: str = None,
+    file_name: str = None,
+    result: dict = None,
+    error: str = None,
+    retryable: bool = None,
+):
+    """Best-effort FIFO Telegram notification, deduped per process.
+
+    Never raises to ingestion callers. RECEIVED is sent once per source per process;
+    COMPLETED and identical ERROR are likewise deduped.
+    """
+    global _INGEST_NOTIFY_WORKER_STARTED
+    try:
+        from ingestion_notify import format_ingestion_message
+
+        _result = result or {}
+        _fingerprint = (
+            str(_result.get("format") or "")
+            if str(stage).upper() == "COMPLETED"
+            else str(error or _result.get("error") or _result.get("error_code") or "")[:180]
+        )
+        key = (str(stage).upper(), str(kind), str(source_id or ""), _fingerprint)
+        with _INGEST_NOTIFY_LOCK:
+            if key in _INGEST_NOTIFY_SEEN:
+                return False
+            _INGEST_NOTIFY_SEEN.add(key)
+            if len(_INGEST_NOTIFY_SEEN) > 5000:
+                _INGEST_NOTIFY_SEEN.clear()
+                _INGEST_NOTIFY_SEEN.add(key)
+            if not _INGEST_NOTIFY_WORKER_STARTED:
+                threading.Thread(
+                    target=_ingestion_notify_worker,
+                    name="ingestion-telegram-notify",
+                    daemon=True,
+                ).start()
+                _INGEST_NOTIFY_WORKER_STARTED = True
+
+        message = format_ingestion_message(
+            stage=stage,
+            kind=kind,
+            source_id=source_id,
+            file_name=file_name,
+            result=_result,
+            error=error,
+            retryable=retryable,
+        )
+        _INGEST_NOTIFY_QUEUE.put((
+            message,
+            {"stage": str(stage).upper(), "kind": kind, "source_id": source_id},
+        ))
+        return True
+    except Exception as e:
+        logger.error(
+            "[INGEST_NOTIFY_QUEUE_FAILED] stage=%s kind=%s source=%s error=%s",
+            stage, kind, source_id, f"{type(e).__name__}:{str(e)[:300]}",
+        )
+        return False
 
 
 async def sb_h(method: str, path: str, **kwargs) -> dict | list | None:
