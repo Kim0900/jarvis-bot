@@ -146,9 +146,9 @@ def install(bot):
     original_process = bot.process_and_save_call_document
     original_mark = bot.mark_call_image_ingestion
 
-    async def wrapped_ocr(image_bytes):
+    async def wrapped_ocr(image_bytes, **kwargs):
         _IMAGE_LOCAL.value = bytes(image_bytes)
-        return await original_ocr(image_bytes)
+        return await original_ocr(image_bytes, **kwargs)
 
     async def wrapped_mark(source_id, status, fmt=None, inserted_count=0, last_error=None):
         if status in ("COMPLETED", "FAILED") and _consume_primary_completed(source_id):
@@ -165,9 +165,9 @@ def install(bot):
             last_error=last_error,
         )
 
-    async def wrapped_process(text, source_id=None):
+    async def wrapped_process(text, source_id=None, **kwargs):
         if not _enabled():
-            return await original_process(text, source_id=source_id)
+            return await original_process(text, source_id=source_id, **kwargs)
 
         try:
             legacy_parsed = bot.detect_and_parse_call_document(text)
@@ -178,14 +178,14 @@ def install(bot):
             legacy_parsed.get("format") != "daily_history"
             and not _looks_like_daily_history(text)
         ):
-            return await original_process(text, source_id=source_id)
+            return await original_process(text, source_id=source_id, **kwargs)
 
         image_bytes = getattr(_IMAGE_LOCAL, "value", None)
         if not image_bytes:
             bot.logger.warning(
                 "[TASK164_LAYOUT_PRIMARY] original image unavailable; compatibility fallback"
             )
-            return await original_process(text, source_id=source_id)
+            return await original_process(text, source_id=source_id, **kwargs)
 
         captured = await _capture_layout(image_bytes)
         action = classify_layout_result(
@@ -198,7 +198,7 @@ def install(bot):
                 "[TASK164_LAYOUT_PRIMARY] layout unavailable; compatibility fallback reason=%s",
                 captured.get("error_code"),
             )
-            return await original_process(text, source_id=source_id)
+            return await original_process(text, source_id=source_id, **kwargs)
 
         layout = captured.get("payload") or {}
         if action == ACTION_FAIL_CLOSED:
