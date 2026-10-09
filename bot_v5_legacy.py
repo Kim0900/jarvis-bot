@@ -3746,12 +3746,20 @@ async def google_vision_ocr(image_bytes: bytes, lang: str = "kor+eng") -> str:
     # 2026-09-11: httpx timeout을 30s→65s로 조정 — OCR서비스 Gunicorn
     # worker timeout(60s)보다 짧으면 서버가 정상처리 중에도 클라이언트가
     # 먼저 끊어버리는 모순이 있었음(값 대폭증가가 아니라 정합성 수정).
+    # Retry only transient upstream throttling. Preserve fail-closed OCR semantics.
     async with httpx.AsyncClient(timeout=65.0) as client:
-        resp = await client.post(
-            f"{service_url}/ocr",
-            headers={"X-MCP-Key": mcp_key},
-            json={"image_base64": b64, "lang": lang},
-        )
+        for attempt in range(3):
+            resp = await client.post(
+                f"{service_url}/ocr",
+                headers={"X-MCP-Key": mcp_key},
+                json={"image_base64": b64, "lang": lang},
+            )
+            if resp.status_code not in (429, 503):
+                break
+            if attempt < 2:
+                retry_after = resp.headers.get("Retry-After", "")
+                delay = float(retry_after) if retry_after.isdigit() else (2 ** attempt)
+                await asyncio.sleep(min(max(delay, 1.0), 10.0))
     if resp.status_code >= 400:
         raise RuntimeError(f"Tesseract OCR서비스 HTTP {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
