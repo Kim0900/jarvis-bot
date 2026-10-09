@@ -16,7 +16,9 @@ WITH unique_pages AS (
 UPDATE public.raw_calls AS r
 SET ledger_date = p.page_date
 FROM unique_pages AS p
-WHERE r.source_id = p.source_id AND r.ledger_date IS NULL;
+WHERE r.source_id = p.source_id AND r.ledger_date IS NULL
+  AND r."콜유형" = '카카오T'
+  AND r.data_source IN ('drive_ocr_layout_v1', 'drive_ocr_tesseract');
 """
 
 PREFLIGHT_SQL = """
@@ -26,12 +28,16 @@ JOIN (
   SELECT source_id FROM public.kakao_daily_page_evidence
   WHERE page_date IS NOT NULL
   GROUP BY source_id HAVING COUNT(DISTINCT page_date) = 1
-) p ON r.source_id = p.source_id;
+) p ON r.source_id = p.source_id
+WHERE r."콜유형" = '카카오T'
+  AND r.data_source IN ('drive_ocr_layout_v1', 'drive_ocr_tesseract');
 """
 
 def test_sql_contract():
     assert "COUNT(DISTINCT page_date) = 1" in BACKFILL_SQL
     assert "r.ledger_date IS NULL" in BACKFILL_SQL
+    assert "drive_ocr_layout_v1" in BACKFILL_SQL
+    assert "drive_ocr_tesseract" in BACKFILL_SQL
     assert "SET platform_date" not in BACKFILL_SQL
     assert "SET business_date" not in BACKFILL_SQL
 
