@@ -246,7 +246,7 @@ async def persist_layout_primary(
             "raw_row_type": "trip",
             "source_id": source_id,
         }
-        payload.update(calc_service_date(payload["날짜"], payload["배차시각"]))
+        # Task180: page header date is independent of per-card platform date.\n        # Disabled until the nullable ledger_date migration is deployed.\n        import os\n        if os.getenv("TASK180_LEDGER_DATE_ENABLED", "").lower() == "true":\n            payload["ledger_date"] = date_value\n        payload.update(calc_service_date(payload["날짜"], payload["배차시각"]))
         valid, reason = validate_call_payload(payload)
         if not valid:
             return {
