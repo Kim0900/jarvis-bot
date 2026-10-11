@@ -502,7 +502,10 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             return False
                         row = rows[0]
                         result = str(row.get("last_result") or "")
-                        if result.startswith("FAIL:"):
+                        if result != "OK" and not (
+                            job_name == "check_daily_ingestion_detail"
+                            and result.startswith("{'날짜':")
+                        ):
                             return False
                         stamp = row.get("last_run_at")
                         if not stamp:
