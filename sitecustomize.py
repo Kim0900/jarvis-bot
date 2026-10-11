@@ -452,6 +452,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_dualverify_day = -1
         last_kpi7day = -1
         task194_attempts: dict[tuple[str, str], int] = {}
+        task194_last_attempt: dict[tuple[str, str], float] = {}
         last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
@@ -516,6 +517,8 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         attempt_key = (str(now.date()), job_name)
                         if task194_attempts.get(attempt_key, 0) >= 3:
                             return
+                        if time.monotonic() - task194_last_attempt.get(attempt_key, -1e9) < 300:
+                            return
                         try:
                             if await _task194_succeeded_today(job_name):
                                 return
@@ -526,6 +529,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             )
                             return  # fail closed: no potentially duplicate write
                         task194_attempts[attempt_key] = task194_attempts.get(attempt_key, 0) + 1
+                        task194_last_attempt[attempt_key] = time.monotonic()
                         try:
                             result = await action()
                             # Persist success via direct upsert: legacy.mark_scheduler_run()
