@@ -528,14 +528,28 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         task194_attempts[attempt_key] = task194_attempts.get(attempt_key, 0) + 1
                         try:
                             result = await action()
-                            await legacy.mark_scheduler_run(
-                                job_name,
-                                str(result) if job_name == "check_daily_ingestion_detail" and result else "OK",
+                            # Persist success via direct upsert: legacy.mark_scheduler_run()
+                            # suppresses write failures and could falsely report completion.
+                            success_value = (
+                                str(result)
+                                if job_name == "check_daily_ingestion_detail" and result else "OK"
                             )
+                            saved = await legacy.sb_upsert(
+                                "scheduler_status",
+                                {
+                                    "job_name": job_name,
+                                    "last_run_at": legacy.datetime.now(legacy.KST).isoformat(),
+                                    "last_result": success_value,
+                                },
+                                on_conflict="job_name",
+                            )
+                            if saved is None:
+                                raise RuntimeError("scheduler_status success write returned None")
                         except Exception as exc:
                             detail = f"FAIL: {type(exc).__name__}: {exc!r}"
                             legacy.logger.error("Task194 scheduler %s: %s", job_name, detail)
-                            await legacy.mark_scheduler_run(job_name, detail)
+                            # Do not overwrite a possibly committed success with FAIL.
+                            # Next guarded attempt reconciles against the database.
 
                     for _job, _action in (
                         ("recalc_daily_summary_totals", legacy.recalc_daily_summary_totals),
