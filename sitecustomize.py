@@ -451,6 +451,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_recalc_day = -1
         last_dualverify_day = -1
         last_kpi7day = -1
+        task194_attempts: dict[tuple[str, str], int] = {}
         last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
@@ -492,61 +493,62 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         legacy.logger.error(f"마기(자동)검증 실행 실패: {exc}")
 
                 if now.hour == 4:
-                    try:
-                        kpi7day_done = loop.run_until_complete(legacy.already_ran_today_kst("calc_daily_snapshot"))
-                    except Exception as exc:
-                        legacy.logger.error(f"already_ran_today_kst(calc_daily_snapshot) 조회 실패: {exc}")
-                        kpi7day_done = False
-                    if not kpi7day_done:
+                    # Task #194: independent success-only guards and bounded retries.
+                    # A FAIL record must not suppress retries of that individual job.
+                    async def _task194_succeeded_today(job_name: str) -> bool:
+                        rows = await legacy.sb_select("scheduler_status", {"job_name": f"eq.{job_name}"})
+                        if not rows:
+                            return False
+                        row = rows[0]
+                        result = str(row.get("last_result") or "")
+                        if result.startswith("FAIL:"):
+                            return False
+                        stamp = row.get("last_run_at")
+                        if not stamp:
+                            return False
                         try:
-                            loop.run_until_complete(legacy.recalc_daily_summary_totals())
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
-                        except Exception as exc:
-                            legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {type(exc).__name__}: {exc!r}"))
-                        try:
-                            loop.run_until_complete(legacy.recalc_7day_average())
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
-                        except Exception as exc:
-                            legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {type(exc).__name__}: {exc!r}"))
-                        try:
-                            loop.run_until_complete(legacy.calc_daily_snapshot())
-                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
-                        except Exception as exc:
-                            legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {type(exc).__name__}: {exc!r}"))
-                    last_kpi7day = now.day
+                            last_dt = legacy.datetime.fromisoformat(stamp).astimezone(legacy.KST)
+                        except (TypeError, ValueError):
+                            return False
+                        return last_dt.date() == now.date()
 
-                    # task#69: 세분화 인입알림은 KPI 3종과 독립적으로 하루 1회 실행.
-                    # task#146 DB기반 재시작내성 가드 원칙을 동일 적용하여,
-                    # 재배포/재시작 또는 다른 04시 작업 완료 여부와 무관하게 보장한다.
-                    try:
-                        ingestion_detail_done = loop.run_until_complete(
-                            legacy.already_ran_today_kst("check_daily_ingestion_detail")
-                        )
-                    except Exception as exc:
-                        legacy.logger.error(
-                            f"already_ran_today_kst(check_daily_ingestion_detail) 조회 실패: {exc}"
-                        )
-                        ingestion_detail_done = False
-                    if not ingestion_detail_done:
+                    async def _task194_run(job_name: str, action: Any) -> None:
+                        attempt_key = (str(now.date()), job_name)
+                        if task194_attempts.get(attempt_key, 0) >= 3:
+                            return
                         try:
-                            detail = loop.run_until_complete(legacy.check_daily_ingestion_detail())
-                            loop.run_until_complete(
-                                legacy.mark_scheduler_run(
-                                    "check_daily_ingestion_detail",
-                                    str(detail) if detail else "OK",
-                                )
+                            if await _task194_succeeded_today(job_name):
+                                return
+                        except Exception as exc:
+                            legacy.logger.error(
+                                "Task194 success guard unavailable (%s): %s: %r",
+                                job_name, type(exc).__name__, exc,
+                            )
+                            return  # fail closed: no potentially duplicate write
+                        task194_attempts[attempt_key] = task194_attempts.get(attempt_key, 0) + 1
+                        try:
+                            result = await action()
+                            await legacy.mark_scheduler_run(
+                                job_name,
+                                str(result) if job_name == "check_daily_ingestion_detail" and result else "OK",
                             )
                         except Exception as exc:
-                            legacy.logger.error(f"세분화 인입알림(task#69) 실패: {exc}")
-                            loop.run_until_complete(
-                                legacy.mark_scheduler_run(
-                                    "check_daily_ingestion_detail",
-                                    f"FAIL: {type(exc).__name__}: {exc!r}",
-                                )
-                            )
+                            detail = f"FAIL: {type(exc).__name__}: {exc!r}"
+                            legacy.logger.error("Task194 scheduler %s: %s", job_name, detail)
+                            await legacy.mark_scheduler_run(job_name, detail)
+
+                    for _job, _action in (
+                        ("recalc_daily_summary_totals", legacy.recalc_daily_summary_totals),
+                        ("recalc_7day_average", legacy.recalc_7day_average),
+                        ("calc_daily_snapshot", legacy.calc_daily_snapshot),
+                        ("check_daily_ingestion_detail", legacy.check_daily_ingestion_detail),
+                    ):
+                        loop.run_until_complete(_task194_run(_job, _action))
+                    # Drop prior-day counters; never retry more than 3 times per job/day.
+                    task194_attempts = {
+                        key: count for key, count in task194_attempts.items()
+                        if key[0] == str(now.date())
+                    }
 
                 if now.hour == 8:
                     try:
