@@ -1,0 +1,4 @@
+TAEO execution regression probe v1.0
+Scope: isolated branch and non-runtime test artifact.
+Expected: GitHub write and PR creation succeed; production main remains untouched.
+No secrets, credentials, or production operations.
