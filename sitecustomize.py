@@ -503,19 +503,19 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
                         except Exception as exc:
                             legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {exc}"))
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {type(exc).__name__}: {exc!r}"))
                         try:
                             loop.run_until_complete(legacy.recalc_7day_average())
                             loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
                         except Exception as exc:
                             legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {exc}"))
+                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {type(exc).__name__}: {exc!r}"))
                         try:
                             loop.run_until_complete(legacy.calc_daily_snapshot())
                             loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
                         except Exception as exc:
                             legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
+                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {type(exc).__name__}: {exc!r}"))
                     last_kpi7day = now.day
 
                     # task#69: 세분화 인입알림은 KPI 3종과 독립적으로 하루 1회 실행.
@@ -544,7 +544,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                             loop.run_until_complete(
                                 legacy.mark_scheduler_run(
                                     "check_daily_ingestion_detail",
-                                    f"FAIL: {exc}",
+                                    f"FAIL: {type(exc).__name__}: {exc!r}",
                                 )
                             )
 
