@@ -1646,6 +1646,14 @@ async def sb_select(table: str, params: dict = None) -> list:
     return result if isinstance(result, list) else []
 
 
+async def sb_select_required(table: str, params: dict = None) -> list:
+    """Do not treat a failed PostgREST read as an empty data set in KPI jobs."""
+    result = await sb_h("GET", table, params=params or {})
+    if not isinstance(result, list):
+        raise RuntimeError(f"Required Supabase read failed: {table}")
+    return result
+
+
 async def sb_select_canonical(start_date: str = None, end_date: str = None) -> list:
     """Approved Task#164/Task#27 canonical read path.
 
@@ -7710,7 +7718,7 @@ async def recalc_daily_summary_totals(days_back: int = 14):
     GPX전용 필드는 PostgREST upsert 특성상 미지정시 기존값 그대로 유지됨."""
     end = today_kst()
     start = end - timedelta(days=days_back-1)
-    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = await sb_select_required("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
     rows = exclude_summary_rows(rows or [])
 
     by_date = {}
@@ -7741,7 +7749,7 @@ async def recalc_7day_average():
     start = end - timedelta(days=6)
     dates = [str(start + timedelta(days=i)) for i in range(7)]
 
-    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = await sb_select_required("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
     rows = rows or []
 
     unclassified_days = set()
@@ -7809,8 +7817,8 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     calc_date = calc_date_str or str(today_kst() - timedelta(days=1))  # 기본: 어제 영업일(당일 새벽 04시 실행 기준)
     next_date = str(datetime.strptime(calc_date, "%Y-%m-%d").date() + timedelta(days=1))
 
-    same_day = await sb_select("raw_calls", {"날짜": f"eq.{calc_date}"}) or []
-    next_day = await sb_select("raw_calls", {"날짜": f"eq.{next_date}"}) or []
+    same_day = await sb_select_required("raw_calls", {"날짜": f"eq.{calc_date}"})
+    next_day = await sb_select_required("raw_calls", {"날짜": f"eq.{next_date}"})
 
     def hour_of(r):
         bt = r.get("배차시각")
