@@ -31,6 +31,12 @@ class SchedulerGuardTests(unittest.TestCase):
     def test_valid_empty_query_allows_first_run(self):
         self.assertFalse(self._guard([]))
 
+    def test_missing_timestamp_blocks_duplicate(self):
+        self.assertTrue(self._guard([{"last_run_at": None}]))
+
+    def test_malformed_timestamp_blocks_duplicate(self):
+        self.assertTrue(self._guard([{"last_run_at": "not-a-date"}]))
+
     def test_invalid_response_blocks_duplicate(self):
         self.assertTrue(self._guard({"error": "bad response"}))
 
