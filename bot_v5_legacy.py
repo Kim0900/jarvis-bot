@@ -6951,11 +6951,13 @@ async def already_ran_today_kst(job_name: str) -> bool:
         return False
     last_run_at = rows[0].get("last_run_at")
     if not last_run_at:
-        return False
+        logger.error("scheduler_status timestamp missing (%s); blocking duplicate", job_name)
+        return True
     try:
         last_dt = datetime.fromisoformat(last_run_at).astimezone(KST)
-    except Exception:
-        return False
+    except (TypeError, ValueError) as exc:
+        logger.error("scheduler_status timestamp invalid (%s): %r; blocking duplicate", job_name, exc)
+        return True
     return last_dt.date() == datetime.now(KST).date()
 
 
