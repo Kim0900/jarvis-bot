@@ -6939,10 +6939,14 @@ async def already_ran_today_kst(job_name: str) -> bool:
     일치). scheduler_status(mark_scheduler_run이 매번 갱신)의 DB영구기록을 근거로 삼아
     재시작에도 살아남는 가드. 오늘자로 이미 기록돼있으면 True."""
     try:
-        rows = await sb_select("scheduler_status", {"job_name": f"eq.{job_name}"})
+        # Distinguish an actual empty result from a failed Supabase request.
+        # Fail closed: never rerun a once-daily job when its prior state is unknown.
+        rows = await sb_h("GET", "scheduler_status", params={"job_name": f"eq.{job_name}"})
+        if rows is None or not isinstance(rows, list):
+            raise RuntimeError("scheduler_status 조회 결과를 확인할 수 없음")
     except Exception as e:
-        logger.error(f"scheduler_status 조회 실패({job_name}): {e}")
-        return False
+        logger.error("scheduler_status 조회 실패(%s): %s — 중복 실행 차단", job_name, e)
+        return True
     if not rows:
         return False
     last_run_at = rows[0].get("last_run_at")
