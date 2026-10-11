@@ -1,0 +1,33 @@
+name: Task 194 scheduler checks
+on:
+  pull_request:
+    paths:
+      - 'sitecustomize.py'
+      - '.github/workflows/task194-scheduler-check.yml'
+  workflow_dispatch:
+
+jobs:
+  compile-and-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile patched scheduler
+        run: python -m py_compile sitecustomize.py
+      - name: Validate Task 194 safety contracts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s = Path("sitecustomize.py").read_text()
+          assert "task194_last_attempt" in s
+          assert "time.monotonic()" in s
+          assert "task194_attempts.get(attempt_key, 0) >= 3" in s
+          assert "await _task194_succeeded_today(job_name)" in s
+          assert "scheduler_status success write returned None" in s
+          assert 'on_conflict="job_name"' in s
+          assert "Task194 job failed" in s
+          assert "Task194 success status uncertain" in s
+          print("Task 194 static safety contracts PASS")
+          PY
