@@ -6945,7 +6945,7 @@ async def already_ran_today_kst(job_name: str) -> bool:
         if rows is None or not isinstance(rows, list):
             raise RuntimeError("scheduler_status 조회 결과를 확인할 수 없음")
     except Exception as e:
-        logger.error("scheduler_status 조회 실패(%s): %s — 중복 실행 차단", job_name, e)
+        logger.error("scheduler_status 조회 실패(%s): %s — 중복 실행 차단", job_name, repr(e))
         return True
     if not rows:
         return False
