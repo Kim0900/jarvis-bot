@@ -567,6 +567,10 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         key: count for key, count in task194_attempts.items()
                         if key[0] == str(now.date())
                     }
+                    task194_last_attempt = {
+                        key: stamp for key, stamp in task194_last_attempt.items()
+                        if key[0] == str(now.date())
+                    }
 
                 if now.hour == 8:
                     try:
