@@ -5,12 +5,14 @@ on:
     paths:
       - "bot_v5_legacy.py"
       - "tests/test_scheduler_guard_fail_closed.py"
+      - "tests/test_scheduler_required_reads.py"
       - ".github/workflows/scheduler-guard-regression.yml"
   push:
     branches: [main]
     paths:
       - "bot_v5_legacy.py"
       - "tests/test_scheduler_guard_fail_closed.py"
+      - "tests/test_scheduler_required_reads.py"
       - ".github/workflows/scheduler-guard-regression.yml"
 
 permissions:
@@ -26,6 +28,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python syntax
-        run: python -m py_compile bot_v5_legacy.py tests/test_scheduler_guard_fail_closed.py
+        run: python -m py_compile bot_v5_legacy.py tests/test_scheduler_guard_fail_closed.py tests/test_scheduler_required_reads.py
       - name: Scheduler state regression
-        run: python -m unittest tests.test_scheduler_guard_fail_closed -v
+        run: python -m unittest tests.test_scheduler_guard_fail_closed tests.test_scheduler_required_reads -v
