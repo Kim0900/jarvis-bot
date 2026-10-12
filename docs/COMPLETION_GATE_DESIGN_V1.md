@@ -1,9 +1,18 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.5 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.6 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.5). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.6). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.5 → v1.6 (카산드라 5024 FAIL: event_type 부분 문자열 일치)
+| 지적 | v1.5 결함 | v1.6 조치 |
+|---|---|---|
+| 철회·무효 이벤트가 최종 PASS로 통과 | `event_type ~* 'VALIDATION'`이 `CASSANDRA_INVALIDATION`, `CASSANDRA_VALIDATION_REVOKED`에도 걸려 J 선택과 PASS_FINAL 조건을 통과 → 나중의 철회 이벤트에 남은 PASS/FINAL과 독립 증거가 있으면 위반 0건 | (1) PASS_FINAL은 **정확 일치 허용 목록**의 event_type에서만 인정: CASSANDRA_VALIDATION·REVALIDATION·IMPLEMENTATION_(RE)VALIDATION·FINAL_(RE)VALIDATION. 그 밖은 REVIEW `PASS_NOT_FROM_VALIDATION_EVENT`. (2) 철회 계열 단어(REVOKED, INVALIDATION, WITHDRAWN, SUPERSEDED, RETRACTED, CANCELLED, VOID, ROLLBACK, REVERTED, REJECTED 등을 **밑줄 경계 단어**로 일치)가 event_type에 있는 이벤트는 J 후보에 포함하고, 최신이면 payload와 무관하게 HARD `LATEST_JUDGMENT_REVOKED`. 이후 새 VALIDATION PASS/FINAL이 나오면 최신 우선으로 다시 통과 |
+| 같은 종류의 결함(제출 전 전수 점검으로 추가 발견) | 증거(C1) 판정도 `~* '(EVIDENCE\|IMPLEMENTATION\|CI_)'` 부분 문자열이라 `EVIDENCE_REVOKED`, `NO_EVIDENCE`, `IMPLEMENTATION_REJECTED`, `YOUNGSIL_GAS_IMPLEMENTATION_SPEC`(명세), `EVIDENCE_ONLY_BRIEFING_LIVE`가 증거로 인정됨(운영 실제 event_type에서 확인) | 증거는 정확 일치 허용 목록(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_EVIDENCE, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, TEST_EVIDENCE, CI_EVIDENCE, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) 또는 `payload.evidence_kind` 경로로만 인정하고, 두 경로 모두에 철회·실패·누락 단어(FAILED, MISSING, NOT, NO 등 밑줄 경계 단어) 제외를 적용. 증거 판정은 REVIEW 수준이라 판정 결과를 HARD로 바꾸지 않음 |
+| 기대값이 부분 문자열 정책을 반복 | 기대값이 `"VALIDATION" in event_type` | 기대값을 밑줄 단위 단어 집합과 허용 목록으로 다시 작성(정규식 미사용). 카산드라 반례 2건 포함 손기대값 15건 |
+**운영 실제 데이터 재생(신규):** 운영의 완료 verification_required 태스크 13건·이벤트 653건(읽기 전용 내보내기: event_type·actor·payload)을 로컬 임시 DB에 그대로 넣고 v1.6 트리거를 실행 → **HARD 3(25·145·147) / REVIEW 10, 예외 0**(3절 표와 일치). `tests/sql/task197_gate_real_replay.py`.
+시험 결과(로컬 임시 PostgreSQL 16, 참고치): **43,267 조합 불일치 0** (증거 6600 / 판정열 36,120 / secondary 100 / 전이 432 / 손기대값 15), 시나리오 24/24. 변이 4종(PASS_FINAL 부분 일치, 철회 분기 제거, 증거 제외 제거, 증거 부분 일치)은 각각 2,472 / 5,265 / 469 / 193건 불일치로 검출됨. 운영 PostgreSQL 독립 재현은 카산드라 몫.
+
 ### v1.4 → v1.5 (제출 전 자체 점검: 이 작업이 운영에서 만들 수 있는 문제 목록화)
 카산드라 지적 없이 캐스퍼가 제출 전에 찾아 고친 것. 운영 DB는 읽기 전용 조회만 했다(2026-10-13 07:4x KST).
 | 점검 항목 | 운영 실측 | 조치 |
@@ -48,7 +57,7 @@
 - evidence_registry 테이블은 완료된 verification_required 태스크에서 쓰이지 않는다(0행). 실제 증거 기록은 magi_task_events 이벤트다.
 - **신규 실측 (v1.1 설계 근거):** actor=CASSANDRA 이벤트 중 `payload.verdict`가 있는 것은 4965~4970 6건뿐이고 나머지 과거 이벤트는 자유서술이다. 값 어휘: PARTIAL_PASS, HOLD, FAIL_DESIGN, FAIL_PATCH. 과거 본문은 `PASS`로 시작해도 300자 안에 HOLD·FAIL 같은 단어가 흔히 섞여, 정규식으로 PASS를 안전하게 판정하는 방법이 없다(시도한 보수 규칙에서 PASS 시작 본문 다수가 판정불가로 남음). → 본문 해석은 포기하고 구조화값을 기준으로 한다.
 
-## 2. 판정 규칙 v1.5 (관찰 모드)
+## 2. 판정 규칙 v1.6 (관찰 모드)
 대상: `NEW.verification_required IS TRUE AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`.
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
@@ -79,7 +88,8 @@
 | REVIEW (gate_level=REVIEW) | LATEST_VERDICT_UNSTRUCTURED | J에 구조화 판정값이 없음 |
 | REVIEW | NO_JUDGMENT_EVENT | 카산드라 이벤트는 있으나 판정 이벤트가 없음 |
 | REVIEW | DESIGN_PASS_ONLY | J가 PASS_DESIGN |
-| REVIEW | PASS_NOT_FROM_VALIDATION_EVENT | J가 PASS+FINAL이나 event_type에 VALIDATION 없음 |
+| HARD | LATEST_JUDGMENT_REVOKED | J의 event_type이 철회·무효·취소 계열 단어(REVOKED, INVALIDATION, WITHDRAWN, SUPERSEDED 등, 밑줄 경계 단어 일치)이면 payload에 남은 PASS/FINAL과 무관하게 통과 아님 |
+| REVIEW | PASS_NOT_FROM_VALIDATION_EVENT | J가 PASS+FINAL이나 event_type이 최종 판정 허용 목록(정확 일치)에 없음 |
 | REVIEW | PASS_STAGE_NOT_FINAL | J가 PASS이나 stage가 IMPLEMENTATION이거나 누락 |
 | REVIEW | EVIDENCE_NOT_RECOGNIZED | C1 불충족(다른 reason과 함께 기록) |
 - J가 PASS_FINAL이고 C1도 충족이면 기록 없음.
@@ -99,15 +109,15 @@
 7. 합의 전까지 이 게이트가 낼 수 있는 결과는 HARD와 REVIEW 뿐이며 "정상 통과"는 합의 이후에만 가능하다(의도된 fail-safe). 카산드라 4996은 합의 응답이며 설계 PASS가 아니다.
 
 ## 3. 백테스트 (read-only, 2026-10-12 17:44 KST 스냅샷 재실행, 완료 vr=true 13건)
-| 태스크 | C1(v1.2) | 카산드라 이벤트 | 최신 판정 이벤트 | v1.2 결과 |
+| 태스크 | C1(v1.6) | 카산드라 이벤트 | 최신 판정 이벤트 | v1.6 결과 |
 |---|---|---|---|---|
 | 25 | 불충족 | 0 | 없음 | HARD NO_CASSANDRA_RECORD + EVIDENCE_NOT_RECOGNIZED |
 | 145 | 불충족 | 0 | 없음 | HARD NO_CASSANDRA_RECORD + EVIDENCE_NOT_RECOGNIZED |
 | 147 | 불충족 | 0 | 없음 | HARD NO_CASSANDRA_RECORD + EVIDENCE_NOT_RECOGNIZED |
-| 160, 164, 174 | 충족 | 3, 10, 1 | 3774, 4003, 4233 | REVIEW LATEST_VERDICT_UNSTRUCTURED |
-| 83, 157, 167, 170, 171, 172, 175 | 불충족 | 1~4 | 3709, 3725, 3926, 4011, 4077, 4070, 4182 | REVIEW LATEST_VERDICT_UNSTRUCTURED + EVIDENCE_NOT_RECOGNIZED |
+| 160, 174 | 충족 | 3, 1 | 3774, 4233 | REVIEW LATEST_VERDICT_UNSTRUCTURED |
+| 83, 157, 164, 167, 170, 171, 172, 175 | 불충족(v1.6: 164 추가, 증거 허용 목록 정확 일치) | 4, 1, 10, 2, 2, 3, 1, 1 | 3709, 3725, 4003, 3926, 4011, 4077, 4070, 4182 | REVIEW LATEST_VERDICT_UNSTRUCTURED + EVIDENCE_NOT_RECOGNIZED |
 - 합계 HARD 3 / REVIEW 10. 카산드라 4997의 독립 재현(HARD 3/REVIEW 10)과 일치한다.
-- 해석: 알려진 위반 3건(25, 145, 147)은 HARD로 잡힌다. 나머지 10건은 최신 카산드라 이벤트가 구조화 전이라 "통과"로 인정되지 않는다. C1을 독립 구현·시험 증거로 좁힌 결과 구형 태스크 10건 중 7건은 증거 이벤트를 알아보지 못한다. 이는 과거 이벤트 이름 관행 때문이며(검증·요청 이벤트로 증거를 대신하던 관행) 신규 전이에서는 `payload.evidence_kind` 관행이 정착되면 줄어든다. 구형 태스크 판정 자체가 틀렸다는 뜻은 아니다.
+- 해석: 알려진 위반 3건(25, 145, 147)은 HARD로 잡힌다. 나머지 10건은 최신 카산드라 이벤트가 구조화 전이라 "통과"로 인정되지 않는다. C1을 독립 구현·시험 증거로 좁힌 결과 구형 태스크 10건 중 8건은 증거 이벤트를 알아보지 못한다(v1.6 정확 일치 허용 목록 적용 후). 이는 과거 이벤트 이름 관행 때문이며(검증·요청 이벤트로 증거를 대신하던 관행) 신규 전이에서는 `payload.evidence_kind` 관행이 정착되면 줄어든다. 구형 태스크 판정 자체가 틀렸다는 뜻은 아니다.
 - 트리거는 신규 전이에만 발동하므로 이 표는 규칙 점검용이며 과거 태스크에 이벤트를 기록하지 않는다. 소급 처리 여부는 마기·대표님 판단.
 - #174 추적성 문제(PASS가 #176 이벤트 안에 기재)는 배치 보고서에서 별도 점검한다.
 - 한계: actor 필드는 쓰기 권한자가 임의로 채울 수 있어 이 게이트는 "누락 탐지"이지 "위조 방지"가 아니다.
@@ -118,7 +128,7 @@
 - 이벤트 insert는 magi_tasks를 건드리지 않아 재귀 없음. `fn_inherit_domain_from_task`가 domain을 채운다.
 - 쓰기 경로 회귀: (a) 봇 PATCH `approve_task`, (b) 마기(자동) COMPLETED(vr=false → 대상 아님), (c) 에이전트 직접 SQL UPDATE, (d) 비상태 컬럼 UPDATE(트리거 미발동)를 롤백 트랜잭션 안에서 전/후 비교.
 
-## 5. 초안 SQL v1.5 (미적용)
+## 5. 초안 SQL v1.6 (미적용)
 ```sql
 create or replace function public.fn_completion_gate_observe() returns trigger
 language plpgsql security definer set search_path = public as $$
@@ -127,6 +137,12 @@ declare
   v_jid bigint; v_jtype text; v_structured boolean := false; v_ver text; v_stage text; v_tier text;
   v_found boolean := false; v_class text;
   v_hard text[] := '{}'; v_rev text[] := '{}';
+  -- event_type vocabulary is matched by whole underscore-delimited words or exact allowlists, never by bare substrings
+  -- of words that also occur inside negations (INVALIDATION contains VALIDATION).
+  v_neg  constant text := '(^|_)(REVOKED|REVOKE|REVOCATION|INVALIDATED|INVALIDATION|INVALID|WITHDRAWN|WITHDRAWAL|SUPERSEDED|RETRACTED|RETRACTION|CANCELLED|CANCELED|VOID|VOIDED|ROLLBACK|REVERTED|REJECTED|FAILED|FAILURE|STALE|OBSOLETE|MISSING|NOT|NO)(_|$)';
+  v_revoke constant text := '(^|_)(REVOKED|REVOKE|REVOCATION|INVALIDATED|INVALIDATION|INVALID|WITHDRAWN|WITHDRAWAL|SUPERSEDED|RETRACTED|RETRACTION|CANCELLED|CANCELED|VOID|VOIDED|ROLLBACK|REVERTED|REJECTED)(_|$)';
+  v_final_types constant text[] := array['CASSANDRA_VALIDATION','CASSANDRA_REVALIDATION','CASSANDRA_IMPLEMENTATION_VALIDATION','CASSANDRA_IMPLEMENTATION_REVALIDATION','CASSANDRA_FINAL_VALIDATION','CASSANDRA_FINAL_REVALIDATION'];
+  v_evid_types constant text[] := array['EVIDENCE','MAGI_EVIDENCE','EVIDENCE_SUBMITTED','IMPLEMENTATION_EVIDENCE','IMPLEMENTATION_CI_PASS','IMPLEMENTATION_PR_DRAFT_CREATED','TEST_EVIDENCE','CI_EVIDENCE','PRODUCTION_BRIDGE_GATE_EVIDENCE','FINAL_PRODUCTION_HTTP_E2E_EVIDENCE'];
 begin
   begin
     -- C1: independent implementation/test evidence only.  Every exclusion is a top-level AND:
@@ -135,7 +151,8 @@ begin
       and e.actor not in ('GEOMNURI_PATROL','마기(자동)','COMPLETION_GATE')
       and e.actor not ilike 'CASSANDRA%'
       and e.event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'
-      and (e.event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'
+      and upper(e.event_type) !~ v_neg                       -- revoked / invalid / failed / missing evidence is not evidence
+      and (upper(e.event_type) = any (v_evid_types)          -- exact allowlist, no substring
            or upper(coalesce(e.payload->>'evidence_kind','')) in ('IMPLEMENTATION','TEST','CI','PRODUCTION'))) into v_c1;
     select count(*) into v_cass_total from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%';
@@ -155,7 +172,7 @@ begin
       from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%'
         and e.event_type !~* '(REQUEST|REQUIRE)'          -- common exclusion: a request is never a judgment
-        and ((e.event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)')
+        and ((e.event_type ~* '(VALIDATION|DESIGN_PASS)' or upper(e.event_type) ~ v_revoke)
              or coalesce(jsonb_typeof(e.payload) = 'object' and e.payload ? 'verdict', false))
       order by e.event_id desc limit 1;
     v_found := found;
@@ -164,6 +181,10 @@ begin
       v_hard := array_append(v_hard, 'NO_CASSANDRA_RECORD'::text); v_class := 'NONE';
     elsif not v_found then
       v_rev := array_append(v_rev, 'NO_JUDGMENT_EVENT'::text); v_class := 'NO_JUDGMENT';
+    elsif upper(v_jtype) ~ v_revoke then
+      -- the latest CASSANDRA judgment-type event withdraws/invalidates an earlier verdict: never a pass,
+      -- whatever stale verdict/stage its payload still carries
+      v_hard := array_append(v_hard, 'LATEST_JUDGMENT_REVOKED'::text); v_class := 'REVOKED';
     elsif not v_structured then
       v_rev := array_append(v_rev, 'LATEST_VERDICT_UNSTRUCTURED'::text); v_class := 'UNSTRUCTURED';
     elsif v_ver ~ '^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)' then
@@ -171,7 +192,7 @@ begin
     elsif v_ver ~ '^PASS(_[A-Z]+)?$' then
       if v_ver ~ 'DESIGN' or v_jtype ~* 'DESIGN' or v_stage = 'DESIGN' then
         v_rev := array_append(v_rev, 'DESIGN_PASS_ONLY'::text); v_class := 'PASS_DESIGN';
-      elsif v_ver = 'PASS' and v_stage = 'FINAL' and v_jtype ~* 'VALIDATION' then v_class := 'PASS_FINAL';
+      elsif v_ver = 'PASS' and v_stage = 'FINAL' and upper(v_jtype) = any (v_final_types) then v_class := 'PASS_FINAL';  -- exact allowlist
       elsif v_ver = 'PASS' and v_stage = 'FINAL' then
         v_rev := array_append(v_rev, 'PASS_NOT_FROM_VALIDATION_EVENT'::text); v_class := 'PASS_NON_VALIDATION';
       else v_rev := array_append(v_rev, 'PASS_STAGE_NOT_FINAL'::text); v_class := 'PASS_PARTIAL_STAGE'; end if;
@@ -226,7 +247,7 @@ execute function public.fn_completion_gate_observe();
 **(b) 증거 이벤트 타입 20종 판정: 20/20 일치.** 허용 7(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) / 불허 13(VERIFICATION_COMPLETED, CASSANDRA_VALIDATION, CASSANDRA_DESIGN_PASS, IMPLEMENTATION_READY_FOR_VERIFICATION, VERIFICATION_READY, VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED).
 **(c) verdict·stage 분류 15/15 일치(읽기 전용 SELECT):** PARTIAL_PASS/FINAL, FAIL_DESIGN(과도기 값), HOLD/FINAL, FAIL/DESIGN → NEG / PASS+FINAL, 소문자 pass+final → PASS_FINAL / PASS 단계 누락, PASS+IMPLEMENTATION, 비표준 PASS_FINAL → PASS_PARTIAL_STAGE / PASS+DESIGN, 과도기 PASS_DESIGN, PASS+FINAL이지만 설계 검증 event_type → PASS_DESIGN / MAYBE → UNKNOWN / 판정값 없는 과거 이벤트 → 비구조 / 카산드라가 아닌 actor의 PASS+FINAL → 불인정.
 **(d) 13건 백테스트 재실행:** 3절 표.
-**(f) v1.5 전수 조합 시험: 22,787 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
+**(f) v1.6 전수 조합 시험: 43,267 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
 **(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 24/24 통과 (v1.5: 운영과 같은 RLS·identity 스키마, anon 경로 A1·A2 추가)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
 **시험 중 발견·수정한 결함 2건:**
 1. (읽기 전용 단계) payload가 NULL인 과거 이벤트가 `NOT NULL`로 평가돼 구형 10건이 HARD로 잘못 분류됨 → 모든 곳에 `coalesce(payload ? 'verdict', false)`.

@@ -45,7 +45,20 @@ def jlit(payload):
 # ----------------------------------------------------------------------------- oracle (plain logic)
 NOT_EVIDENCE_ACTORS = {"GEOMNURI_PATROL", "마기(자동)", "COMPLETION_GATE"}
 EXCLUDED_WORDS = ("REQUEST", "REQUIRE", "READY", "VALIDATION", "VERIFICATION", "CASSANDRA")
-EVIDENCE_WORDS = ("EVIDENCE", "IMPLEMENTATION", "CI_")
+# policy: event_type words are matched as whole underscore-delimited tokens or by exact allowlist, never as bare
+# substrings of a word that also occurs inside a negation (INVALIDATION contains VALIDATION).
+REVOKE_TOKENS = {"REVOKED", "REVOKE", "REVOCATION", "INVALIDATED", "INVALIDATION", "INVALID", "WITHDRAWN", "WITHDRAWAL",
+                 "SUPERSEDED", "RETRACTED", "RETRACTION", "CANCELLED", "CANCELED", "VOID", "VOIDED", "ROLLBACK", "REVERTED", "REJECTED"}
+NEG_TOKENS = REVOKE_TOKENS | {"FAILED", "FAILURE", "STALE", "OBSOLETE", "MISSING", "NOT", "NO"}
+EVIDENCE_TYPES = {"EVIDENCE", "MAGI_EVIDENCE", "EVIDENCE_SUBMITTED", "IMPLEMENTATION_EVIDENCE", "IMPLEMENTATION_CI_PASS",
+                  "IMPLEMENTATION_PR_DRAFT_CREATED", "TEST_EVIDENCE", "CI_EVIDENCE", "PRODUCTION_BRIDGE_GATE_EVIDENCE",
+                  "FINAL_PRODUCTION_HTTP_E2E_EVIDENCE"}
+FINAL_TYPES = {"CASSANDRA_VALIDATION", "CASSANDRA_REVALIDATION", "CASSANDRA_IMPLEMENTATION_VALIDATION",
+               "CASSANDRA_IMPLEMENTATION_REVALIDATION", "CASSANDRA_FINAL_VALIDATION", "CASSANDRA_FINAL_REVALIDATION"}
+
+
+def toks(etype):
+    return set(etype.upper().split("_"))
 EVIDENCE_KINDS = {"IMPLEMENTATION", "TEST", "CI", "PRODUCTION"}
 NEG_PREFIXES = ("PARTIAL", "HOLD", "FAIL", "CONDITIONAL", "REJECT")
 
@@ -61,7 +74,9 @@ def oracle_evidence(actor, etype, payload):
     t = etype.upper()
     if any(w in t for w in EXCLUDED_WORDS):
         return False
-    if any(w in t for w in EVIDENCE_WORDS):
+    if toks(etype) & NEG_TOKENS:
+        return False
+    if t in EVIDENCE_TYPES:
         return True
     kind = (pd(payload).get("evidence_kind") or "")
     return str(kind).upper() in EVIDENCE_KINDS
@@ -87,13 +102,15 @@ def oracle_judgment(events):
         t = etype.upper()
         if "REQUEST" in t or "REQUIRE" in t:      # policy: a request is never a judgment, structured or not
             continue
-        typed = "VALIDATION" in t or "DESIGN_PASS" in t
+        typed = "VALIDATION" in t or "DESIGN_PASS" in t or bool(toks(etype) & REVOKE_TOKENS)
         structured = "verdict" in pd(payload)
         if typed or structured:
             judg.append((etype, payload))
     if not judg:
         return [], ["NO_JUDGMENT_EVENT"]
     etype, payload = judg[-1]
+    if toks(etype) & REVOKE_TOKENS:   # a withdrawal/invalidation is never a pass, whatever stale verdict it carries
+        return ["LATEST_JUDGMENT_REVOKED"], []
     if "verdict" not in pd(payload):
         return [], ["LATEST_VERDICT_UNSTRUCTURED"]
     v = str(pd(payload).get("verdict") or "").upper()
@@ -104,7 +121,7 @@ def oracle_judgment(events):
         if "DESIGN" in v or "DESIGN" in etype.upper() or st == "DESIGN":
             return [], ["DESIGN_PASS_ONLY"]
         if v == "PASS" and st == "FINAL":
-            if "VALIDATION" in etype.upper():
+            if etype.upper() in FINAL_TYPES:
                 return [], []
             return [], ["PASS_NOT_FROM_VALIDATION_EVENT"]   # only an explicit validation verdict event may pass
         return [], ["PASS_STAGE_NOT_FINAL"]
@@ -223,7 +240,14 @@ def main():
              "CASSANDRA_EVIDENCE_REQUEST", "DESIGN_V2_EVIDENCE_REQUIREMENTS", "CASSANDRA_REVALIDATION_REQUESTED",
              "IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED", "MAGI_DECISION", "TASK_UPDATED", "DESIGN_SUBMITTED",
              "evidence", "Implementation_Note", "CI_RESULT", "TEST_RESULT", "EVIDENCE_VALIDATION", "IMPLEMENTATION_VERIFICATION",
-             "EVIDENCE_READY"]
+             "EVIDENCE_READY",
+             # added after CASSANDRA 5024 and from the real production vocabulary
+             "EVIDENCE_REVOKED", "EVIDENCE_INVALIDATED", "INVALID_EVIDENCE", "NO_EVIDENCE", "EVIDENCE_MISSING", "EVIDENCE_NOT_FOUND",
+             "IMPLEMENTATION_REJECTED", "IMPLEMENTATION_CI_FAILED", "IMPLEMENTATION_CI_PASS_WITHDRAWN", "EVIDENCE_SUPERSEDED",
+             "YOUNGSIL_GAS_IMPLEMENTATION_SPEC", "EVIDENCE_ONLY_BRIEFING_LIVE", "TEST_EVIDENCE", "IMPLEMENTATION_EVIDENCE",
+             "CI_EVIDENCE", "CI_EVIDENCE_RECOVERED", "GOLDEN_TEST_STAGED", "DEPENDENCY_EVIDENCE_LINKED", "TASK_CANCELLED",
+             "STATUS_REVERTED", "CASSANDRA_HOLD_EVIDENCE_VISIBILITY_GAP", "METER_COMPLETENESS_EVIDENCE_FROM_TASK186",
+             "GAS_GPX_IMPLEMENTATION_REQUESTED", "MCP_BROKER_PROPOSAL_RETRACTED", "FINAL_CONTROL_PLANE_NATURAL_E2E_EVIDENCE"]
     kinds = [None, "", "IMPLEMENTATION", "TEST", "CI", "PRODUCTION", "implementation", "ci", "OTHER", "VERIFICATION"]
     actors = ["캐스퍼", "마기", "마기(자동)", "TAEO", "CASSANDRA", "cassandra", "CASSANDRA_AGENT", "GEOMNURI_PATROL",
               "COMPLETION_GATE", "영실", "신규 실행 책임 에이전트", "ARGOS"]
@@ -275,6 +299,21 @@ def main():
         ("Plistv", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": ["PASS"], "stage": "FINAL"})),
         ("Pspace", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": " PASS", "stage": "FINAL"})),
         ("Pstagespace", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": "PASS", "stage": "FINAL "})),
+        ("Rinval", ("CASSANDRA", "CASSANDRA_INVALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rrevoked", ("CASSANDRA", "CASSANDRA_VALIDATION_REVOKED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rrevlow", ("CASSANDRA", "cassandra_validation_revoked", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rrevnull", ("CASSANDRA", "CASSANDRA_VALIDATION_REVOKED", None)),
+        ("Rwithdrawn", ("CASSANDRA", "CASSANDRA_VALIDATION_WITHDRAWN", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rsuperseded", ("CASSANDRA", "CASSANDRA_VALIDATION_SUPERSEDED", None)),
+        ("Rrejected", ("CASSANDRA", "CASSANDRA_VALIDATION_REJECTED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rrollback", ("CASSANDRA", "CASSANDRA_ROLLBACK", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Rvoid", ("CASSANDRA", "CASSANDRA_VOID_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Ainval2", ("CASSANDRA", "CASSANDRA_VALIDATION_STATUS", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Apre", ("CASSANDRA", "CASSANDRA_PREVALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Aimpl", ("CASSANDRA", "CASSANDRA_IMPLEMENTATION_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Afinal", ("CASSANDRA", "CASSANDRA_FINAL_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Areval", ("CASSANDRA", "CASSANDRA_REVALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Anote", ("CASSANDRA", "CASSANDRA_VALIDATION_NOTE", {"verdict": "PASS", "stage": "FINAL"})),
         ("Ureq", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", None)),
         ("Ureq2", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"note": "x"})),
     ]
@@ -283,7 +322,7 @@ def main():
     for n in (1, 2):
         for seq in itertools.product(alphabet, repeat=n):
             B.task("B|" + ">".join(s[0] for s in seq), [EVID] + [s[1] for s in seq])
-    reduced_names = {"Parr", "Pnullv", "Plistv", "Pspace", "Vreq", "Vreqlow", "Vagree", "Vdlow", "Ureq", "V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
+    reduced_names = {"Rinval", "Rrevoked", "Rrevnull", "Rsuperseded", "Ainval2", "Aimpl", "Anote", "Parr", "Pnullv", "Plistv", "Pspace", "Vreq", "Vreqlow", "Vagree", "Vdlow", "Ureq", "V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
                      "V[MAYBE/FINAL]", "U{}", "Unull", "Nagree", "Nvreq", "Xguide", "Udesign", "V[PASS_DESIGN/None]"}
     reduced = [a for a in alphabet if a[0] in reduced_names]
     assert len(reduced) == len(reduced_names), (len(reduced), reduced_names - {a[0] for a in reduced})
@@ -354,6 +393,13 @@ def main():
         ("99111 uppercase design validation PASS/FINAL", [EVID, ("CASSANDRA", "CASSANDRA_DESIGN_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})], ["DESIGN_PASS_ONLY"], "REVIEW"),
         ("agreement PASS/FINAL is not a pass", [EVID, ("CASSANDRA", "AGREEMENT_RESPONSE", {"verdict": "PASS", "stage": "FINAL"})], ["PASS_NOT_FROM_VALIDATION_EVENT"], "REVIEW"),
         ("PASS/FINAL then request w/ HOLD ignored -> still PASS", [EVID, PASS_FINAL, ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "HOLD", "stage": "FINAL"})], None, None),
+        ("5024 invalidation with stale PASS/FINAL", [EVID, ("CASSANDRA", "CASSANDRA_INVALIDATION", {"verdict": "PASS", "stage": "FINAL"})], ["LATEST_JUDGMENT_REVOKED"], "WARN"),
+        ("5024 validation revoked with stale PASS/FINAL", [EVID, PASS_FINAL, ("CASSANDRA", "CASSANDRA_VALIDATION_REVOKED", {"verdict": "PASS", "stage": "FINAL"})], ["LATEST_JUDGMENT_REVOKED"], "WARN"),
+        ("revoked then re-issued validation passes", [EVID, PASS_FINAL, ("CASSANDRA", "CASSANDRA_VALIDATION_REVOKED", None), PASS_FINAL], None, None),
+        ("validation status event is not an authorised final type", [EVID, ("CASSANDRA", "CASSANDRA_VALIDATION_STATUS", {"verdict": "PASS", "stage": "FINAL"})], ["PASS_NOT_FROM_VALIDATION_EVENT"], "REVIEW"),
+        ("revoked evidence is not evidence", [("캐스퍼", "EVIDENCE_REVOKED", None), PASS_FINAL], ["EVIDENCE_NOT_RECOGNIZED"], "REVIEW"),
+        ("spec event is not evidence", [("영실", "YOUNGSIL_GAS_IMPLEMENTATION_SPEC", None), PASS_FINAL], ["EVIDENCE_NOT_RECOGNIZED"], "REVIEW"),
+        ("revoked evidence_kind event is not evidence", [("캐스퍼", "TEST_RESULT_INVALIDATED", {"evidence_kind": "TEST"}), PASS_FINAL], ["EVIDENCE_NOT_RECOGNIZED"], "REVIEW"),
         ("lowercase validation PASS/FINAL passes", [EVID, ("CASSANDRA", "cassandra_validation", {"verdict": "PASS", "stage": "FINAL"})], None, None),
     ]
     for label, evs, _, _ in spec:
