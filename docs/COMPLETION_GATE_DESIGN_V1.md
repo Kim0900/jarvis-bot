@@ -1,9 +1,17 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.3 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.4 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.3). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.4). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.3 → v1.4 (카산드라 5018 FAIL)
+| 지적 | v1.3 결함 | v1.4 조치 |
+|---|---|---|
+| (1) 요청이 최종 PASS로 취급(#99021, #99022) | J 선택의 `OR payload ? verdict`가 REQUEST/REQUIRE 제외를 우회 → `CASSANDRA_REVALIDATION_REQUESTED`에 verdict=PASS/stage=FINAL이 있으면 통과, 증거가 있으면 위반 0건(미탐) | `event_type !~* '(REQUEST\|REQUIRE)'`를 J 선택의 최상위 AND로 이동(구조화 여부와 무관). 요청은 어떤 payload를 가져도 판정이 아님. 추가로 PASS_FINAL은 event_type에 VALIDATION이 있는 명시 판정 이벤트에서만 인정; 합의·안내·VERIFICATION_COMPLETED 등의 PASS/FINAL은 REVIEW `PASS_NOT_FROM_VALIDATION_EVENT`(부정 판정 HOLD 등은 종전대로 HARD) |
+| (2) DESIGN 판별 대소문자 구분(#99110) | `v_jtype ~ 'DESIGN'` → 소문자 event_type이 PASS_FINAL로 오분류 | `~*`로 변경. 소문자·혼합 표기 event_type 시험 추가 |
+| (3) 기대값이 SQL과 같은 오류를 복제 | `oracle_judgment`가 typed or structured를 그대로 사용 | 기대값을 정책 문장 기준으로 다시 작성(요청 제외 최우선, 명시 판정 이벤트만 PASS). 기대값과 별개로 카산드라 반례 #99021·#99022·#99023·#99110·#99111 등 8건을 손으로 쓴 기대값(E)으로 고정. 판정 알파벳에 요청·합의·안내·소문자·혼합 표기 16종 추가 |
+시험 결과(로컬 임시 PostgreSQL 16, 참고치): 16,161 조합 불일치 0 (증거 3600 / 판정열 12,261 / secondary 100 / 전이 192 / 손기대값 8). **v1.3 SQL을 같은 시험에 넣으면 판정열 2,401건 + 손기대값 5건 불일치로 검출됨.** 운영 PostgreSQL 독립 재현은 카산드라 몫.
+
 ### v1.2 → v1.3 (카산드라 5009 FAIL, 마기 5014 지시 반영)
 | 지적 | v1.2 결함 | v1.3 조치 |
 |---|---|---|
@@ -30,17 +38,18 @@
 - evidence_registry 테이블은 완료된 verification_required 태스크에서 쓰이지 않는다(0행). 실제 증거 기록은 magi_task_events 이벤트다.
 - **신규 실측 (v1.1 설계 근거):** actor=CASSANDRA 이벤트 중 `payload.verdict`가 있는 것은 4965~4970 6건뿐이고 나머지 과거 이벤트는 자유서술이다. 값 어휘: PARTIAL_PASS, HOLD, FAIL_DESIGN, FAIL_PATCH. 과거 본문은 `PASS`로 시작해도 300자 안에 HOLD·FAIL 같은 단어가 흔히 섞여, 정규식으로 PASS를 안전하게 판정하는 방법이 없다(시도한 보수 규칙에서 PASS 시작 본문 다수가 판정불가로 남음). → 본문 해석은 포기하고 구조화값을 기준으로 한다.
 
-## 2. 판정 규칙 v1.3 (관찰 모드)
+## 2. 판정 규칙 v1.4 (관찰 모드)
 대상: `NEW.verification_required IS TRUE AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`.
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
 **선택(구조화 여부를 보기 전에):** 같은 태스크에서 `actor ILIKE 'CASSANDRA%'` 이고
-`(event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)' AND event_type !~* '(REQUEST|REQUIRE)') OR coalesce(payload ? 'verdict', false)` 인 이벤트 중 **event_id가 가장 큰 1건(J)** 이 현재 판정이다. 새 event_type이라도 payload.verdict가 있으면 판정 이벤트로 본다. 합의 응답·백로그 검토·증거 요청 등 판정이 아닌 카산드라 이벤트는 J 선택에 영향을 주지 않는다.
+`event_type !~* '(REQUEST|REQUIRE)' AND (event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)' OR coalesce(payload ? 'verdict', false))` (요청 제외는 최상위 AND) 인 이벤트 중 **event_id가 가장 큰 1건(J)** 이 현재 판정이다. 새 event_type이라도 payload.verdict가 있으면 판정 이벤트로 본다. 합의 응답·백로그 검토·증거 요청 등 판정이 아닌 카산드라 이벤트는 J 선택에 영향을 주지 않는다.
 **분류(J에 대해서만):**
 - J가 없음 → NO_JUDGMENT_EVENT. J에 `payload.verdict`가 없음 → LATEST_VERDICT_UNSTRUCTURED(과거에 구조화 PASS가 있어도 인정하지 않음).
 - 표준 필드(2.4절): `verdict` ∈ {PASS, PARTIAL_PASS, CONDITIONAL, HOLD, FAIL}, `stage` ∈ {DESIGN, IMPLEMENTATION, FINAL}.
 - NEG: verdict(대문자화)가 `^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)`로 시작(과도기 값 FAIL_DESIGN·FAIL_PATCH 포함).
-- PASS_FINAL: verdict가 정확히 `PASS`이고 `stage = FINAL`이며 verdict·event_type에 DESIGN이 없음.
+- PASS_FINAL: verdict가 정확히 `PASS`이고 `stage = FINAL`이며 verdict·event_type에 DESIGN이 없고(대소문자 무관) **event_type에 VALIDATION이 있는 명시 판정 이벤트**일 것.
+- PASS_NON_VALIDATION: PASS+FINAL이지만 판정 이벤트가 아님(합의·안내 등) → REVIEW `PASS_NOT_FROM_VALIDATION_EVENT`.
 - PASS_DESIGN: PASS 형태인데 stage=DESIGN, 또는 verdict·event_type에 DESIGN 포함.
 - PASS_PARTIAL_STAGE: PASS인데 stage=IMPLEMENTATION, 또는 stage 누락·미정의 값. 최종으로 인정하지 않는다.
 - UNKNOWN: 그 외 모든 값. UNKNOWN은 PASS가 아니다.
@@ -60,6 +69,7 @@
 | REVIEW (gate_level=REVIEW) | LATEST_VERDICT_UNSTRUCTURED | J에 구조화 판정값이 없음 |
 | REVIEW | NO_JUDGMENT_EVENT | 카산드라 이벤트는 있으나 판정 이벤트가 없음 |
 | REVIEW | DESIGN_PASS_ONLY | J가 PASS_DESIGN |
+| REVIEW | PASS_NOT_FROM_VALIDATION_EVENT | J가 PASS+FINAL이나 event_type에 VALIDATION 없음 |
 | REVIEW | PASS_STAGE_NOT_FINAL | J가 PASS이나 stage가 IMPLEMENTATION이거나 누락 |
 | REVIEW | EVIDENCE_NOT_RECOGNIZED | C1 불충족(다른 reason과 함께 기록) |
 - J가 PASS_FINAL이고 C1도 충족이면 기록 없음.
@@ -134,7 +144,8 @@ begin
       into v_jid, v_jtype, v_structured, v_ver, v_stage, v_tier
       from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%'
-        and ((e.event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)' and e.event_type !~* '(REQUEST|REQUIRE)')
+        and e.event_type !~* '(REQUEST|REQUIRE)'          -- common exclusion: a request is never a judgment
+        and ((e.event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)')
              or coalesce(e.payload ? 'verdict', false))
       order by e.event_id desc limit 1;
     v_found := found;
@@ -148,9 +159,11 @@ begin
     elsif v_ver ~ '^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)' then
       v_hard := array_append(v_hard, 'LATEST_VERDICT_NOT_PASS'::text); v_class := 'NEG';
     elsif v_ver ~ '^PASS(_[A-Z]+)?$' then
-      if v_ver ~ 'DESIGN' or v_jtype ~ 'DESIGN' or v_stage = 'DESIGN' then
+      if v_ver ~ 'DESIGN' or v_jtype ~* 'DESIGN' or v_stage = 'DESIGN' then
         v_rev := array_append(v_rev, 'DESIGN_PASS_ONLY'::text); v_class := 'PASS_DESIGN';
-      elsif v_ver = 'PASS' and v_stage = 'FINAL' then v_class := 'PASS_FINAL';
+      elsif v_ver = 'PASS' and v_stage = 'FINAL' and v_jtype ~* 'VALIDATION' then v_class := 'PASS_FINAL';
+      elsif v_ver = 'PASS' and v_stage = 'FINAL' then
+        v_rev := array_append(v_rev, 'PASS_NOT_FROM_VALIDATION_EVENT'::text); v_class := 'PASS_NON_VALIDATION';
       else v_rev := array_append(v_rev, 'PASS_STAGE_NOT_FINAL'::text); v_class := 'PASS_PARTIAL_STAGE'; end if;
     else
       v_hard := array_append(v_hard, 'LATEST_VERDICT_NOT_PASS'::text); v_class := 'UNKNOWN';
@@ -203,7 +216,7 @@ execute function public.fn_completion_gate_observe();
 **(b) 증거 이벤트 타입 20종 판정: 20/20 일치.** 허용 7(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) / 불허 13(VERIFICATION_COMPLETED, CASSANDRA_VALIDATION, CASSANDRA_DESIGN_PASS, IMPLEMENTATION_READY_FOR_VERIFICATION, VERIFICATION_READY, VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED).
 **(c) verdict·stage 분류 15/15 일치(읽기 전용 SELECT):** PARTIAL_PASS/FINAL, FAIL_DESIGN(과도기 값), HOLD/FINAL, FAIL/DESIGN → NEG / PASS+FINAL, 소문자 pass+final → PASS_FINAL / PASS 단계 누락, PASS+IMPLEMENTATION, 비표준 PASS_FINAL → PASS_PARTIAL_STAGE / PASS+DESIGN, 과도기 PASS_DESIGN, PASS+FINAL이지만 설계 검증 event_type → PASS_DESIGN / MAYBE → UNKNOWN / 판정값 없는 과거 이벤트 → 비구조 / 카산드라가 아닌 actor의 PASS+FINAL → 불인정.
 **(d) 13건 백테스트 재실행:** 3절 표.
-**(f) v1.3 전수 조합 시험: 10,176 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
+**(f) v1.4 전수 조합 시험: 16,161 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
 **(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 22/22 통과 (v1.3에서 P11 기대값을 HARD로 갱신)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
 **시험 중 발견·수정한 결함 2건:**
 1. (읽기 전용 단계) payload가 NULL인 과거 이벤트가 `NOT NULL`로 평가돼 구형 10건이 HARD로 잘못 분류됨 → 모든 곳에 `coalesce(payload ? 'verdict', false)`.

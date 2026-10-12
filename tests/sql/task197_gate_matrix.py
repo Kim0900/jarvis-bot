@@ -80,8 +80,9 @@ def oracle_judgment(events):
     judg = []
     for actor, etype, payload in cass:
         t = etype.upper()
-        typed = (("VALIDATION" in t or "REVALIDATION" in t or "DESIGN_PASS" in t)
-                 and "REQUEST" not in t and "REQUIRE" not in t)
+        if "REQUEST" in t or "REQUIRE" in t:      # policy: a request is never a judgment, structured or not
+            continue
+        typed = "VALIDATION" in t or "DESIGN_PASS" in t
         structured = payload is not None and "verdict" in payload
         if typed or structured:
             judg.append((etype, payload))
@@ -95,10 +96,12 @@ def oracle_judgment(events):
     if v.startswith(NEG_PREFIXES):
         return ["LATEST_VERDICT_NOT_PASS"], []
     if is_pass_word(v):
-        if "DESIGN" in v or "DESIGN" in etype or st == "DESIGN":
+        if "DESIGN" in v or "DESIGN" in etype.upper() or st == "DESIGN":
             return [], ["DESIGN_PASS_ONLY"]
         if v == "PASS" and st == "FINAL":
-            return [], []
+            if "VALIDATION" in etype.upper():
+                return [], []
+            return [], ["PASS_NOT_FROM_VALIDATION_EVENT"]   # only an explicit validation verdict event may pass
         return [], ["PASS_STAGE_NOT_FINAL"]
     return ["LATEST_VERDICT_NOT_PASS"], []
 
@@ -248,16 +251,30 @@ def main():
         ("Vdesignevt", ("CASSANDRA", "CASSANDRA_DESIGN_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
         ("Vrevalid", ("CASSANDRA", "CASSANDRA_IMPLEMENTATION_REVALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
         ("Vreq", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vreqlow", ("CASSANDRA", "cassandra_revalidation_requested", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vrequire", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUIRED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vreq2", ("CASSANDRA", "CASSANDRA_VALIDATION_REQUESTED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vreqhold", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "HOLD", "stage": "FINAL"})),
+        ("Vagree", ("CASSANDRA", "AGREEMENT_RESPONSE", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vguide", ("CASSANDRA", "CASSANDRA_OPERATIONAL_GUIDANCE", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vcomplete", ("CASSANDRA", "VERIFICATION_COMPLETED", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vdlow", ("CASSANDRA", "cassandra_design_validation", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vdmix", ("CASSANDRA", "Cassandra_Design_Validation", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vdup", ("CASSANDRA", "CASSANDRA_DESIGN_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vvlow", ("CASSANDRA", "cassandra_validation", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Vrevalow", ("CASSANDRA", "cassandra_implementation_revalidation", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Ureq", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", None)),
+        ("Ureq2", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"note": "x"})),
     ]
     alphabet = full + extra
     B = Bulk()
     for n in (1, 2):
         for seq in itertools.product(alphabet, repeat=n):
             B.task("B|" + ">".join(s[0] for s in seq), [EVID] + [s[1] for s in seq])
-    reduced_names = {"V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
+    reduced_names = {"Vreq", "Vreqlow", "Vagree", "Vdlow", "Ureq", "V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
                      "V[MAYBE/FINAL]", "U{}", "Unull", "Nagree", "Nvreq", "Xguide", "Udesign", "V[PASS_DESIGN/None]"}
     reduced = [a for a in alphabet if a[0] in reduced_names]
-    assert len(reduced) == 14, len(reduced)
+    assert len(reduced) == 19, len(reduced)
     for seq in itertools.product(reduced, repeat=3):
         B.task("B|" + ">".join(s[0] for s in seq), [EVID] + [s[1] for s in seq])
     total += compare("B judgment sequences", B.run(), B, lambda ev: expected(ev))
@@ -312,6 +329,35 @@ def main():
             failures.append(("D transition matrix", f"vr={vr} {old}->{new}", "fire mismatch", counts.get(tid, 0)))
     print(f"D transition matrix: {len(cases)} cases, {D_fail} mismatches")
     total += len(cases)
+
+    # E. hand-written spec expectations (independent of the oracle): CASSANDRA 5018 counterexamples
+    reset()
+    E = Bulk()
+    HOLD = ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": "HOLD", "stage": "FINAL"})
+    spec = [
+        ("99021 request w/ PASS+FINAL only", [EVID, ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "PASS", "stage": "FINAL"})], ["NO_JUDGMENT_EVENT"], "REVIEW"),
+        ("99022 HOLD then request w/ PASS+FINAL", [EVID, HOLD, ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "PASS", "stage": "FINAL"})], ["LATEST_VERDICT_NOT_PASS"], "WARN"),
+        ("99023 HOLD then unstructured request", [EVID, HOLD, ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", None)], ["LATEST_VERDICT_NOT_PASS"], "WARN"),
+        ("99110 lowercase design validation PASS/FINAL", [EVID, ("CASSANDRA", "cassandra_design_validation", {"verdict": "PASS", "stage": "FINAL"})], ["DESIGN_PASS_ONLY"], "REVIEW"),
+        ("99111 uppercase design validation PASS/FINAL", [EVID, ("CASSANDRA", "CASSANDRA_DESIGN_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})], ["DESIGN_PASS_ONLY"], "REVIEW"),
+        ("agreement PASS/FINAL is not a pass", [EVID, ("CASSANDRA", "AGREEMENT_RESPONSE", {"verdict": "PASS", "stage": "FINAL"})], ["PASS_NOT_FROM_VALIDATION_EVENT"], "REVIEW"),
+        ("PASS/FINAL then request w/ HOLD ignored -> still PASS", [EVID, PASS_FINAL, ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"verdict": "HOLD", "stage": "FINAL"})], None, None),
+        ("lowercase validation PASS/FINAL passes", [EVID, ("CASSANDRA", "cassandra_validation", {"verdict": "PASS", "stage": "FINAL"})], None, None),
+    ]
+    for label, evs, _, _ in spec:
+        E.task("E|" + label, evs)
+    got = E.run()
+    by_label = {lab: tid for tid, (lab, _) in E.cases.items()}
+    for label, evs, reasons, level in spec:
+        rows = got.get(by_label["E|" + label], [])
+        if reasons is None:
+            ok = not rows
+        else:
+            ok = len(rows) == 1 and rows[0][0] == level and sorted(rows[0][1]) == sorted(reasons)
+        if not ok:
+            failures.append(("E spec", label, "differs from hand-written expectation", rows))
+    print(f"E spec expectations: {len(spec)} cases, {sum(1 for f in failures if f[0] == 'E spec')} mismatches")
+    total += len(spec)
 
     print(f"\nTOTAL {total} combinations, {len(failures)} mismatches")
     for f in failures[:25]:
