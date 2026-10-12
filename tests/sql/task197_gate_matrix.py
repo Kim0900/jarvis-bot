@@ -50,6 +50,11 @@ EVIDENCE_KINDS = {"IMPLEMENTATION", "TEST", "CI", "PRODUCTION"}
 NEG_PREFIXES = ("PARTIAL", "HOLD", "FAIL", "CONDITIONAL", "REJECT")
 
 
+def pd(payload):
+    """payload as a dict; jsonb arrays/scalars/NULL carry no structured fields."""
+    return payload if isinstance(payload, dict) else {}
+
+
 def oracle_evidence(actor, etype, payload):
     if actor in NOT_EVIDENCE_ACTORS or actor.upper().startswith("CASSANDRA"):
         return False
@@ -58,7 +63,7 @@ def oracle_evidence(actor, etype, payload):
         return False
     if any(w in t for w in EVIDENCE_WORDS):
         return True
-    kind = ((payload or {}).get("evidence_kind") or "")
+    kind = (pd(payload).get("evidence_kind") or "")
     return str(kind).upper() in EVIDENCE_KINDS
 
 
@@ -83,16 +88,16 @@ def oracle_judgment(events):
         if "REQUEST" in t or "REQUIRE" in t:      # policy: a request is never a judgment, structured or not
             continue
         typed = "VALIDATION" in t or "DESIGN_PASS" in t
-        structured = payload is not None and "verdict" in payload
+        structured = "verdict" in pd(payload)
         if typed or structured:
             judg.append((etype, payload))
     if not judg:
         return [], ["NO_JUDGMENT_EVENT"]
     etype, payload = judg[-1]
-    if payload is None or "verdict" not in payload:
+    if "verdict" not in pd(payload):
         return [], ["LATEST_VERDICT_UNSTRUCTURED"]
-    v = str(payload.get("verdict") or "").upper()
-    st = str(payload.get("stage") or "").upper()
+    v = str(pd(payload).get("verdict") or "").upper()
+    st = str(pd(payload).get("stage") or "").upper()
     if v.startswith(NEG_PREFIXES):
         return ["LATEST_VERDICT_NOT_PASS"], []
     if is_pass_word(v):
@@ -109,7 +114,7 @@ def oracle_judgment(events):
 def oracle_secondary(events):
     flags = [False, False]  # pass recorded, any secondary event
     for actor, etype, payload in events:
-        p = payload or {}
+        p = pd(payload)
         if actor != "마기" or str(p.get("verifier_role") or "").upper() != "SECONDARY":
             continue
         flags[1] = True
@@ -263,6 +268,13 @@ def main():
         ("Vdup", ("CASSANDRA", "CASSANDRA_DESIGN_VALIDATION", {"verdict": "PASS", "stage": "FINAL"})),
         ("Vvlow", ("CASSANDRA", "cassandra_validation", {"verdict": "PASS", "stage": "FINAL"})),
         ("Vrevalow", ("CASSANDRA", "cassandra_implementation_revalidation", {"verdict": "PASS", "stage": "FINAL"})),
+        ("Parr", ("CASSANDRA", "CASSANDRA_VALIDATION", ["verdict"])),
+        ("Pstr", ("CASSANDRA", "CASSANDRA_VALIDATION", "verdict")),
+        ("Pnullv", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": None, "stage": "FINAL"})),
+        ("Pnumv", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": 123, "stage": "FINAL"})),
+        ("Plistv", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": ["PASS"], "stage": "FINAL"})),
+        ("Pspace", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": " PASS", "stage": "FINAL"})),
+        ("Pstagespace", ("CASSANDRA", "CASSANDRA_VALIDATION", {"verdict": "PASS", "stage": "FINAL "})),
         ("Ureq", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", None)),
         ("Ureq2", ("CASSANDRA", "CASSANDRA_REVALIDATION_REQUESTED", {"note": "x"})),
     ]
@@ -271,10 +283,10 @@ def main():
     for n in (1, 2):
         for seq in itertools.product(alphabet, repeat=n):
             B.task("B|" + ">".join(s[0] for s in seq), [EVID] + [s[1] for s in seq])
-    reduced_names = {"Vreq", "Vreqlow", "Vagree", "Vdlow", "Ureq", "V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
+    reduced_names = {"Parr", "Pnullv", "Plistv", "Pspace", "Vreq", "Vreqlow", "Vagree", "Vdlow", "Ureq", "V[PASS/FINAL]", "V[PASS/DESIGN]", "V[PASS/None]", "V[PARTIAL_PASS/FINAL]", "V[HOLD/FINAL]", "V[FAIL/FINAL]",
                      "V[MAYBE/FINAL]", "U{}", "Unull", "Nagree", "Nvreq", "Xguide", "Udesign", "V[PASS_DESIGN/None]"}
     reduced = [a for a in alphabet if a[0] in reduced_names]
-    assert len(reduced) == 19, len(reduced)
+    assert len(reduced) == len(reduced_names), (len(reduced), reduced_names - {a[0] for a in reduced})
     for seq in itertools.product(reduced, repeat=3):
         B.task("B|" + ">".join(s[0] for s in seq), [EVID] + [s[1] for s in seq])
     total += compare("B judgment sequences", B.run(), B, lambda ev: expected(ev))
@@ -307,7 +319,7 @@ def main():
 
     # D. transition matrix ----------------------------------------------------------------
     reset()
-    statuses = ["PENDING", "ASSIGNED", "IN_PROGRESS", "VERIFICATION", "COMPLETED", "CLOSED", "CANCELLED", "BLOCKED"]
+    statuses = ["CREATED", "ASSIGNED", "IN_PROGRESS", "WAITING", "BLOCKED", "HANDOFF", "REVIEW", "VERIFICATION", "COMPLETED", "HOLD", "CANCELLED", "CLOSED"]
     D_fail = 0
     cases = []
     for vr, old, new in itertools.product([True, False, None], statuses, statuses):

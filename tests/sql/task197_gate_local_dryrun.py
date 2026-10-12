@@ -91,6 +91,13 @@ sql("alter table magi_task_events drop constraint no_gate;")
 # payload shape: no patrol keys, no marker strings
 row,_=sql("select count(*) from magi_task_events where event_type='COMPLETION_GATE_VIOLATION' and (payload ? 'severity' or payload ? 'level' or payload ? 'priority' or detail ~ '🔴|\\[CRITICAL\\]|P0 |P1 |P0급|P0격상')")
 ok=(row=="0"); results.append(ok); print(("PASS " if ok else "FAIL ")+f"R3 violation events carry no patrol trigger keys/markers (count={row})")
+# production-shaped permissions: the bot updates status as anon under RLS; the event must still be recorded
+out,_=sql("insert into magi_tasks(title,status,priority,verification_required) values ('A1','VERIFICATION','P1',true) returning task_id;"); tid=int(out.split()[0])
+o,e=sql(f"set role anon; update magi_tasks set status='COMPLETED' where task_id={tid} returning status;")
+cnt,_=sql(f"select count(*) from magi_task_events where task_id={tid} and event_type='COMPLETION_GATE_VIOLATION' and domain='magi'")
+ok=("COMPLETED" in o and cnt=="1"); results.append(ok); print(("PASS " if ok else "FAIL ")+f"A1 anon (RLS) status update records violation, domain inherited (count={cnt}, warn={e[:60]})")
+o,e=sql("set role anon; select count(*) from magi_task_events where event_type='COMPLETION_GATE_VIOLATION';")
+ok=(o.split()[-1].isdigit()); results.append(ok); print(("PASS " if ok else "FAIL ")+"A2 anon can read violation events (read policy)")
 anon,_=sql("select has_function_privilege('anon','fn_completion_gate_observe()','execute')")
 ok=(anon=="f"); results.append(ok); print(("PASS " if ok else "FAIL ")+f"anon cannot execute function (has_function_privilege={anon})")
 print(f"\n{sum(results)}/{len(results)} passed")

@@ -1,9 +1,19 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.4 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.5 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.4). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.5). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.4 → v1.5 (제출 전 자체 점검: 이 작업이 운영에서 만들 수 있는 문제 목록화)
+카산드라 지적 없이 캐스퍼가 제출 전에 찾아 고친 것. 운영 DB는 읽기 전용 조회만 했다(2026-10-13 07:4x KST).
+| 점검 항목 | 운영 실측 | 조치 |
+|---|---|---|
+| 로컬 시험 스키마가 운영과 달라 결과가 운영을 대변하지 못함 | event_id=identity ALWAYS, 두 테이블 RLS 켜짐(FORCE 아님, 소유자 postgres), anon 읽기·쓰기 정책(events는 insert, tasks는 update), 도메인 상속 트리거, status/priority CHECK | 로컬 스키마를 동일 조건으로 재작성. 봇이 anon 권한으로 상태를 바꾸는 경로 시험 A1·A2 추가(RLS 아래에서도 위반 이벤트 기록, domain 상속 확인). **적용 시 함수 소유자는 RLS를 우회하는 postgres여야 함**(SECURITY DEFINER 전제, 6.2 롤백 드라이런에서 확인) |
+| payload가 객체가 아닌 JSON(배열·문자열) | 운영은 객체 229건·NULL 4,649건뿐이고 verdict 12건 전부 문자열 | `payload ? 'verdict'`는 배열 원소에도 참이 됨 → `jsonb_typeof(payload)='object'` 조건 추가(J 선택과 구조화 판정 2곳). 배열·문자열·null·숫자·리스트 verdict, 앞뒤 공백 값 시험 추가(모두 안전 방향: 비구조 또는 HARD) |
+| 변이 확인 | | jsonb_typeof 제거 시 판정열 853건, J 선택의 요청 제외 제거 시 판정열 2,522건 + 손기대값 4건 불일치로 검출 |
+시험 결과(로컬 임시 PostgreSQL 16, 운영 조건 재현, 참고치): **22,787 조합 불일치 0** (증거 3600 / 판정열 18,647 / secondary 100 / 전이 432 / 손기대값 8), 시나리오 **24/24**. 운영 PostgreSQL 독립 재현은 카산드라 몫.
+**알려진 한계(미수정, 관찰 모드이므로 허용):** (1) anon 키로 events insert가 허용돼 있어 누구나 actor='CASSANDRA'로 기재할 수 있다 → 게이트는 위조 방지가 아님(3절). (2) `REQUIRE` 같은 부분 문자열이 든 정상 판정 event_type(예: …REQUIREMENTS_VALIDATION)은 판정에서 제외돼 REVIEW로 기록된다(안전 방향 오탐). 관찰 기간 오탐 목록으로 확인.
+
 ### v1.3 → v1.4 (카산드라 5018 FAIL)
 | 지적 | v1.3 결함 | v1.4 조치 |
 |---|---|---|
@@ -38,7 +48,7 @@
 - evidence_registry 테이블은 완료된 verification_required 태스크에서 쓰이지 않는다(0행). 실제 증거 기록은 magi_task_events 이벤트다.
 - **신규 실측 (v1.1 설계 근거):** actor=CASSANDRA 이벤트 중 `payload.verdict`가 있는 것은 4965~4970 6건뿐이고 나머지 과거 이벤트는 자유서술이다. 값 어휘: PARTIAL_PASS, HOLD, FAIL_DESIGN, FAIL_PATCH. 과거 본문은 `PASS`로 시작해도 300자 안에 HOLD·FAIL 같은 단어가 흔히 섞여, 정규식으로 PASS를 안전하게 판정하는 방법이 없다(시도한 보수 규칙에서 PASS 시작 본문 다수가 판정불가로 남음). → 본문 해석은 포기하고 구조화값을 기준으로 한다.
 
-## 2. 판정 규칙 v1.4 (관찰 모드)
+## 2. 판정 규칙 v1.5 (관찰 모드)
 대상: `NEW.verification_required IS TRUE AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`.
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
@@ -108,7 +118,7 @@
 - 이벤트 insert는 magi_tasks를 건드리지 않아 재귀 없음. `fn_inherit_domain_from_task`가 domain을 채운다.
 - 쓰기 경로 회귀: (a) 봇 PATCH `approve_task`, (b) 마기(자동) COMPLETED(vr=false → 대상 아님), (c) 에이전트 직접 SQL UPDATE, (d) 비상태 컬럼 UPDATE(트리거 미발동)를 롤백 트랜잭션 안에서 전/후 비교.
 
-## 5. 초안 SQL v1.2 (미적용)
+## 5. 초안 SQL v1.5 (미적용)
 ```sql
 create or replace function public.fn_completion_gate_observe() returns trigger
 language plpgsql security definer set search_path = public as $$
@@ -139,14 +149,14 @@ begin
       and e.actor = '마기' and upper(coalesce(e.payload->>'verifier_role','')) = 'SECONDARY') into v_sec_other;
 
     -- J: latest CASSANDRA judgment event, chosen BEFORE looking at structure
-    select e.event_id, e.event_type, coalesce(e.payload ? 'verdict', false),
+    select e.event_id, e.event_type, coalesce(jsonb_typeof(e.payload) = 'object' and e.payload ? 'verdict', false),
            upper(e.payload->>'verdict'), upper(e.payload->>'stage'), e.payload->>'tier'
       into v_jid, v_jtype, v_structured, v_ver, v_stage, v_tier
       from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%'
         and e.event_type !~* '(REQUEST|REQUIRE)'          -- common exclusion: a request is never a judgment
         and ((e.event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)')
-             or coalesce(e.payload ? 'verdict', false))
+             or coalesce(jsonb_typeof(e.payload) = 'object' and e.payload ? 'verdict', false))
       order by e.event_id desc limit 1;
     v_found := found;
 
@@ -216,8 +226,8 @@ execute function public.fn_completion_gate_observe();
 **(b) 증거 이벤트 타입 20종 판정: 20/20 일치.** 허용 7(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) / 불허 13(VERIFICATION_COMPLETED, CASSANDRA_VALIDATION, CASSANDRA_DESIGN_PASS, IMPLEMENTATION_READY_FOR_VERIFICATION, VERIFICATION_READY, VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED).
 **(c) verdict·stage 분류 15/15 일치(읽기 전용 SELECT):** PARTIAL_PASS/FINAL, FAIL_DESIGN(과도기 값), HOLD/FINAL, FAIL/DESIGN → NEG / PASS+FINAL, 소문자 pass+final → PASS_FINAL / PASS 단계 누락, PASS+IMPLEMENTATION, 비표준 PASS_FINAL → PASS_PARTIAL_STAGE / PASS+DESIGN, 과도기 PASS_DESIGN, PASS+FINAL이지만 설계 검증 event_type → PASS_DESIGN / MAYBE → UNKNOWN / 판정값 없는 과거 이벤트 → 비구조 / 카산드라가 아닌 actor의 PASS+FINAL → 불인정.
 **(d) 13건 백테스트 재실행:** 3절 표.
-**(f) v1.4 전수 조합 시험: 16,161 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
-**(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 22/22 통과 (v1.3에서 P11 기대값을 HARD로 갱신)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
+**(f) v1.5 전수 조합 시험: 22,787 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
+**(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 24/24 통과 (v1.5: 운영과 같은 RLS·identity 스키마, anon 경로 A1·A2 추가)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
 **시험 중 발견·수정한 결함 2건:**
 1. (읽기 전용 단계) payload가 NULL인 과거 이벤트가 `NOT NULL`로 평가돼 구형 10건이 HARD로 잘못 분류됨 → 모든 곳에 `coalesce(payload ? 'verdict', false)`.
 2. (로컬 실행 단계) **v1·v1.1 초안 SQL은 실제로는 동작하지 않았다.** `text[] || '문자열'`에서 문자열이 배열 리터럴로 해석돼 `malformed array literal` 오류가 났고, fail-open 설계 때문에 이 오류가 삼켜져 위반 이벤트가 하나도 기록되지 않았다(첫 실행 9/22). `array_append(배열, '값'::text)`로 고쳐 22/22 통과. 교훈: fail-open 트리거는 결함이 있어도 조용히 아무것도 안 하므로, 적용 전 반드시 실제 실행 시험이 필요하고 관찰 기간 첫날 위반 이벤트 건수 대비 완료 전이 건수를 점검해야 한다(위반 이벤트 0건이 "정상"인지 "고장"인지 구분 불가).
