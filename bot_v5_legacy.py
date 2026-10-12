@@ -6978,7 +6978,15 @@ async def already_ran_today_kst(job_name: str) -> bool:
     if last_dt > now_kst:
         logger.error("scheduler_status future timestamp (%s): blocking duplicate", job_name)
         return True
-    return last_dt.date() == now_kst.date()
+    if last_dt.date() != now_kst.date():
+        return False
+    # FAIL is an attempt, not a successful completion. Permit retry when DB is readable.
+    # Unknown/empty results remain fail-closed; never guess success.
+    last_result = rows[0].get("last_result")
+    if not isinstance(last_result, str) or not last_result.strip():
+        logger.error("scheduler_status result missing (%s): blocking duplicate", job_name)
+        return True
+    return not last_result.startswith("FAIL")
 
 
 async def notify_pending_simple_tasks():
