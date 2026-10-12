@@ -80,7 +80,7 @@ execute function public.fn_completion_gate_observe();
 ## 6. 시험 계획 (카산드라 PASS 후, 단일 DO 블록 안에서 DDL+시험 후 강제 롤백으로 운영 무변경 드라이런)
 양성: (P1) 증거·PASS 없는 vr=true 전이 → 위반 1건, reasons=2개. (P2) 증거만 있고 PASS 없음 → NO_CASSANDRA_PASS. (P3) 카산드라 PARTIAL만 → 위반. (P4) 다른 태스크에 PASS 기재 → PASS_FILED_ON_OTHER_TASK.
 음성: (N1) 증거+같은 태스크 PASS → 기록 없음. (N2) vr=false 전이. (N3) status 외 컬럼 UPDATE. (N4) COMPLETED→CLOSED 재전이 비발동. (N5) 재오픈 후 재완료는 다시 발동.
-회귀·안전: (R1) 트리거 함수가 예외를 내도 UPDATE 성공(fail-open). (R2) 봇 approve_task PATCH 경로 동작. (R3) 위반 이벤트가 순라 underposting/slack_policy 점검을 유발하지 않음(분류기 함수에 payload/detail 입력 시험). (R4) 백테스트 13건 결과와 일치. (R5) magi_task_events에 task_id 인덱스 존재 확인(없으면 3개 조회의 비용 평가).
+회귀·안전: (R1) 트리거 함수가 예외를 내도 UPDATE 성공(fail-open). (R2) 봇 approve_task PATCH 경로 동작. (R3) 위반 이벤트가 순라 underposting/slack_policy 점검을 유발하지 않음(분류기 함수에 payload/detail 입력 시험). (R4) 백테스트 13건 결과와 일치. (R5) 비용: `idx_magi_task_events_task`(task_id) 인덱스 존재 확인됨 → C1·C2는 인덱스 조회. C2'만 `task_id <> NEW.task_id` 전체 스캔이므로 이벤트 수 증가 시 비용을 측정하고, 필요하면 C2'를 관찰 보고서(배치 SQL)로 이동.
 종료증거: 위 시험 결과 이벤트 + 카산드라 독립 PASS. 관찰 2주 후 위반 집계·오탐 검토를 마기에 보고하고, 거부 전환은 별도 설계·승인.
 
 ## 7. 미확인/한계
