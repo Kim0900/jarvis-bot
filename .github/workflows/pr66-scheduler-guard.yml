@@ -1,0 +1,21 @@
+name: PR66 scheduler guard regression
+on:
+  pull_request:
+    paths:
+      - 'bot_v5_legacy.py'
+      - 'tests/test_scheduler_guard_fail_closed.py'
+      - '.github/workflows/pr66-scheduler-guard.yml'
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile target and tests
+        run: python -m py_compile bot_v5_legacy.py tests/test_scheduler_guard_fail_closed.py
+      - name: Reproduce database failure and validate fail-closed guard
+        run: python -m unittest discover -s tests -p 'test_scheduler_guard_fail_closed.py' -v
