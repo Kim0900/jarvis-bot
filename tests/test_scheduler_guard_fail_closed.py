@@ -33,13 +33,13 @@ class SchedulerGuardTests(unittest.TestCase):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
-        self.assertTrue(self._guard([{"last_run_at": stamp}]))
+        self.assertTrue(self._guard([{"last_run_at": stamp, "last_result": "OK"}]))
 
     def test_yesterday_completed_run_allows_next_day(self):
         from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo
         stamp = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=1)).isoformat()
-        self.assertFalse(self._guard([{"last_run_at": stamp}]))
+        self.assertFalse(self._guard([{"last_run_at": stamp, "last_result": "OK"}]))
 
     def test_non_object_row_blocks(self):
         self.assertTrue(self._guard(["bad-row"]))
@@ -54,12 +54,12 @@ class SchedulerGuardTests(unittest.TestCase):
         from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo
         stamp = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(days=1)).isoformat()
-        self.assertTrue(self._guard([{"last_run_at": stamp}]))
+        self.assertTrue(self._guard([{"last_run_at": stamp, "last_result": "OK"}]))
 
     def test_utc_z_timestamp_parses(self):
         from datetime import datetime, timedelta, timezone
         stamp = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
-        self.assertFalse(self._guard([{"last_run_at": stamp}]))
+        self.assertFalse(self._guard([{"last_run_at": stamp, "last_result": "OK"}]))
 
     def test_transient_failure_then_db_recovery(self):
         source = Path(__file__).resolve().parents[1].joinpath("bot_v5_legacy.py").read_text()
@@ -69,7 +69,7 @@ class SchedulerGuardTests(unittest.TestCase):
         class Logger:
             def error(self, *args): pass
         stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
-        db = AsyncMock(side_effect=[TimeoutError(), [], [{"last_run_at": stamp}]])
+        db = AsyncMock(side_effect=[TimeoutError(), [], [{"last_run_at": stamp, "last_result": "OK"}]])
         namespace = {"sb_h": db, "logger": Logger(), "datetime": datetime, "KST": ZoneInfo("Asia/Seoul")}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "<guard>", "exec"), namespace)
         async def scenario():
@@ -80,6 +80,18 @@ class SchedulerGuardTests(unittest.TestCase):
             return blocked, allowed_after_recovery, blocked_after_success
         self.assertEqual(asyncio.run(scenario()), (True, False, True))
         self.assertEqual(db.await_count, 3)
+
+    def test_today_failed_attempt_is_retryable(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+        self.assertFalse(self._guard([{"last_run_at": stamp, "last_result": "FAIL: timeout"}]))
+
+    def test_today_unknown_result_remains_fail_closed(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+        self.assertTrue(self._guard([{"last_run_at": stamp, "last_result": ""}]))
 
     def test_failed_query_blocks_duplicate(self):
         self.assertTrue(self._guard(None))
