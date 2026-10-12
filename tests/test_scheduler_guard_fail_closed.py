@@ -22,6 +22,25 @@ class SchedulerGuardTests(unittest.TestCase):
         exec(code, namespace)
         return asyncio.run(namespace["already_ran_today_kst"]("calc_daily_snapshot"))
 
+    def test_timeout_failure_reproduces_original_fail_open_bug(self):
+        """A timeout caused legacy guard to return False (allow duplicate)."""
+        self.assertTrue(self._guard(None, TimeoutError()))
+
+    def test_empty_valid_result_remains_first_run(self):
+        self.assertFalse(self._guard([]))
+
+    def test_today_completed_run_blocks_duplicate(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+        self.assertTrue(self._guard([{"last_run_at": stamp}]))
+
+    def test_yesterday_completed_run_allows_next_day(self):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        stamp = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=1)).isoformat()
+        self.assertFalse(self._guard([{"last_run_at": stamp}]))
+
     def test_failed_query_blocks_duplicate(self):
         self.assertTrue(self._guard(None))
 
