@@ -1,0 +1,44 @@
+name: Task194 Scheduler Recovery
+
+on:
+  pull_request:
+    paths:
+      - "scheduler_daily_jobs.py"
+      - "sitecustomize.py"
+      - "bot_v5_legacy.py"
+      - "tests/test_task194_*.py"
+      - "tests/fake_postgrest.py"
+      - ".github/workflows/task194-scheduler-recovery.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scheduler_daily_jobs.py"
+      - "sitecustomize.py"
+      - "tests/test_task194_*.py"
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax
+        run: python -m py_compile scheduler_daily_jobs.py sitecustomize.py bot_v5_legacy.py
+      - name: Unit tests (fail-closed guard, retry rules, wiring)
+        run: python -m unittest tests.test_task194_daily_jobs -v
+        env:
+          PYTHONPATH: .
+          SUPABASE_URL: http://127.0.0.1:1
+          SUPABASE_KEY: ci-test-key
+          TELEGRAM_BOT_TOKEN: ci-test-token
+      - name: End-to-end failure injection against an in-process PostgREST stand-in
+        run: python -m unittest tests.test_task194_e2e_fake_postgrest -v
+        env:
+          PYTHONPATH: .
+          SUPABASE_URL: http://127.0.0.1:1
+          SUPABASE_KEY: ci-test-key
+          TELEGRAM_BOT_TOKEN: ci-test-token
