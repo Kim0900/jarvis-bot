@@ -6081,6 +6081,15 @@ async def mark_scheduler_run(job_name: str, result: str = "OK"):
         logger.error(f"scheduler_status 기록 실패({job_name}): {e}")
 
 
+async def mark_scheduler_run_required(job_name: str, result: str = "OK"):
+    """Task#194 critical jobs: DB status persistence must not fail silently."""
+    return await sb_upsert("scheduler_status", {
+        "job_name": job_name,
+        "last_run_at": datetime.now(KST).isoformat(),
+        "last_result": result,
+    }, on_conflict="job_name")
+
+
 # ──────────────────────────────────────────────
 # task#160: 검누리 순라 MVP (2026-09-28)
 # 1단계 원칙: 감지 → Registry 사건 기록 → Telegram 경보. 자동복구 금지.
@@ -8593,9 +8602,10 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"마기(자동)검증 실행 실패: {e}")
 
-            # ── task#160: 04:00 작업별 영구 DB 가드. 읽기 실패 시 실행 금지.
-            # 메모리 가드만으로는 Render 재시작 후 중복 실행을 막을 수 없다.
-            if now.hour == 4 and now.day != last_kpi7day:
+            # ── task#194: 04:00 작업. FAIL은 재시도, DB 조회 불능은 실행 차단.
+            # 기존 scheduler_status는 마지막 실행만 보관하므로 동일시각 동시
+            # 프로세스의 원자적 claim은 보장하지 않는다(향후 청룡 큐에서 해결).
+            if now.hour == 4:
                 daily_jobs = (
                     ("recalc_daily_summary_totals", recalc_daily_summary_totals),
                     ("recalc_7day_average", recalc_7day_average),
@@ -8608,10 +8618,13 @@ def fish_scheduler(app):
                     try:
                         outcome = loop.run_until_complete(job_func())
                         result = str(outcome) if job_name == "check_daily_ingestion_detail" and outcome else "OK"
-                        loop.run_until_complete(mark_scheduler_run(job_name, result))
+                        loop.run_until_complete(mark_scheduler_run_required(job_name, result))
                     except Exception as e:
                         logger.error("04:00 스케줄러 작업 실패(%s): %r", job_name, e)
-                        loop.run_until_complete(mark_scheduler_run(job_name, f"FAIL: {e}"))
+                        try:
+                            loop.run_until_complete(mark_scheduler_run_required(job_name, f"FAIL: {e}"))
+                        except Exception as record_error:
+                            logger.error("04:00 실패기록 저장 불가(%s): %r", job_name, record_error)
                 last_kpi7day = now.day
 
             # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
