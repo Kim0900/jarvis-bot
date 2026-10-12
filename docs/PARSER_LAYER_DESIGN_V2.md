@@ -34,3 +34,50 @@ F. 소유권·배포 승인: 마기 결정 사항. 캐스퍼 제안은 파서 PR
 - 코퍼스 원본 접근 가능 범위(대표님 Drive 내 위치).
 - 현 CI 필수 체크(브랜치 보호) 설정 여부(GitHub 설정 접근 불가).
 - 이 세션은 저장소 push 권한이 없음(읽기 전용) → PR 작성은 권한 연결 후.
+
+---
+
+# v2.1 보완 (카산드라 event 4911 보완 7건 대응, 2026-10-12 KST)
+
+## 실측 추가
+- 잔여 4개 파서(`parse_kakao_trip_detail`, `parse_receipt_summary`, `parse_meter_receipt`, `detect_and_parse_call_document`)를 import하는 테스트/스크립트가 **0건**(grep 확인). 즉 이관 전 characterization 테스트가 필수이며, 현재 이 4개의 동작은 코드 외에 고정된 근거가 없다.
+- 저장소에 이미지 파일 0건(jpg/png 검색). 픽스처는 테스트 안 인라인 텍스트뿐이라 Git 이미지 금지 원칙은 현재 준수 중.
+- `call_image_ingestions` 컬럼: source_type, source_id, status, format, inserted_count, last_error, started_at, updated_at, completed_at (JSON/메타 컬럼 없음).
+
+## 보완 1 — 계약 충돌 방지 (분류 우선순위 동결)
+`parse_document(text)`는 **신규 추가 함수**이며 `detect_and_parse_call_document`에 위임만 한다(재구현 금지). 반환 dict는 재가공 없이 그대로. 동결할 분류 우선순위:
+1. "매출" and "집계" → meter_receipt
+2. kakao_monthly(looks_like) → kakao_monthly
+3. "일별" and "운행" and "이력" → daily_history
+4. uber(looks_like) → uber_trip_detail
+5. "배차" and ("기사" or "운행 정보") → kakao_trip_detail
+6. 그 외 → `{"format":"unknown", ...}`
+기존 이름(parse_daily_history 등)은 래퍼로 유지. 운영 경로가 `parse_document`를 쓰도록 바꾸는 것은 별도 승인 단계(3단계 이후)로 분리.
+
+## 보완 2 — characterization vs golden 분리
+- **characterization 세트**: 현재 출력을 그대로 고정(이관 안전망). 알려진 오파싱은 `known_bug` 태그로 명시해 현 오파싱을 "정답"으로 오인하지 않게 하고, 수정은 별도 PR에서만 태그 해제.
+- **golden 세트**: 사람이 확정한 정답 JSON. 파서 정확도 판정은 이 세트로.
+- diff=0 통과는 "이관이 동작을 바꾸지 않음"만 의미하며 "정확함"을 의미하지 않는다고 보고서에 분리 표기.
+
+## 보완 3 — OCR 원문도 개인정보
+OCR 텍스트에는 주소·시각·금액·결제수단이 포함될 수 있어 정답 JSON과 동일 기준으로 비식별(주소 동 단위 이하 마스킹, 식별자 제거) + 접근통제 적용. 비식별 전 원문은 Git·PR·이벤트 payload에 넣지 않는다.
+
+## 보완 4 — 해시와 보관정책
+sha256(원본 바이트)는 "동일 파일 식별/무결성 확인용 포인터"일 뿐 진위·보관권한을 증명하지 않는다. 따라서 (a) 승인된 Drive 폴더, (b) 접근 가능자, (c) 보관기간, (d) 해시 알고리즘(sha256 고정), (e) 해시 대장 위치를 **대표님이 확정**한 뒤 코퍼스 구축. 확정 전에는 로컬 초안만.
+
+## 보완 5 — parser_version 저장 (무스키마안 재판정)
+점검한 무스키마 후보와 결론:
+- `raw_calls.data_source`: canonical identity 게이트가 출처 구분에 쓰므로 변경 금지.
+- `raw_calls.비고/메모`: 코드가 `비고`의 "OCR 추출:" 접두어로 요약행을 판정하므로 오염 위험.
+- `call_image_ingestions.last_error`: 의미 불일치.
+→ **깨끗한 무스키마 슬롯이 없다.** 권고: `call_image_ingestions`에 nullable text `parser_version` 1컬럼 추가(소스 단위, raw_calls와는 source_id로 조인 가능). 기존 행 NULL 유지, 소급 추정 금지, 롤백=컬럼 drop, 읽기 경로=ingestion 조회. **스키마 변경은 별도 설계+카산드라 재검증+대표 승인 후**이며 이 문서는 승인 요청이 아니다.
+
+## 보완 6 — 테스트 수치 재현 방법
+기준 커밋 9440796(= main 26d237c + 문서 1개)에서 직접 실행한 값:
+- `python -m unittest discover -s tests -p "test_*.py"` → Ran 210, errors=2 (오류 2건은 test_s700/test_s700_db가 스크립트형이라 로더가 실패 처리한 것, 실제 단언 실패 아님) → 정상 208건.
+- `python -m unittest tests.test_s700` → RESULT: PASS=43 FAIL=0
+- `python -m unittest tests.test_s700_db` → RESULT: PASS=25 FAIL=0
+(앞서 "S700 43건"은 test_s700만의 수치였고 test_s700_db는 25건이 추가.) 카산드라 독립 재실행을 요청한다.
+
+## 보완 7 — 상태와 권한 구분
+Registry `IN_PROGRESS`는 "설계 보완 작업 중"이지 구현 권한이 아니다. 구현·스키마·배포는 (대표 승인 + 마기 배정 + 카산드라 해당 단계 PASS) 전부 충족 전까지 금지. 현재 허용 범위: 문서 작성, 읽기 전용 조사, 로컬 비식별 초안.
