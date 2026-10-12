@@ -8589,33 +8589,25 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"마기(자동)검증 실행 실패: {e}")
 
-            # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산 + daily_summary 자동갱신
+            # ── task#160: 04:00 작업별 영구 DB 가드. 읽기 실패 시 실행 금지.
+            # 메모리 가드만으로는 Render 재시작 후 중복 실행을 막을 수 없다.
             if now.hour == 4 and now.day != last_kpi7day:
-                try:
-                    loop.run_until_complete(recalc_daily_summary_totals())
-                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals"))
-                except Exception as e:
-                    logger.error(f"daily_summary 자동갱신 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {e}"))
-                try:
-                    loop.run_until_complete(recalc_7day_average())
-                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average"))
-                except Exception as e:
-                    logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average", f"FAIL: {e}"))
-                try:
-                    loop.run_until_complete(calc_daily_snapshot())
-                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot"))
-                except Exception as e:
-                    logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot", f"FAIL: {e}"))
-                # ── task#69: 04:00 세분화 인입알림(부분누락 gpx_proxy 포함, 매일체크)
-                try:
-                    detail = loop.run_until_complete(check_daily_ingestion_detail())
-                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", str(detail) if detail else "OK"))
-                except Exception as e:
-                    logger.error(f"세분화 인입알림(task#69) 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", f"FAIL: {e}"))
+                daily_jobs = (
+                    ("recalc_daily_summary_totals", recalc_daily_summary_totals),
+                    ("recalc_7day_average", recalc_7day_average),
+                    ("calc_daily_snapshot", calc_daily_snapshot),
+                    ("check_daily_ingestion_detail", check_daily_ingestion_detail),
+                )
+                for job_name, job_func in daily_jobs:
+                    if loop.run_until_complete(already_ran_today_kst(job_name)):
+                        continue
+                    try:
+                        outcome = loop.run_until_complete(job_func())
+                        result = str(outcome) if job_name == "check_daily_ingestion_detail" and outcome else "OK"
+                        loop.run_until_complete(mark_scheduler_run(job_name, result))
+                    except Exception as e:
+                        logger.error("04:00 스케줄러 작업 실패(%s): %r", job_name, e)
+                        loop.run_until_complete(mark_scheduler_run(job_name, f"FAIL: {e}"))
                 last_kpi7day = now.day
 
             # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
