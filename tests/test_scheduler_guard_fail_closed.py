@@ -41,6 +41,46 @@ class SchedulerGuardTests(unittest.TestCase):
         stamp = (datetime.now(ZoneInfo("Asia/Seoul")) - timedelta(days=1)).isoformat()
         self.assertFalse(self._guard([{"last_run_at": stamp}]))
 
+    def test_non_object_row_blocks(self):
+        self.assertTrue(self._guard(["bad-row"]))
+
+    def test_multiple_rows_block(self):
+        self.assertTrue(self._guard([{"last_run_at": "2026-10-10T00:00:00+00:00"}, {"last_run_at": "2026-10-11T00:00:00+00:00"}]))
+
+    def test_naive_timestamp_blocks(self):
+        self.assertTrue(self._guard([{"last_run_at": "2026-10-12T04:00:00"}]))
+
+    def test_future_timestamp_blocks(self):
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        stamp = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(days=1)).isoformat()
+        self.assertTrue(self._guard([{"last_run_at": stamp}]))
+
+    def test_utc_z_timestamp_parses(self):
+        from datetime import datetime, timedelta, timezone
+        stamp = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        self.assertFalse(self._guard([{"last_run_at": stamp}]))
+
+    def test_transient_failure_then_db_recovery(self):
+        source = Path(__file__).resolve().parents[1].joinpath("bot_v5_legacy.py").read_text()
+        fn = next(n for n in ast.parse(source).body if isinstance(n, ast.AsyncFunctionDef) and n.name == "already_ran_today_kst")
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        class Logger:
+            def error(self, *args): pass
+        stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+        db = AsyncMock(side_effect=[TimeoutError(), [], [{"last_run_at": stamp}]])
+        namespace = {"sb_h": db, "logger": Logger(), "datetime": datetime, "KST": ZoneInfo("Asia/Seoul")}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "<guard>", "exec"), namespace)
+        async def scenario():
+            guard = namespace["already_ran_today_kst"]
+            blocked = await guard("calc_daily_snapshot")
+            allowed_after_recovery = await guard("calc_daily_snapshot")
+            blocked_after_success = await guard("calc_daily_snapshot")
+            return blocked, allowed_after_recovery, blocked_after_success
+        self.assertEqual(asyncio.run(scenario()), (True, False, True))
+        self.assertEqual(db.await_count, 3)
+
     def test_failed_query_blocks_duplicate(self):
         self.assertTrue(self._guard(None))
 
