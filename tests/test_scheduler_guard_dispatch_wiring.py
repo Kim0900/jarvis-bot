@@ -18,6 +18,8 @@ class ProductionSchedulerWiringTests(unittest.TestCase):
                     if isinstance(item.elts[0], ast.Constant):
                         guarded.append(item.elts[0].value)
         self.assertEqual(set(guarded), jobs)
+        self.assertIn("last_kpi7day = now.day", source)
+        self.assertIn("mark_scheduler_run_required(job_name, result)", source)
         # The actual dispatch loop must check the DB before calling the job.
         loops = [n for n in ast.walk(scheduler) if isinstance(n, ast.For) and isinstance(n.target, ast.Tuple) and any(isinstance(t, ast.Name) and t.id == "job_name" for t in n.target.elts)]
         self.assertTrue(any(
