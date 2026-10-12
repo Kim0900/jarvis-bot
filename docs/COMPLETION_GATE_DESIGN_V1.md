@@ -22,9 +22,11 @@
 
 ### 2.1 카산드라 판정값 분류 (구조화 전용)
 대상 이벤트: 같은 태스크의 `actor ILIKE 'CASSANDRA%'` 이면서 `payload ? 'verdict'`인 것. 가장 최근(event_id 최대) 1건이 결정한다(최신 우선: PASS 뒤에 HOLD가 오면 HOLD).
-- NEG: verdict(대문자화)가 `^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)`로 시작.
-- PASS_FINAL: `^PASS(_[A-Z]+)?$` 이면서 verdict에 DESIGN이 없고 event_type에도 DESIGN이 없음.
-- PASS_DESIGN: 위 PASS 형태인데 verdict 또는 event_type에 DESIGN 포함.
+- 표준 필드(2.4절 합의안): `payload.verdict` ∈ {PASS, PARTIAL_PASS, CONDITIONAL, HOLD, FAIL}, `payload.stage` ∈ {DESIGN, IMPLEMENTATION, FINAL}. 판정과 단계를 분리한다.
+- NEG: verdict(대문자화)가 `^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)`로 시작(과도기 값 FAIL_DESIGN·FAIL_PATCH 포함).
+- PASS_FINAL: verdict가 정확히 `PASS`이고 `stage = FINAL`이며 event_type에 DESIGN이 없음.
+- PASS_DESIGN: PASS 형태인데 stage=DESIGN, 또는 verdict·event_type에 DESIGN 포함(과도기 값 PASS_DESIGN 포함).
+- PASS_PARTIAL_STAGE: PASS인데 stage=IMPLEMENTATION, 또는 stage 누락·미정의 값(최종으로 인정하지 않음).
 - UNKNOWN: 그 외 모든 값. UNKNOWN은 PASS가 아니다.
 - 판정값 없는 과거 카산드라 이벤트는 LEGACY(본문을 읽지 않는다).
 
@@ -40,6 +42,7 @@
 | HARD | LATEST_VERDICT_NOT_PASS | 최신 구조화 판정이 NEG 또는 UNKNOWN |
 | REVIEW (gate_level=REVIEW) | LEGACY_UNSTRUCTURED_ONLY | 카산드라 이벤트는 있으나 구조화 판정이 한 건도 없음 |
 | REVIEW | DESIGN_PASS_ONLY | 최신 구조화 판정이 PASS_DESIGN |
+| REVIEW | PASS_STAGE_NOT_FINAL | 최신 구조화 판정이 PASS이나 stage가 IMPLEMENTATION이거나 누락 |
 | REVIEW | EVIDENCE_NOT_RECOGNIZED | C1 불충족 |
 - 최신 구조화 판정이 PASS_FINAL이고 C1도 충족이면 기록 없음.
 - HARD가 하나라도 있으면 gate_level=WARN, REVIEW만 있으면 REVIEW.
@@ -48,8 +51,13 @@
 - 항상 fail-open: 트리거 내부 오류는 EXCEPTION으로 삼키고 RAISE WARNING만. 거부 모드는 이 설계 범위 밖.
 
 ### 2.4 선결 합의 사항 (운영 적용의 전제, 마기·카산드라)
-1. 카산드라가 최종·설계 판정 이벤트마다 `payload.verdict`를 표준 어휘로 기록한다. 이미 4965~4970이 이 방식이라 관행의 공식화다. 어휘 확정 필요: `PASS`(최종), `PASS_DESIGN`(설계), `PARTIAL_PASS`, `HOLD`, `FAIL_*`, `CONDITIONAL`. 특히 최종 PASS의 정확한 값 표기는 아직 관측된 적이 없다.
-2. 합의 전까지 이 게이트가 낼 수 있는 결과는 사실상 HARD(NO_CASSANDRA_RECORD·NEG)와 REVIEW 뿐이며, "정상 통과" 판정은 합의 이후에만 가능하다. 이것이 의도된 fail-safe다.
+1. 카산드라가 판정 이벤트마다 두 필드를 기록한다(제안, 마기·카산드라 합의 대기).
+   - `payload.verdict` ∈ {PASS, PARTIAL_PASS, CONDITIONAL, HOLD, FAIL}. PASS는 "조건·보류 없이 통과"만 뜻한다. 조건이 하나라도 있으면 CONDITIONAL 또는 PARTIAL_PASS.
+   - `payload.stage` ∈ {DESIGN, IMPLEMENTATION, FINAL}. 기존 `scope` 키는 4969·4970에서 이미 쓰이고 있어(값 의미 미확인) 충돌을 피하려고 `stage`를 쓴다.
+   - 이미 쓰인 값 PARTIAL_PASS·HOLD는 그대로 유효. FAIL_DESIGN·FAIL_PATCH는 FAIL+stage로 이행하며, 과도기에는 게이트가 앞부분 기준으로 읽는다.
+   - 최종 PASS의 표기는 `verdict=PASS, stage=FINAL`이다(아직 관측된 적 없음).
+2. 어휘를 코드로 강제하는 입력 검사는 이번 범위 밖이다. 관찰 2주 동안 어휘 이탈 건수를 보고서로 세고, 필요하면 별도 태스크로 올린다.
+3. 합의 전까지 이 게이트가 낼 수 있는 결과는 사실상 HARD(NO_CASSANDRA_RECORD·NEG)와 REVIEW 뿐이며, "정상 통과" 판정은 합의 이후에만 가능하다. 이것이 의도된 fail-safe다.
 
 ## 3. 백테스트 (read-only, 2026-10-12 16:50 KST 스냅샷 재실행, 완료 vr=true 13건)
 | 태스크 | C1(v1.1) | 카산드라 이벤트 | 구조화 판정 | v1.1 결과 |
@@ -75,7 +83,7 @@ create or replace function public.fn_completion_gate_observe() returns trigger
 language plpgsql security definer set search_path = public as $$
 declare
   v_c1 boolean; v_cass_total int;
-  v_ev bigint; v_ver text; v_vtype text; v_found boolean := false; v_class text;
+  v_ev bigint; v_ver text; v_vtype text; v_stage text; v_found boolean := false; v_class text;
   v_hard text[] := '{}'; v_rev text[] := '{}';
 begin
   begin
@@ -85,7 +93,8 @@ begin
       and e.event_type !~* '(REQUEST|REQUIRE)') into v_c1;
     select count(*) into v_cass_total from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%';
-    select e.event_id, upper(e.payload->>'verdict'), e.event_type into v_ev, v_ver, v_vtype
+    select e.event_id, upper(e.payload->>'verdict'), e.event_type, upper(e.payload->>'stage')
+      into v_ev, v_ver, v_vtype, v_stage
       from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%' and e.payload ? 'verdict'
       order by e.event_id desc limit 1;
@@ -98,9 +107,10 @@ begin
     elsif v_ver ~ '^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)' then
       v_hard := v_hard || 'LATEST_VERDICT_NOT_PASS'; v_class := 'NEG';
     elsif v_ver ~ '^PASS(_[A-Z]+)?$' then
-      if v_ver ~ 'DESIGN' or v_vtype ~ 'DESIGN' then
+      if v_ver ~ 'DESIGN' or v_vtype ~ 'DESIGN' or v_stage = 'DESIGN' then
         v_rev := v_rev || 'DESIGN_PASS_ONLY'; v_class := 'PASS_DESIGN';
-      else v_class := 'PASS_FINAL'; end if;
+      elsif v_ver = 'PASS' and v_stage = 'FINAL' then v_class := 'PASS_FINAL';
+      else v_rev := v_rev || 'PASS_STAGE_NOT_FINAL'; v_class := 'PASS_PARTIAL_STAGE'; end if;
     else
       v_hard := v_hard || 'LATEST_VERDICT_NOT_PASS'; v_class := 'UNKNOWN';
     end if;
@@ -133,19 +143,24 @@ execute function public.fn_completion_gate_observe();
 롤백: `drop trigger trg_magi_tasks_completion_gate_observe on magi_tasks; drop function fn_completion_gate_observe();` 기록된 위반 이벤트는 삭제하지 않는다(append-only).
 
 ## 6. 시험 계획
-### 6.1 이미 실행한 읽기 전용 골든테스트 (2026-10-12, 분류식을 SELECT로 실행, 운영 무변경)
-| 케이스 | 입력 | 기대 | 결과 |
-|---|---|---|---|
-| G1 | verdict=PARTIAL_PASS | NEG | 일치 |
-| G2 | verdict=FAIL_DESIGN | NEG | 일치 |
-| G3 | verdict=HOLD | NEG | 일치 |
-| G4 | verdict=PASS (CASSANDRA_VALIDATION) | PASS_FINAL | 일치 |
-| G5 | verdict=PASS_DESIGN | PASS_DESIGN | 일치 |
-| G6 | verdict=pass(소문자) | PASS_FINAL | 일치 |
-| G7 | verdict=MAYBE | UNKNOWN | 일치 |
-| G8 | 판정값 없음(과거 본문) | LEGACY | 일치 |
-| G9 | actor=TAEO가 verdict=PASS를 기재 | IGNORED(카산드라로 불인정) | 일치 |
-| G10 | verdict=PASS, event_type=CASSANDRA_DESIGN_VALIDATION | PASS_DESIGN | 일치 |
+### 6.1 이미 실행한 읽기 전용 골든테스트 (2026-10-12 17:10 KST, verdict+stage 분류식을 SELECT로 실행, 운영 무변경): 15/15 일치
+| 케이스 | 입력(verdict / stage) | 기대 = 결과 |
+|---|---|---|
+| G1 | PARTIAL_PASS / FINAL | NEG |
+| G2 | FAIL_DESIGN (과도기 값) | NEG |
+| G3 | HOLD / FINAL | NEG |
+| G4 | PASS / FINAL | PASS_FINAL |
+| G4b | PASS / (stage 없음) | PASS_PARTIAL_STAGE (최종 불인정) |
+| G4c | PASS / IMPLEMENTATION | PASS_PARTIAL_STAGE |
+| G5 | PASS_DESIGN (과도기 값, 설계 PASS 이벤트) | PASS_DESIGN |
+| G5b | PASS / DESIGN | PASS_DESIGN |
+| G6 | pass / final (소문자) | PASS_FINAL |
+| G7 | MAYBE / FINAL | UNKNOWN |
+| G8 | 판정값 없음(과거 본문) | LEGACY |
+| G9 | actor=TAEO가 PASS / FINAL 기재 | IGNORED |
+| G10 | PASS / FINAL이지만 event_type이 DESIGN 검증 | PASS_DESIGN |
+| G11 | PASS_FINAL (비표준 값) | PASS_PARTIAL_STAGE (표준 어휘 아님 → 최종 불인정) |
+| G12 | FAIL / DESIGN | NEG |
 증거 이벤트 타입 14종(허용 6: EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, VERIFICATION_COMPLETED, CASSANDRA_VALIDATION / 불허 8: VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED): 14/14 기대와 일치. 카산드라가 지적한 두 반례(`PARTIAL PASS / 전체 HOLD`, `FAIL — PASS 조건 미충족`)는 본문을 읽지 않으므로 구조화 판정이 NEG이면 NEG, 판정값이 없으면 LEGACY로만 분류된다.
 
 ### 6.2 카산드라 설계 PASS 후 실행(롤백 드라이런, 단일 DO 블록 안에서 DDL+시험 후 강제 롤백)
