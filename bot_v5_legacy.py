@@ -6989,13 +6989,9 @@ async def already_ran_today_kst(job_name: str) -> bool:
         return True
     if last_dt.date() != now_kst.date():
         return False
-    # FAIL is an attempt, not a successful completion. Permit retry when DB is readable.
-    # Unknown/empty results remain fail-closed; never guess success.
-    last_result = rows[0].get("last_result")
-    if not isinstance(last_result, str) or not last_result.strip():
-        logger.error("scheduler_status result missing (%s): blocking duplicate", job_name)
-        return True
-    return not last_result.startswith("FAIL")
+    # Any same-day attempt is ambiguous after partial writes or a lost response.
+    # Never automatically replay non-atomic business calculations.
+    return True
 
 
 async def notify_pending_simple_tasks():
@@ -8602,10 +8598,10 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"마기(자동)검증 실행 실패: {e}")
 
-            # ── task#194: 04:00 작업. FAIL은 재시도, DB 조회 불능은 실행 차단.
-            # 기존 scheduler_status는 마지막 실행만 보관하므로 동일시각 동시
-            # 프로세스의 원자적 claim은 보장하지 않는다(향후 청룡 큐에서 해결).
-            if now.hour == 4:
+            # ── task#194: never replay non-atomic daily jobs after uncertain outcome.
+            if now.hour == 4 and now.day != last_kpi7day:
+                # Set before the first side effect: no repeat within this process.
+                last_kpi7day = now.day
                 daily_jobs = (
                     ("recalc_daily_summary_totals", recalc_daily_summary_totals),
                     ("recalc_7day_average", recalc_7day_average),
@@ -8620,12 +8616,9 @@ def fish_scheduler(app):
                         result = str(outcome) if job_name == "check_daily_ingestion_detail" and outcome else "OK"
                         loop.run_until_complete(mark_scheduler_run_required(job_name, result))
                     except Exception as e:
-                        logger.error("04:00 스케줄러 작업 실패(%s): %r", job_name, e)
-                        try:
-                            loop.run_until_complete(mark_scheduler_run_required(job_name, f"FAIL: {e}"))
-                        except Exception as record_error:
-                            logger.error("04:00 실패기록 저장 불가(%s): %r", job_name, record_error)
-                last_kpi7day = now.day
+                        logger.error("04:00 작업/기록 실패(%s): %r; 자동 재실행 금지", job_name, e)
+                        # Do not overwrite an uncertain successful write with FAIL.
+                        # Recovery requires explicit reconciliation of output and status.
 
             # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
             if now.hour == 8 and now.day != last_dualverify_day:
