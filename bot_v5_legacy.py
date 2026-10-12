@@ -7690,15 +7690,10 @@ async def check_daily_ingestion_detail():
     await sync_operated_status()
 
     yesterday = str(today_kst() - timedelta(days=1))
-    try:
-        rows = await sb_select("operated_status", {"날짜": f"eq.{yesterday}"})
-    except Exception as e:
-        logger.error(f"세분화 인입상태 조회 실패({yesterday}): {e}")
-        return None
-
+    rows = await sb_select_required("operated_status", {"날짜": f"eq.{yesterday}"})
     status = rows[0] if rows else None
     if not status:
-        return None
+        raise RuntimeError(f"세분화 인입상태 미확정({yesterday}): operated_status 행 없음")
 
     source = status.get("source")
     operated = status.get("operated")
@@ -7756,6 +7751,7 @@ async def recalc_daily_summary_totals(days_back: int = 14):
             updated.append(d)
         except Exception as e:
             logger.error(f"daily_summary 자동갱신 실패({d}): {e}")
+            raise
     logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일 ({start}~{end})")
     return updated
 
