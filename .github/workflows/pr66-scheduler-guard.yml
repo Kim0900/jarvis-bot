@@ -5,6 +5,7 @@ on:
       - 'bot_v5_legacy.py'
       - 'tests/test_scheduler_guard_fail_closed.py'
       - 'tests/test_scheduler_guard_before_after.py'
+      - 'tests/test_scheduler_guard_db_integration.py'
       - '.github/workflows/pr66-scheduler-guard.yml'
   workflow_dispatch:
 
@@ -21,6 +22,6 @@ jobs:
       - name: Fetch baseline main
         run: git fetch origin main
       - name: Compile target and tests
-        run: python -m py_compile bot_v5_legacy.py tests/test_scheduler_guard_fail_closed.py tests/test_scheduler_guard_before_after.py
+        run: python -m py_compile bot_v5_legacy.py tests/test_scheduler_guard_fail_closed.py tests/test_scheduler_guard_before_after.py tests/test_scheduler_guard_db_integration.py
       - name: Reproduce database failure and validate fail-closed guard
         run: python -m unittest discover -s tests -p 'test_scheduler_guard*.py' -v
