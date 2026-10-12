@@ -6957,16 +6957,28 @@ async def already_ran_today_kst(job_name: str) -> bool:
         return True
     if not rows:
         return False
+    # Duplicate or malformed state is ambiguous; never guess which row is authoritative.
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        logger.error("scheduler_status ambiguous response (%s): blocking duplicate", job_name)
+        return True
     last_run_at = rows[0].get("last_run_at")
-    if not last_run_at:
+    if not isinstance(last_run_at, str) or not last_run_at.strip():
         logger.error("scheduler_status timestamp missing (%s); blocking duplicate", job_name)
         return True
     try:
-        last_dt = datetime.fromisoformat(last_run_at).astimezone(KST)
-    except (TypeError, ValueError) as exc:
+        last_dt = datetime.fromisoformat(last_run_at.replace("Z", "+00:00"))
+        # Naive timestamps are ambiguous between UTC and KST.
+        if last_dt.tzinfo is None or last_dt.utcoffset() is None:
+            raise ValueError("timezone offset missing")
+        last_dt = last_dt.astimezone(KST)
+    except (TypeError, ValueError, OverflowError) as exc:
         logger.error("scheduler_status timestamp invalid (%s): %r; blocking duplicate", job_name, exc)
         return True
-    return last_dt.date() == datetime.now(KST).date()
+    now_kst = datetime.now(KST)
+    if last_dt > now_kst:
+        logger.error("scheduler_status future timestamp (%s): blocking duplicate", job_name)
+        return True
+    return last_dt.date() == now_kst.date()
 
 
 async def notify_pending_simple_tasks():
