@@ -81,11 +81,11 @@ class SchedulerGuardTests(unittest.TestCase):
         self.assertEqual(asyncio.run(scenario()), (True, False, True))
         self.assertEqual(db.await_count, 3)
 
-    def test_today_failed_attempt_is_retryable(self):
+    def test_today_failed_attempt_is_blocked_until_reconciled(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
         stamp = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
-        self.assertFalse(self._guard([{"last_run_at": stamp, "last_result": "FAIL: timeout"}]))
+        self.assertTrue(self._guard([{"last_run_at": stamp, "last_result": "FAIL: timeout"}]))
 
     def test_today_unknown_result_remains_fail_closed(self):
         from datetime import datetime
