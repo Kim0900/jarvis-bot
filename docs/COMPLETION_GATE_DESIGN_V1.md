@@ -1,9 +1,18 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.2 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.3 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.2). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.3). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.2 → v1.3 (카산드라 5009 FAIL, 마기 5014 지시 반영)
+| 지적 | v1.2 결함 | v1.3 조치 |
+|---|---|---|
+| 증거 중복 인정 우회 | 제외 규칙이 event_type 경로에만 걸려 `payload.evidence_kind`가 있으면 요청·검증 이벤트도 증거로 인정됨 | 제외 규칙(actor·event_type)을 OR 바깥 최상위 AND 한 곳으로 일원화. evidence_kind 경로도 동일 적용, 값 비교는 `upper()` |
+| secondary 오분류 | 마기·SECONDARY 이벤트가 존재하기만 하면 SECONDARY_ONLY_NOT_ACCEPTED로 분류(마기 FAIL, 보조검증 요청도 해당) | SECONDARY_ONLY 분류 폐기. 보조검증은 통과 근거가 아니며 판정 reason에 영향 없음. 정보용 checks만 기록: `secondary_pass_recorded`(마기+SECONDARY+요청 아님+PASS+FINAL) / `secondary_events_recorded`(마기+SECONDARY 이벤트 존재) |
+| 카산드라 0건 + secondary | v1.2는 secondary가 있으면 HARD를 REVIEW로 낮춤 | 카산드라 이벤트 0건이면 secondary 유무와 무관하게 HARD NO_CASSANDRA_RECORD. 기본 tier=HIGH 유지, HARD를 낮추지 않음 |
+| 수작업 반례 한계 | 반례를 사람이 골라 시험 | `tests/sql/task197_gate_matrix.py`: event_type × evidence_kind × actor 3600, 카산드라 이벤트열(길이 1·2 전수 + 길이 3 축약) 6284, secondary × 카산드라 상태 × 증거 100, 상태 전이 192 = **10,176 조합**을 실제 트리거에 실행해 정규식 없이 따로 작성한 기대값(oracle)과 대조. 불일치 0. 변이 시험: v1.2 결함 재현 3종 주입 시 각각 576/18/372건 불일치로 검출됨 |
+**한계 명시:** 위 결과는 이 작업 환경의 임시 로컬 PostgreSQL 16 기준 참고치이며, 운영 PostgreSQL에서의 독립 재현은 카산드라의 몫이다.
+
 ### v1.1 → v1.2 (카산드라 4997 FAIL, 4996 조건부 동의 반영)
 | 카산드라 지적 | v1.1 결함 | v1.2 조치 |
 |---|---|---|
@@ -21,7 +30,7 @@
 - evidence_registry 테이블은 완료된 verification_required 태스크에서 쓰이지 않는다(0행). 실제 증거 기록은 magi_task_events 이벤트다.
 - **신규 실측 (v1.1 설계 근거):** actor=CASSANDRA 이벤트 중 `payload.verdict`가 있는 것은 4965~4970 6건뿐이고 나머지 과거 이벤트는 자유서술이다. 값 어휘: PARTIAL_PASS, HOLD, FAIL_DESIGN, FAIL_PATCH. 과거 본문은 `PASS`로 시작해도 300자 안에 HOLD·FAIL 같은 단어가 흔히 섞여, 정규식으로 PASS를 안전하게 판정하는 방법이 없다(시도한 보수 규칙에서 PASS 시작 본문 다수가 판정불가로 남음). → 본문 해석은 포기하고 구조화값을 기준으로 한다.
 
-## 2. 판정 규칙 v1.2 (관찰 모드)
+## 2. 판정 규칙 v1.3 (관찰 모드)
 대상: `NEW.verification_required IS TRUE AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`.
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
@@ -38,21 +47,20 @@
 
 ### 2.2 증거 이벤트(C1): 독립 구현·시험 증거만
 같은 태스크에서 다음을 모두 만족하는 이벤트가 1건 이상:
-- actor가 GEOMNURI_PATROL·마기(자동)·COMPLETION_GATE가 아니고 **CASSANDRA%도 아님**(독립 검증자의 판정은 구현 증거가 아니다).
-- `event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'` 이고 `event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'`, **또는** 신규 제안 필드 `payload.evidence_kind ∈ {IMPLEMENTATION, TEST, CI, PRODUCTION}`.
+- (공통 제외, 모든 경로에 적용) actor가 GEOMNURI_PATROL·마기(자동)·COMPLETION_GATE가 아니고 **CASSANDRA%도 아님**, 그리고 `event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'`.
+- (증거 형태, 둘 중 하나) `event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'` **또는** `upper(payload.evidence_kind) ∈ {IMPLEMENTATION, TEST, CI, PRODUCTION}`. evidence_kind가 있어도 공통 제외를 우회할 수 없다.
 - 검증 요청·준비·판정(…_REQUESTED, …_READY, …VALIDATION, VERIFICATION_COMPLETED 등)은 증거가 아니다.
 - 한계: 증거의 "내용 충분성"은 판정하지 않는다(존재 여부만). 충분성은 카산드라 판정의 몫. 과거 이벤트 이름에 의존하므로 구형 태스크에서는 증거를 못 알아볼 수 있다(3절 참고).
 
 ### 2.3 결과 분류
 | 구분 | reason | 조건 |
 |---|---|---|
-| HARD (gate_level=WARN) | NO_CASSANDRA_RECORD | 같은 태스크에 actor=CASSANDRA% 이벤트가 0건이고 마기 보조검증도 없음 |
+| HARD (gate_level=WARN) | NO_CASSANDRA_RECORD | 같은 태스크에 actor=CASSANDRA% 이벤트가 0건(마기 보조검증 유무와 무관) |
 | HARD | LATEST_VERDICT_NOT_PASS | J가 구조화돼 있으나 NEG 또는 UNKNOWN |
 | REVIEW (gate_level=REVIEW) | LATEST_VERDICT_UNSTRUCTURED | J에 구조화 판정값이 없음 |
 | REVIEW | NO_JUDGMENT_EVENT | 카산드라 이벤트는 있으나 판정 이벤트가 없음 |
 | REVIEW | DESIGN_PASS_ONLY | J가 PASS_DESIGN |
 | REVIEW | PASS_STAGE_NOT_FINAL | J가 PASS이나 stage가 IMPLEMENTATION이거나 누락 |
-| REVIEW | SECONDARY_ONLY_NOT_ACCEPTED | 카산드라 이벤트 0건이고 actor=마기, verifier_role=SECONDARY 판정만 존재(2.4절) |
 | REVIEW | EVIDENCE_NOT_RECOGNIZED | C1 불충족(다른 reason과 함께 기록) |
 - J가 PASS_FINAL이고 C1도 충족이면 기록 없음.
 - HARD가 하나라도 있으면 gate_level=WARN, REVIEW만 있으면 REVIEW. 증거 없음은 REVIEW 수준이지만 위반 이벤트는 반드시 남으므로 미탐은 아니다.
@@ -65,7 +73,7 @@
 1. 카산드라는 판정 이벤트마다 `payload.verdict`, `payload.stage`를 기록한다(PASS는 조건·보류 없이 통과일 때만). 마기 권장 필드: `payload.tier`(HIGH|MEDIUM|LOW), `payload.target`(PR 번호·head SHA 또는 문서·쿼리 id). 필수는 verdict·stage뿐이다. 기존 `scope` 키(4969·4970)는 건드리지 않는다. 과도기 값 FAIL_DESIGN·FAIL_PATCH·PASS_DESIGN은 게이트가 앞부분 기준으로 읽는다. 최종 PASS는 `verdict=PASS, stage=FINAL`이다.
 2. **tier 규칙:** 통과 판정에 쓰는 tier의 출처는 마기가 착수 전에 지정하는 태스크 단위 tier이며(#200에서 구현), 판정자가 자기 이벤트에 적는 tier는 신뢰 근거가 아니다. 따라서 #200이 태스크 단위 tier 기록을 구현하기 전에는 **모든 태스크를 HIGH로 간주**한다.
 3. **HIGH:** 통과 근거는 카산드라의 최신 판정 PASS+FINAL뿐이다.
-4. **MEDIUM/LOW 보조검증:** 마기 보조검증은 actor=마기, `payload.verifier_role=SECONDARY`, verdict=PASS, stage=FINAL 로 별도 구분하며 마기가 설계·작성한 건은 제외한다(#200 규칙). **이 설계에서는 보조검증을 통과 근거로 인정하지 않고** SECONDARY_ONLY_NOT_ACCEPTED(REVIEW)로 기록만 한다. 인정하려면 #200 구현 후 별도 설계 변경과 카산드라 검증이 필요하다.
+4. **MEDIUM/LOW 보조검증:** 마기 보조검증은 actor=마기, `payload.verifier_role=SECONDARY`, verdict=PASS, stage=FINAL 로 별도 구분하며 마기가 설계·작성한 건은 제외한다(#200 규칙). **이 설계에서는 보조검증을 통과 근거로 인정하지 않으며** 판정 reason에도 영향을 주지 않는다(카산드라 이벤트 0건이면 항상 HARD). payload.checks의 `secondary_pass_recorded`·`secondary_events_recorded`로 정보만 남긴다. 마기 FAIL·보조검증 요청 이벤트는 secondary PASS로 세지 않는다. 인정하려면 #200 구현 후 별도 설계 변경과 카산드라 검증이 필요하다.
 5. `payload.tier`와 `payload.target`은 위반 이벤트 payload에 기록용으로 복사할 뿐 판정 로직에는 쓰지 않는다.
 6. 어휘를 코드로 강제하는 입력 검사는 이번 범위 밖이다. 관찰 2주 동안 어휘 이탈 건수를 보고서로 세고 필요하면 별도 태스크로 올린다.
 7. 합의 전까지 이 게이트가 낼 수 있는 결과는 HARD와 REVIEW 뿐이며 "정상 통과"는 합의 이후에만 가능하다(의도된 fail-safe). 카산드라 4996은 합의 응답이며 설계 PASS가 아니다.
@@ -95,23 +103,30 @@
 create or replace function public.fn_completion_gate_observe() returns trigger
 language plpgsql security definer set search_path = public as $$
 declare
-  v_c1 boolean; v_cass_total int; v_secondary boolean;
+  v_c1 boolean; v_cass_total int; v_sec_pass boolean; v_sec_other boolean;
   v_jid bigint; v_jtype text; v_structured boolean := false; v_ver text; v_stage text; v_tier text;
   v_found boolean := false; v_class text;
   v_hard text[] := '{}'; v_rev text[] := '{}';
 begin
   begin
-    -- C1: independent implementation/test evidence only (never the verifier's own events)
+    -- C1: independent implementation/test evidence only.  Every exclusion is a top-level AND:
+    -- no alternative path (type pattern OR evidence_kind) can bypass it.
     select exists(select 1 from magi_task_events e where e.task_id = NEW.task_id
       and e.actor not in ('GEOMNURI_PATROL','마기(자동)','COMPLETION_GATE')
       and e.actor not ilike 'CASSANDRA%'
-      and ((e.event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'
-            and e.event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)')
-           or coalesce(e.payload->>'evidence_kind','') in ('IMPLEMENTATION','TEST','CI','PRODUCTION'))) into v_c1;
+      and e.event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'
+      and (e.event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'
+           or upper(coalesce(e.payload->>'evidence_kind','')) in ('IMPLEMENTATION','TEST','CI','PRODUCTION'))) into v_c1;
     select count(*) into v_cass_total from magi_task_events e
       where e.task_id = NEW.task_id and e.actor ilike 'CASSANDRA%';
+    -- Secondary (마기) verification is recorded for information only; it never lowers a HARD result.
     select exists(select 1 from magi_task_events e where e.task_id = NEW.task_id
-      and e.actor = '마기' and e.payload->>'verifier_role' = 'SECONDARY') into v_secondary;
+      and e.actor = '마기' and upper(coalesce(e.payload->>'verifier_role','')) = 'SECONDARY'
+      and e.event_type !~* '(REQUEST|REQUIRE)'
+      and upper(coalesce(e.payload->>'verdict','')) = 'PASS'
+      and upper(coalesce(e.payload->>'stage','')) = 'FINAL') into v_sec_pass;
+    select exists(select 1 from magi_task_events e where e.task_id = NEW.task_id
+      and e.actor = '마기' and upper(coalesce(e.payload->>'verifier_role','')) = 'SECONDARY') into v_sec_other;
 
     -- J: latest CASSANDRA judgment event, chosen BEFORE looking at structure
     select e.event_id, e.event_type, coalesce(e.payload ? 'verdict', false),
@@ -125,8 +140,7 @@ begin
     v_found := found;
 
     if v_cass_total = 0 then
-      if v_secondary then v_rev := array_append(v_rev, 'SECONDARY_ONLY_NOT_ACCEPTED'::text); v_class := 'SECONDARY';
-      else v_hard := array_append(v_hard, 'NO_CASSANDRA_RECORD'::text); v_class := 'NONE'; end if;
+      v_hard := array_append(v_hard, 'NO_CASSANDRA_RECORD'::text); v_class := 'NONE';
     elsif not v_found then
       v_rev := array_append(v_rev, 'NO_JUDGMENT_EVENT'::text); v_class := 'NO_JUDGMENT';
     elsif not v_structured then
@@ -152,7 +166,8 @@ begin
           'reasons', v_hard||v_rev,'from_status',OLD.status,'to_status',NEW.status,'task_priority',NEW.priority,
           'last_judgment_event_id', v_jid,'last_verdict', v_ver,'last_stage', v_stage,'tier_recorded', v_tier,
           'verdict_class', v_class,
-          'checks', jsonb_build_object('independent_evidence',v_c1,'cassandra_events',v_cass_total)));
+          'checks', jsonb_build_object('independent_evidence',v_c1,'cassandra_events',v_cass_total,
+            'secondary_pass_recorded',v_sec_pass,'secondary_events_recorded',v_sec_other)));
     end if;
   exception when others then
     raise warning 'completion_gate_observe failed: %', sqlerrm;
@@ -181,14 +196,15 @@ execute function public.fn_completion_gate_observe();
 | 99013 | PASS/FINAL 뒤에 FAIL/FINAL | HARD LATEST_VERDICT_NOT_PASS | 일치 |
 | 99014 | 비구조 뒤에 PASS/FINAL(나중) | 최신 우선으로 통과 | 일치 |
 | 99015 | PASS/FINAL 뒤에 AGREEMENT_RESPONSE(판정 아님) | 통과 유지 | 일치 |
-| 99016 | 카산드라 0건, 마기 SECONDARY PASS/FINAL | REVIEW SECONDARY_ONLY_NOT_ACCEPTED | 일치 |
+| 99016 | 카산드라 0건, 마기 SECONDARY PASS/FINAL | HARD NO_CASSANDRA_RECORD (secondary는 정보 checks만, v1.3) | 일치 |
 | 99017 | 카산드라 VALIDATION_REQUESTED만 | REVIEW NO_JUDGMENT_EVENT | 일치 |
 | 99018 | 요청 이벤트(VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED)만 + 카산드라 PASS/FINAL | 증거 불충족 | 일치 |
 | 99019 | 증거 + 카산드라 PASS/DESIGN | REVIEW DESIGN_PASS_ONLY | 일치 |
 **(b) 증거 이벤트 타입 20종 판정: 20/20 일치.** 허용 7(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) / 불허 13(VERIFICATION_COMPLETED, CASSANDRA_VALIDATION, CASSANDRA_DESIGN_PASS, IMPLEMENTATION_READY_FOR_VERIFICATION, VERIFICATION_READY, VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED).
 **(c) verdict·stage 분류 15/15 일치(읽기 전용 SELECT):** PARTIAL_PASS/FINAL, FAIL_DESIGN(과도기 값), HOLD/FINAL, FAIL/DESIGN → NEG / PASS+FINAL, 소문자 pass+final → PASS_FINAL / PASS 단계 누락, PASS+IMPLEMENTATION, 비표준 PASS_FINAL → PASS_PARTIAL_STAGE / PASS+DESIGN, 과도기 PASS_DESIGN, PASS+FINAL이지만 설계 검증 event_type → PASS_DESIGN / MAYBE → UNKNOWN / 판정값 없는 과거 이벤트 → 비구조 / 카산드라가 아닌 actor의 PASS+FINAL → 불인정.
 **(d) 13건 백테스트 재실행:** 3절 표.
-**(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 22/22 통과** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
+**(f) v1.3 전수 조합 시험: 10,176 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
+**(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 22/22 통과 (v1.3에서 P11 기대값을 HARD로 갱신)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
 **시험 중 발견·수정한 결함 2건:**
 1. (읽기 전용 단계) payload가 NULL인 과거 이벤트가 `NOT NULL`로 평가돼 구형 10건이 HARD로 잘못 분류됨 → 모든 곳에 `coalesce(payload ? 'verdict', false)`.
 2. (로컬 실행 단계) **v1·v1.1 초안 SQL은 실제로는 동작하지 않았다.** `text[] || '문자열'`에서 문자열이 배열 리터럴로 해석돼 `malformed array literal` 오류가 났고, fail-open 설계 때문에 이 오류가 삼켜져 위반 이벤트가 하나도 기록되지 않았다(첫 실행 9/22). `array_append(배열, '값'::text)`로 고쳐 22/22 통과. 교훈: fail-open 트리거는 결함이 있어도 조용히 아무것도 안 하므로, 적용 전 반드시 실제 실행 시험이 필요하고 관찰 기간 첫날 위반 이벤트 건수 대비 완료 전이 건수를 점검해야 한다(위반 이벤트 0건이 "정상"인지 "고장"인지 구분 불가).

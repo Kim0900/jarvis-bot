@@ -66,7 +66,7 @@ t,r,c=scenario("P7 unknown verdict",True,[EVID,EV({"verdict":"MAYBE","stage":"FI
 t,r,c=scenario("P8 pass then latest unstructured (99001)",True,[EVID,EV(),("CASSANDRA_VALIDATION","CASSANDRA",{"audit":"x"})]); check("P8 latest unstructured overrides earlier PASS",r,'REVIEW:["LATEST_VERDICT_UNSTRUCTURED"]')
 t,r,c=scenario("P9 verifier self-evidence (99011)",True,[EV()]); check("P9 verifier event is not implementation evidence",r,'REVIEW:["EVIDENCE_NOT_RECOGNIZED"]')
 t,r,c=scenario("P10 stage missing",True,[EVID,EV({"verdict":"PASS"})]); check("P10 PASS without stage",r,'REVIEW:["PASS_STAGE_NOT_FINAL"]')
-t,r,c=scenario("P11 secondary only",True,[EVID,("MAGI_DECISION","마기",{"verdict":"PASS","stage":"FINAL","verifier_role":"SECONDARY","tier":"LOW"})]); check("P11 secondary not accepted",r,'REVIEW:["SECONDARY_ONLY_NOT_ACCEPTED"]')
+t,r,c=scenario("P11 secondary only",True,[EVID,("MAGI_DECISION","마기",{"verdict":"PASS","stage":"FINAL","verifier_role":"SECONDARY","tier":"LOW"})]); check("P11 secondary never lowers HARD",r,'WARN:["NO_CASSANDRA_RECORD"]')
 t,r,c=scenario("P12 non-cassandra PASS",True,[EVID,("CASSANDRA_VALIDATION","TAEO",{"verdict":"PASS","stage":"FINAL"})]); check("P12 PASS by other actor ignored",r,'WARN:["NO_CASSANDRA_RECORD"]')
 t,r,c=scenario("P13 evidence_kind path",True,[("MAGI_DECISION","마기",{"evidence_kind":"TEST"}),EV()],); check("P13 evidence_kind accepted -> clean",r,'(none)')
 # negative
