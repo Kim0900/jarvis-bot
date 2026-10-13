@@ -64,6 +64,25 @@ class OutboxTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(sdj.needs_pre_send_claim("check_daily_ingestion_detail"))
         self.assertFalse(sdj.needs_pre_send_claim("recalc_7day_average"))
 
+    async def test_old_claim_remains_uncertain_during_feature_rollout(self):
+        # Switching on the new outbox must not replay an old same-day CLAIMED
+        # whose Telegram delivery is ambiguous.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tests.test_task194_daily_jobs import FakeLegacy, Clock
+        legacy = FakeLegacy()
+        now = datetime(2026, 10, 13, 4, 0, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+        legacy.rows["check_daily_ingestion_detail"] = {
+            "job_name": "check_daily_ingestion_detail",
+            "last_run_at": now.isoformat(),
+            "last_result": "CLAIMED: attempt=1",
+        }
+        outcomes = await sdj.run_daily_jobs(
+            legacy, now, sdj.DailyJobState(), Clock(), legacy.actions(),
+        )
+        self.assertEqual(outcomes["check_daily_ingestion_detail"], "uncertain_done")
+        self.assertEqual(legacy.calls["check_daily_ingestion_detail"], 0)
+
     async def test_enqueue_per_recipient_uses_conflict_ignore(self):
         calls = []
         async def fake_post(_legacy, path, payload, *, prefer=None):
