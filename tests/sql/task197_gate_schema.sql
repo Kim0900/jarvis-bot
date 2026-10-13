@@ -18,3 +18,4 @@ create policy magi_task_events_anon_read on magi_task_events for select to anon 
 create policy magi_task_events_anon_write on magi_task_events for insert to anon with check (true);
 grant select, update on magi_tasks to anon;
 grant select, insert on magi_task_events to anon;
+grant temp on database gate to anon;   -- production anon has TEMP privilege (has_database_privilege('anon', current_database(), 'TEMP') = true)

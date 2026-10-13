@@ -394,8 +394,12 @@ def main():
     out = psql("select task_id, count(*) from magi_task_events where event_type='COMPLETION_GATE_VIOLATION' group by 1;")
     counts = {int(l.split("\t")[0]): int(l.split("\t")[1]) for l in out.splitlines()}
     for tid, vr, old, new in cases:
-        should = vr is True and new in ("COMPLETED", "CLOSED") and old not in ("COMPLETED", "CLOSED")
-        if counts.get(tid, 0) != (1 if should else 0):
+        terminal = ("COMPLETED", "CLOSED")
+        # one event when the task is created directly in a terminal state (INSERT path) plus one when an UPDATE moves it
+        # from a non-terminal to a terminal state
+        want = (1 if vr is True and old in terminal else 0) + (1 if vr is True and new in terminal and old not in terminal else 0)
+        should = want
+        if counts.get(tid, 0) != want:
             D_fail += 1
             failures.append(("D transition matrix", f"vr={vr} {old}->{new}", "fire mismatch", counts.get(tid, 0)))
     print(f"D transition matrix: {len(cases)} cases, {D_fail} mismatches")
@@ -427,6 +431,27 @@ def main():
             failures.append(("D2 vr change", f"{ov}->{nv} {ns}", "mismatch", reasons))
     print(f"D2 verification_required change: {len(c2)} cases, {d2_fail} mismatches")
     total += len(c2)
+
+    # D3. tasks created directly in a status (INSERT path)
+    reset()
+    c3 = [(70000 + i, vr, st) for i, (vr, st) in enumerate(itertools.product([True, False, None], statuses))]
+    sql = ["begin;"]
+    for tid, vr, st in c3:
+        sql.append(f"insert into magi_tasks(task_id,title,status,priority,verification_required) values ({tid},'D3',{lit(st)},'P1',{nl(vr)});")
+    sql.append("commit;")
+    psql("\n".join(sql))
+    out = psql("select task_id, payload->>'op', coalesce(payload->>'from_status','null'), payload->'reasons' from magi_task_events where event_type='COMPLETION_GATE_VIOLATION';")
+    got3 = {int(l.split("\t")[0]): l.split("\t")[1:] for l in out.splitlines()}
+    d3_fail = 0
+    for tid, vr, st in c3:
+        should = vr is True and st in ("COMPLETED", "CLOSED")
+        row = got3.get(tid)
+        ok = (row is not None) == should and (not should or (row[0] == "INSERT" and row[1] == "null" and "NO_CASSANDRA_RECORD" in json.loads(row[2])))
+        if not ok:
+            d3_fail += 1
+            failures.append(("D3 insert path", f"vr={vr} {st}", "mismatch", row))
+    print(f"D3 insert path: {len(c3)} cases, {d3_fail} mismatches")
+    total += len(c3)
 
     # E. hand-written spec expectations (independent of the oracle): CASSANDRA 5018 counterexamples
     reset()
