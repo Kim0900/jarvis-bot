@@ -20,6 +20,8 @@ class FakePostgREST:
         self.fail_mode: str | None = None  # None | "503" | "reset"
         self.fail_tables: set[str] | None = None  # None = every table
         self.fail_methods: set[str] | None = None  # None = every method
+        # GET answers that are HTTP 200 but untrustworthy: None | "empty" | "badjson" | "dict"
+        self.get_quirk: str | None = None
         self.requests: list[tuple[str, str]] = []
         self._lock = threading.Lock()
         outer = self
@@ -61,6 +63,15 @@ class FakePostgREST:
                     params = parse_qsl(url.query, keep_blank_values=True)
                     rows = outer.tables.setdefault(table, [])
                     if method == "GET":
+                        quirk = outer.get_quirk
+                        if quirk and (outer.fail_tables is None or table in outer.fail_tables):
+                            raw = {"empty": b"", "badjson": b"<html>proxy</html>", "dict": b"{}"}[quirk]
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(raw)))
+                            self.end_headers()
+                            self.wfile.write(raw)
+                            return
                         self._send(200, outer._select(rows, params))
                     elif method == "POST":
                         data = json.loads(body or b"{}")

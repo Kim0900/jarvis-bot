@@ -85,25 +85,35 @@ def format_failure(exc: BaseException) -> str:
     return text[:RESULT_MAX_LEN]
 
 
+CLAIM_PREFIX = "CLAIMED"
+
+
 def is_success_result(result: Any) -> bool:
-    return isinstance(result, str) and bool(result.strip()) and not result.startswith("FAIL")
+    return (isinstance(result, str) and bool(result.strip())
+            and not result.startswith("FAIL") and not result.startswith(CLAIM_PREFIX))
 
 
-async def succeeded_today(legacy: Any, job_name: str, now: datetime) -> bool:
-    """True iff ``job_name`` has a success record stamped today (KST).
+def is_claim_result(result: Any) -> bool:
+    return isinstance(result, str) and result.startswith(CLAIM_PREFIX)
 
-    Raises :class:`SchedulerStateUnknown` for every answer that cannot be trusted:
-    transport errors, non-list bodies (``sb_h`` returns ``None`` on non-200),
-    duplicated or malformed rows, naive or future timestamps.
+
+async def job_state_today(legacy: Any, job_name: str, now: datetime) -> str:
+    """``"success"``, ``"claimed"`` or ``"none"`` for today's (KST) record of ``job_name``.
+
+    The read goes through ``legacy.sb_get_strict`` (CASSANDRA 5067 F1): only HTTP 200
+    with a non-empty JSON list is believed, so an empty/garbled 200 can never pass as
+    "no row yet".  Raises :class:`SchedulerStateUnknown` for every untrusted answer:
+    transport errors, non-200, empty/invalid/non-list body, duplicated or malformed
+    rows, naive or future timestamps.
     """
     try:
-        rows = await legacy.sb_h("GET", "scheduler_status", params={"job_name": f"eq.{job_name}"})
-    except Exception as exc:  # transport level: timeout, connection reset, ...
+        rows = await legacy.sb_get_strict("scheduler_status", {"job_name": f"eq.{job_name}"})
+    except Exception as exc:  # transport level or untrusted body
         raise SchedulerStateUnknown(f"read failed: {type(exc).__name__}: {exc!r}") from exc
     if not isinstance(rows, list):
         raise SchedulerStateUnknown("read failed: non-list response")
     if not rows:
-        return False  # a verified empty answer is a first run
+        return "none"  # a verified empty answer is a first run
     if len(rows) != 1 or not isinstance(rows[0], dict):
         raise SchedulerStateUnknown("ambiguous scheduler_status rows")
     row = rows[0]
@@ -120,8 +130,15 @@ async def succeeded_today(legacy: Any, job_name: str, now: datetime) -> bool:
     if parsed > now + timedelta(minutes=5):
         raise SchedulerStateUnknown("last_run_at is in the future")
     if parsed.date() != now.date():
-        return False
-    return is_success_result(row.get("last_result"))
+        return "none"
+    result = row.get("last_result")
+    if is_claim_result(result):
+        return "claimed"
+    return "success" if is_success_result(result) else "none"
+
+
+async def succeeded_today(legacy: Any, job_name: str, now: datetime) -> bool:
+    return (await job_state_today(legacy, job_name, now)) == "success"
 
 
 class DailyJobState:
@@ -160,7 +177,7 @@ async def run_daily_jobs(
     """One scheduler tick.  Returns ``{job_name: outcome}`` for logging and tests.
 
     Outcomes: ``outside_window``, ``done``, ``state_unknown``, ``cooldown``,
-    ``uncertain_done``, ``ok``, ``failed``, ``ok_status_write_failed``.
+    ``uncertain_done``, ``claim_failed``, ``ok``, ``failed``, ``ok_status_write_failed``.
     """
     outcomes: dict[str, str] = {}
     start_hour, end_hour = window_hours()
@@ -183,9 +200,17 @@ async def run_daily_jobs(
             outcomes[name] = "cooldown"
             continue
         try:
-            if await succeeded_today(legacy, name, now):
+            seen = await job_state_today(legacy, name, now)
+            if seen == "success":
                 state.confirmed_done.add(key)
                 outcomes[name] = "done"
+                continue
+            if seen == "claimed" and name in NON_IDEMPOTENT_JOBS:
+                # A previous process claimed the send and never recorded the outcome
+                # (crash/restart or lost status write).  At-most-once: do not resend.
+                legacy.logger.error("Task194 %s: claim found without outcome -> not re-run (delivery uncertain)", name)
+                state.uncertain_done.add(key)
+                outcomes[name] = "uncertain_done"
                 continue
         except SchedulerStateUnknown as exc:
             legacy.logger.error("Task194 scheduler state unknown (%s): %s -> job not run", name, exc)
@@ -196,6 +221,16 @@ async def run_daily_jobs(
 
         state.last_attempt[key] = monotonic()
         state.attempts[key] = state.attempts.get(key, 0) + 1
+        if name in NON_IDEMPOTENT_JOBS:
+            # Durable claim BEFORE the external side effect (CASSANDRA 5067 F2).  If the
+            # claim cannot be stored we do not send; if the process dies after sending,
+            # the stored claim stops any re-send after restart.
+            try:
+                await _write_status(legacy, name, f"{CLAIM_PREFIX}: attempt={state.attempts[key]}", now)
+            except Exception as exc:
+                legacy.logger.error("Task194 claim write failed (%s): %r -> job not run", name, exc)
+                outcomes[name] = "claim_failed"
+                continue
         try:
             result = await actions[name]()
         except Exception as exc:
@@ -262,9 +297,9 @@ async def missing_snapshot_dates(legacy: Any, now: datetime, max_days: int) -> l
     yesterday = now.date() - timedelta(days=1)
     first = yesterday - timedelta(days=max_days)
     try:
-        rows = await legacy.sb_h(
-            "GET", "daily_calc_snapshot",
-            params={"select": "calc_date", "calc_date": [f"gte.{first}", f"lt.{yesterday}"], "limit": "1000"},
+        rows = await legacy.sb_get_strict(
+            "daily_calc_snapshot",
+            {"select": "calc_date", "calc_date": [f"gte.{first}", f"lt.{yesterday}"], "limit": "1000"},
         )
     except Exception as exc:
         raise SchedulerStateUnknown(f"snapshot read failed: {type(exc).__name__}: {exc!r}") from exc

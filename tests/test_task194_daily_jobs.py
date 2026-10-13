@@ -74,6 +74,12 @@ class FakeLegacy:
             row["last_run_at"] = None
         return [row]
 
+    async def sb_get_strict(self, table, params=None):
+        result = await self.sb_h("GET", table, params=params)
+        if not isinstance(result, list):
+            raise RuntimeError("strict read failed")
+        return result
+
     async def sb_upsert(self, table, data, on_conflict):
         if self.write_fail:
             raise RuntimeError("sb_upsert 실패")
@@ -242,13 +248,52 @@ class DailyJobsTests(IsolatedAsyncioTestCase):
     async def test_success_status_write_failure_retries_idempotent_jobs_only(self):
         self.lg.write_fail = True
         out = await self.tick(kst(4))
-        self.assertEqual(set(out.values()), {"ok_status_write_failed"})
+        # the alert job's durable claim cannot be stored -> it must not send at all
+        self.assertEqual(out["check_daily_ingestion_detail"], "claim_failed")
+        self.assertEqual(self.lg.calls["check_daily_ingestion_detail"], 0)
+        self.assertEqual({v for k, v in out.items() if k != "check_daily_ingestion_detail"},
+                         {"ok_status_write_failed"})
         self.lg.write_fail = False
         self.clock.advance(sdj.retry_interval_seconds() + 1)
         out = await self.tick(kst(4, 20))
         self.assertEqual(self.lg.calls["recalc_daily_summary_totals"], 2)
-        self.assertEqual(self.lg.calls["check_daily_ingestion_detail"], 1)  # alert job not repeated
+        self.assertEqual(self.lg.calls["check_daily_ingestion_detail"], 1)
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok")
+
+    async def test_claim_without_outcome_blocks_resend_after_restart(self):
+        # process 1 claimed, sent, then died / lost the outcome write
+        self.lg.rows["check_daily_ingestion_detail"] = {
+            "job_name": "check_daily_ingestion_detail", "last_run_at": kst(4).isoformat(),
+            "last_result": "CLAIMED: attempt=1"}
+        out = await self.tick(kst(4, 30))
         self.assertEqual(out["check_daily_ingestion_detail"], "uncertain_done")
+        self.assertEqual(self.lg.calls["check_daily_ingestion_detail"], 0)
+        self.assertFalse(await sdj.succeeded_today(self.lg, "check_daily_ingestion_detail", kst(4, 30)))
+
+    async def test_claim_is_written_before_the_job_runs(self):
+        order = []
+        orig = self.lg.sb_upsert
+
+        async def spy(table, data, on_conflict):
+            order.append(("write", data["last_result"][:7]))
+            return await orig(table, data, on_conflict)
+        self.lg.sb_upsert = spy
+
+        async def alert():
+            order.append(("run", ""))
+            return {"x": 1}
+        acts = self.lg.actions()
+        acts["check_daily_ingestion_detail"] = alert
+        await sdj.run_daily_jobs(self.lg, kst(4), sdj.DailyJobState(), self.clock, jobs=acts)
+        alert_events = [e for e in order if e[0] == "run" or e[1] in ("CLAIMED",)]
+        self.assertEqual(alert_events[:2], [("write", "CLAIMED"), ("run", "")])
+
+    async def test_claim_from_yesterday_does_not_block_today(self):
+        self.lg.rows["check_daily_ingestion_detail"] = {
+            "job_name": "check_daily_ingestion_detail",
+            "last_run_at": (kst(4) - timedelta(days=1)).isoformat(), "last_result": "CLAIMED: attempt=1"}
+        out = await self.tick(kst(4))
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok")
 
     async def test_failure_status_write_failure_is_survivable(self):
         self.lg.job_error["calc_daily_snapshot"] = RuntimeError("boom")
@@ -340,22 +385,13 @@ class WiringTests(unittest.TestCase):
             self.assertIn("sb_select_required", calls, name)
             self.assertNotIn("sb_select", calls, name)
 
-    def test_sb_select_required_semantics(self):
+    def test_sb_select_required_is_strict_getter(self):
         tree = ast.parse(self.legacy)
         fn = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "sb_select_required")
-        ns = {}
+        calls = [n.func.id for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+        self.assertIn("sb_get_strict", calls)
+        self.assertNotIn("sb_h", calls)  # behaviour is covered by the E2E tests on the real HTTP stack
 
-        async def sb_h(method, table, params=None):
-            return ns["answer"]
-        ns["sb_h"] = sb_h
-        exec(compile(ast.Module(body=[fn], type_ignores=[]), "<req>", "exec"), ns)
-        for answer, raises in ((None, True), ({"x": 1}, True), ([], False), ([{"a": 1}], False)):
-            ns["answer"] = answer
-            if raises:
-                with self.assertRaises(RuntimeError):
-                    asyncio.run(ns["sb_select_required"]("raw_calls"))
-            else:
-                self.assertEqual(asyncio.run(ns["sb_select_required"]("raw_calls")), answer)
 
 
 if __name__ == "__main__":

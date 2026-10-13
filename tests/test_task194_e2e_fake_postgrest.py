@@ -53,10 +53,14 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.srv.fail_mode = None
         self.srv.fail_tables = None
         self.srv.fail_methods = None
+        self.srv.get_quirk = None
+        self.send_result = {"sent": 1, "failed": 0}
         self.srv.requests.clear()
         self.patches = [
             patch.object(legacy, "SUPABASE_URL", self.srv.url),
             patch.object(legacy, "send_telegram_broadcast", self._fake_send),
+            # jobs derive "today" from the real clock; freeze it to the test's `now`
+            patch.object(legacy, "today_kst", lambda: datetime(2026, 10, 12, tzinfo=KST).date()),
         ]
         for p in self.patches:
             p.start()
@@ -75,6 +79,24 @@ class E2E(unittest.IsolatedAsyncioTestCase):
 
     async def _fake_send(self, msg):
         self.sent.append(msg)
+        if isinstance(self.send_result, BaseException):
+            raise self.send_result
+        return self.send_result
+
+    def alerts(self):
+        return [m for m in self.sent if "부분누락" in m]
+
+    def arm_alert(self):
+        """operated_status says 'GPX only' -> check_daily_ingestion_detail must alert."""
+        self.srv.tables["operated_status"] = [
+            {"날짜": self.yesterday, "source": "gpx_proxy", "operated": True}]
+        p = patch.object(legacy, "sync_operated_status", self._noop)
+        p.start()
+        self.patches.append(p)
+
+    @staticmethod
+    async def _noop(*a, **k):
+        return None
 
     async def tick(self, state=None, now=None):
         return await sdj.run_daily_jobs(legacy, now or self.now, state or self.state, self.clock)
@@ -117,7 +139,7 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["recalc_7day_average"], "failed")
         self.assertEqual(out["calc_daily_snapshot"], "failed")
         for job in ("recalc_daily_summary_totals", "recalc_7day_average", "calc_daily_snapshot"):
-            self.assertTrue(self.status(job).startswith("FAIL: RuntimeError"), self.status(job))
+            self.assertTrue(self.status(job).startswith("FAIL: SupabaseReadError"), self.status(job))
             self.assertIn("raw_calls", self.status(job))
         self.assertEqual(self.posts("daily_summary") + self.posts("kpi_7day_snapshot")
                          + self.posts("daily_calc_snapshot"), 0)
@@ -162,6 +184,138 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         out = await self.tick(state=sdj.DailyJobState(), now=self.now + timedelta(hours=1))
         self.assertEqual(set(out.values()), {"state_unknown"})
         self.assertEqual(self.posts("daily_calc_snapshot"), before)
+
+    # CASSANDRA 5067 F1: HTTP 200 with an empty / garbled body is not "no row yet"
+    async def test_untrusted_200_answers_are_state_unknown_and_run_nothing(self):
+        for quirk in ("empty", "badjson", "dict"):
+            with self.subTest(quirk=quirk):
+                self.srv.tables.pop("scheduler_status", None)
+                self.srv.requests.clear()
+                self.state = sdj.DailyJobState()
+                self.srv.get_quirk = quirk
+                self.srv.fail_tables = {"scheduler_status"}
+                out = await self.tick()
+                self.assertEqual(set(out.values()), {"state_unknown"}, out)
+                self.assertEqual(self.posts("daily_summary") + self.posts("kpi_7day_snapshot")
+                                 + self.posts("daily_calc_snapshot") + self.posts("scheduler_status"), 0)
+        self.srv.get_quirk = None
+        self.srv.fail_tables = None
+
+    async def test_real_empty_list_is_a_first_run_not_an_error(self):
+        out = await self.tick()
+        self.assertEqual({out[j] for j in JOBS[:3]}, {"ok"}, out)
+
+    async def test_sb_select_required_rejects_untrusted_answers_but_accepts_real_empty(self):
+        self.assertEqual(await legacy.sb_select_required("nothing_here", {"a": "eq.1"}), [])
+        for quirk in ("empty", "badjson", "dict"):
+            self.srv.get_quirk = quirk
+            with self.assertRaises(legacy.SupabaseReadError, msg=quirk):
+                await legacy.sb_select_required("raw_calls", {})
+            # the lenient reader keeps its old contract for other callers
+            self.assertEqual(await legacy.sb_select("raw_calls", {}), [])
+        self.srv.get_quirk = None
+        self.srv.fail_mode = "reset"
+        with self.assertRaises(legacy.SupabaseReadError):
+            await legacy.sb_select_required("raw_calls", {})
+
+    async def test_job_input_read_with_empty_200_fails_instead_of_aggregating_zero(self):
+        self.srv.get_quirk = "empty"
+        self.srv.fail_tables = {"raw_calls"}
+        out = await self.tick()
+        self.assertEqual(out["recalc_daily_summary_totals"], "failed")
+        self.assertEqual(out["recalc_7day_average"], "failed")
+        self.assertEqual(self.posts("kpi_7day_snapshot"), 0)
+
+    # CASSANDRA 5067 F3: delivery failure propagates
+    async def test_alert_sent_once_and_recorded(self):
+        self.arm_alert()
+        out = await self.tick()
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok")
+        self.assertEqual(len(self.alerts()), 1)
+
+    async def test_alert_delivery_failure_is_a_failure_and_is_retried(self):
+        self.arm_alert()
+        for err in ({"sent": 0, "failed": 2}, RuntimeError("telegram down"), None):
+            with self.subTest(err=repr(err)):
+                self.srv.tables.pop("scheduler_status", None)
+                self.state = sdj.DailyJobState()
+                self.sent.clear()
+                self.send_result = err
+                out = await self.tick()
+                self.assertEqual(out["check_daily_ingestion_detail"], "failed", out)
+                self.assertTrue(self.status("check_daily_ingestion_detail").startswith("FAIL:"))
+        self.send_result = {"sent": 1, "failed": 0}
+        self.clock.advance(sdj.retry_interval_seconds() + 1)
+        out = await self.tick(now=self.now + timedelta(minutes=20))
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok")
+        self.assertEqual(self.status("check_daily_ingestion_detail")[:1], "{")
+
+    async def test_partial_delivery_counts_as_delivered(self):
+        self.arm_alert()
+        self.send_result = {"sent": 1, "failed": 1}
+        out = await self.tick()
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok")
+
+    # independent review: the alert path's own reader (sync_operated_status) must be strict too
+    async def test_sync_read_outage_never_produces_false_no_data_alert(self):
+        pre = [{"날짜": self.yesterday, "source": "confirmed", "operated": True}]
+        for label, setup in (
+            ("503", lambda: (setattr(self.srv, "fail_mode", "503"),
+                             setattr(self.srv, "fail_tables", {"raw_calls", "gpx_sessions"}),
+                             setattr(self.srv, "fail_methods", {"GET"}))),
+            ("empty200", lambda: (setattr(self.srv, "get_quirk", "empty"),
+                                  setattr(self.srv, "fail_tables", {"raw_calls", "gpx_sessions"}))),
+            ("operated_status_503", lambda: (setattr(self.srv, "fail_mode", "503"),
+                                             setattr(self.srv, "fail_tables", {"operated_status"}),
+                                             setattr(self.srv, "fail_methods", {"GET"}))),
+        ):
+            with self.subTest(case=label):
+                self.srv.fail_mode = self.srv.fail_tables = self.srv.fail_methods = self.srv.get_quirk = None
+                self.srv.tables.pop("scheduler_status", None)
+                self.srv.tables["operated_status"] = [dict(r) for r in pre]
+                self.sent.clear()
+                self.state = sdj.DailyJobState()
+                setup()
+                out = await self.tick()
+                self.assertEqual(out["check_daily_ingestion_detail"], "failed", out)
+                self.assertEqual(self.alerts() + [m for m in self.sent if "데이터 없음" in m], [])
+                self.assertEqual(self.srv.tables["operated_status"], pre)  # nothing stamped None/None
+        self.srv.fail_mode = self.srv.fail_tables = self.srv.fail_methods = self.srv.get_quirk = None
+
+    # CASSANDRA 5067 F2: send succeeds, outcome write fails, process restarts
+    async def test_send_ok_status_write_fails_restart_does_not_resend(self):
+        self.arm_alert()
+        real_send = self._fake_send
+
+        async def send_then_break_status(msg):
+            r = await real_send(msg)
+            if "부분누락" in msg:
+                self.srv.fail_mode = "503"
+                self.srv.fail_tables = {"scheduler_status"}
+                self.srv.fail_methods = {"POST"}
+            return r
+        legacy.send_telegram_broadcast = send_then_break_status
+        out = await self.tick()
+        self.assertEqual(out["check_daily_ingestion_detail"], "ok_status_write_failed")
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertEqual(self.status("check_daily_ingestion_detail")[:7], "CLAIMED")
+        # restart: new process state, database healthy again
+        self.srv.fail_mode = None
+        self.srv.fail_tables = None
+        self.srv.fail_methods = None
+        self.clock.advance(sdj.retry_interval_seconds() + 1)
+        out = await self.tick(state=sdj.DailyJobState(), now=self.now + timedelta(minutes=30))
+        self.assertEqual(out["check_daily_ingestion_detail"], "uncertain_done")
+        self.assertEqual(len(self.alerts()), 1)
+
+    async def test_claim_write_failure_means_no_send(self):
+        self.arm_alert()
+        self.srv.fail_mode = "503"
+        self.srv.fail_tables = {"scheduler_status"}
+        self.srv.fail_methods = {"POST"}
+        out = await self.tick()
+        self.assertEqual(out["check_daily_ingestion_detail"], "claim_failed")
+        self.assertEqual(self.alerts(), [])
 
     # 4. the original bug, documented on the real stack
     async def test_original_guards_were_fail_open(self):

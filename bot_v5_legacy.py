@@ -1648,15 +1648,42 @@ async def sb_select(table: str, params: dict = None) -> list:
     return result if isinstance(result, list) else []
 
 
+class SupabaseReadError(RuntimeError):
+    """A Supabase GET whose answer cannot be trusted (task #194 / CASSANDRA 5067 F1)."""
+
+
+async def sb_get_strict(table: str, params: dict = None) -> list:
+    """Strict PostgREST GET that returns a JSON list or raises.
+
+    ``sb_h`` is lenient on purpose for legacy callers: HTTP 200 with an empty body or
+    invalid JSON becomes ``[]``.  For a guard or aggregate that is indistinguishable
+    from a verified empty table, so here only a non-empty, valid JSON *list* body on
+    HTTP 200 is accepted (a real empty result is the body ``[]``)."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.request("GET", url, headers=HEADERS_SB, params=params or {})
+    except Exception as exc:
+        raise SupabaseReadError(f"{table}: transport {type(exc).__name__}: {exc!r}") from exc
+    if r.status_code != 200:
+        raise SupabaseReadError(f"{table}: HTTP {r.status_code}")
+    if not r.content or not r.content.strip():
+        raise SupabaseReadError(f"{table}: empty 200 body")
+    try:
+        data = r.json()
+    except Exception as exc:
+        raise SupabaseReadError(f"{table}: invalid JSON body") from exc
+    if not isinstance(data, list):
+        raise SupabaseReadError(f"{table}: non-list body {type(data).__name__}")
+    return data
+
+
 async def sb_select_required(table: str, params: dict = None) -> list:
-    """Task #194: for jobs that compute from the result. ``sb_select`` turns a failed
-    PostgREST answer (non-200 -> ``sb_h`` returns None) into ``[]``, which makes an
-    outage look like "no data" and lets a job write wrong aggregates or report OK.
-    Here a failed read raises, so the job is recorded as FAIL and retried."""
-    result = await sb_h("GET", table, params=params or {})
-    if not isinstance(result, list):
-        raise RuntimeError(f"Required Supabase read failed: {table}")
-    return result
+    """Task #194: for jobs that compute from the result.  ``sb_select`` turns any failed
+    or malformed PostgREST answer into ``[]``, which makes an outage look like "no data"
+    and lets a job write wrong aggregates or report OK.  Here every untrusted answer
+    raises, so the job is recorded as FAIL and retried."""
+    return await sb_get_strict(table, params)
 
 
 async def sb_select_canonical(start_date: str = None, end_date: str = None) -> list:
@@ -6639,34 +6666,47 @@ def geomnuri_patrol_scheduler():
         time.sleep(max(GEOMNURI_PATROL_INTERVAL_SECONDS - elapsed, 30))
 
 
-async def sync_operated_status(days_back: int = 30):
+async def sync_operated_status(days_back: int = 30, strict: bool = False):
     """task#38: 최근 N일에 대해 operated_status를 3단계 소스로 자동채움.
     confirmed(raw_calls존재)/gpx_proxy(raw_calls없음+GPX있음)는 자동확정,
-    둘다없는 날짜만 미확인(pending)으로 남겨 질문 대상이 됨."""
+    둘다없는 날짜만 미확인(pending)으로 남겨 질문 대상이 됨.
+
+    Task #194 (independent review of the F1 fix): with ``strict=True`` a failed or
+    untrusted read raises instead of being treated as "no data".  Otherwise an outage
+    on raw_calls/gpx_sessions/operated_status would stamp every day as
+    ``operated=None, source=None`` and the 04:00 alert would claim "no data at all".
+    The default stays lenient for the other caller (08:00 question flow)."""
     today = today_kst()
     dates = [str(today - timedelta(days=i)) for i in range(1, days_back+1)]
+    read = sb_get_strict if strict else sb_select
 
     raw_dates = set()
     try:
-        rows = await sb_select("raw_calls", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        rows = await read("raw_calls", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         for r in (rows or []):
             if r.get("날짜"): raw_dates.add(r["날짜"])
     except Exception as e:
         logger.error(f"operated_status 동기화 - raw_calls 조회 실패: {e}")
+        if strict:
+            raise
 
     gpx_dates = set()
     try:
-        rows = await sb_select("gpx_sessions", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        rows = await read("gpx_sessions", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         for r in (rows or []):
             if r.get("날짜"): gpx_dates.add(r["날짜"])
     except Exception as e:
         logger.error(f"operated_status 동기화 - gpx_sessions 조회 실패: {e}")
+        if strict:
+            raise
 
     try:
-        existing_rows = await sb_select("operated_status", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        existing_rows = await read("operated_status", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         existing = {r["날짜"]: r for r in (existing_rows or [])}
     except Exception as e:
         logger.error(f"operated_status 동기화 - 기존행 조회 실패: {e}")
+        if strict:
+            raise
         existing = {}
 
     pending = []
@@ -7666,7 +7706,7 @@ async def check_daily_ingestion_detail():
     (완전누락만, 최대 3일 지연) 그대로 유지하고, 이 함수는 매일(대기없이)
     + 부분누락(GPX는 있는데 콜/영수증만 없음, source='gpx_proxy')까지
     구분해서 하루 단위로 먼저 알린다."""
-    await sync_operated_status()
+    await sync_operated_status(strict=True)  # Task #194: untrusted reads must fail the job
 
     yesterday = str(today_kst() - timedelta(days=1))
     # Task #194: a failed read must surface as a job failure (retry), not as a
@@ -7698,11 +7738,18 @@ async def check_daily_ingestion_detail():
     else:
         return None
 
-    try:
-        await send_telegram_broadcast(msg)
-        logger.info(f"세분화 인입알림 발송: {yesterday} source={source} operated={operated}")
-    except Exception as e:
-        logger.error(f"세분화 인입알림 발송 실패: {e}")
+    # Task #194 (CASSANDRA 5067 F3): a delivery failure must reach the scheduler.  The
+    # old code swallowed it and the job was recorded as OK although nobody was told.
+    # No recipient reached (sent == 0) raises -> FAIL record -> retried.  Partial delivery
+    # (one chat reached) counts as delivered: resending would duplicate to that chat.
+    result = await send_telegram_broadcast(msg)
+    sent = result.get("sent", 0) if isinstance(result, dict) else 0
+    failed = result.get("failed", 0) if isinstance(result, dict) else 0
+    if sent <= 0:
+        raise RuntimeError(f"ingestion alert not delivered (sent={sent} failed={failed})")
+    if failed:
+        logger.error(f"세분화 인입알림 부분 발송: sent={sent} failed={failed}")
+    logger.info(f"세분화 인입알림 발송: {yesterday} source={source} operated={operated}")
     return {"날짜": yesterday, "source": source, "operated": operated}
 
 
