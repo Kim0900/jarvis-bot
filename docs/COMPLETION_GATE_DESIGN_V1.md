@@ -1,9 +1,24 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.8 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.9 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.8). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.9). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.8 → v1.9 (제출 전 독립 검토 에이전트의 적대적 검토 결과)
+작성자와 컨텍스트를 공유하지 않는 별도 검토자(코드·문서와 운영 사실만 제공, 기존 시험 결과·결론 미제공)에게 공격만 시켰다. 재현 5건·의심 4건 중 판정:
+| 구분 | 내용 | 판정·조치 |
+|---|---|---|
+| 수정 | 검증자 이벤트에서 복사하는 `last_verdict`·`last_stage`·`tier_recorded`가 무제한 길이·임의 문자(예: 지시문처럼 보이는 문장, 30MB 문자열)로 위반 이벤트 payload에 들어감. MAGI 에이전트가 이 이벤트를 읽으므로 프롬프트 주입·부풀림 경로 | 기록 시 `[A-Z0-9_]` 토큰으로 정제하고 32자로 제한(판정은 정제 전 값으로 수행). 시험 F 추가 |
+| 수정 | `create trigger`가 재실행 불가 | `drop trigger if exists` 후 생성 |
+| 수정(문서) | "전이를 막지 않는다"는 서술이 statement 취소(timeout) 예외까지 보장하지 않음. 운영 anon의 `statement_timeout`은 3초. 한 태스크에 anon이 이벤트를 대량 삽입하면 완료 UPDATE가 취소될 수 있음(재현: 40만 건, 150ms 설정). 운영 실측 태스크당 최대 이벤트 817건이라 현재는 해당 없음 | 서술 정정(7절). 쿼리 범위 제한은 판정 의미를 바꾸므로 이번에는 채택하지 않고 관찰 기간에 이벤트 수 모니터링 |
+| 운영 실측으로 해당 없음 | `OLD.status`가 NULL이면 트리거가 발동하지 않음 | 운영 `magi_tasks.status`는 NOT NULL이다(실측). 시험 스키마도 NOT NULL로 맞춤 |
+| 운영 실측으로 해당 없음 | anon이 public 스키마에 객체를 만들 수 있으면 search_path 순서 영향 | 운영 anon의 public CREATE 권한 false(실측). pg_catalog 우선 + 한정 이름으로 이중 방어 |
+| **설계 밖, 별도 조치 권고(7절)** | anon이 `OVERRIDING SYSTEM VALUE`로 `event_id`를 직접 지정해 위조한 카산드라 PASS를 항상 "최신"으로 고정할 수 있음. 운영에서 anon의 events INSERT·event_id 컬럼 INSERT 권한이 모두 true(실측). 위조 PASS와 증거를 함께 삽입하면 게이트가 위반을 기록하지 않음 | 게이트 설계로 막을 수 없는 쓰기 권한 문제이며, 카산드라가 이미 수용한 "actor 위조 불가 방지" 한계의 더 강한 형태다. **마기·대표 결정 사항으로 분리:** anon의 events INSERT에서 event_id·actor 컬럼 권한 제거 또는 쓰기 경로를 서비스 키로 한정 |
+| 설계 밖(수용) | vr을 완료 이전의 별도 UPDATE로 끈 경우 미탐지 | 카산드라 5028이 수용한 한계(변경 없음). 해결하려면 vr 변경 감시 트리거 추가 필요 |
+| 의심(미재현) | 동시 트랜잭션의 미커밋 철회·FAIL이 보이지 않음 | READ COMMITTED의 본질적 한계로 7절에 명시 |
+시험(로컬 임시 PostgreSQL 16, 참고치): **32,606 조합 불일치 0**(F 정제 시험 6건 추가), 시나리오 29/29, 운영 실제 이력 13태스크 재생 HARD 3 / REVIEW 10 유지, 정제를 빼면 F 6건 전부 실패. 운영 PostgreSQL 독립 재현은 카산드라 몫.
+검토자가 이상 없음으로 확인한 범위: 비소유자의 트리거 비활성화·session_replication_role 변경·함수 교체·직접 실행 모두 거부됨, INSERT·COPY·ON CONFLICT DO UPDATE·다중 행 UPDATE ... FROM 모두 발동, 종료 상태 간 재전이 비재발동, 재오픈 후 재발동, 소문자·공백 status는 CHECK가 거부, event_type 뒤 공백은 안전 방향(REVIEW), 철회 정규식은 단어 경계와 `$` 처리 정상, SECURITY DEFINER의 search_path·한정 이름·RLS 우회 정상, 모든 쿼리가 task_id 인덱스 사용.
+
 ### v1.7 → v1.8 (카산드라 5028 FAIL: F1 HIGH, F2 MEDIUM)
 | 지적 | 확인 | 조치 |
 |---|---|---|
@@ -75,7 +90,7 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 - evidence_registry 테이블은 완료된 verification_required 태스크에서 쓰이지 않는다(0행). 실제 증거 기록은 magi_task_events 이벤트다.
 - **신규 실측 (v1.1 설계 근거):** actor=CASSANDRA 이벤트 중 `payload.verdict`가 있는 것은 4965~4970 6건뿐이고 나머지 과거 이벤트는 자유서술이다. 값 어휘: PARTIAL_PASS, HOLD, FAIL_DESIGN, FAIL_PATCH. 과거 본문은 `PASS`로 시작해도 300자 안에 HOLD·FAIL 같은 단어가 흔히 섞여, 정규식으로 PASS를 안전하게 판정하는 방법이 없다(시도한 보수 규칙에서 PASS 시작 본문 다수가 판정불가로 남음). → 본문 해석은 포기하고 구조화값을 기준으로 한다.
 
-## 2. 판정 규칙 v1.8 (관찰 모드)
+## 2. 판정 규칙 v1.9 (관찰 모드)
 대상: `(NEW.verification_required IS TRUE OR OLD.verification_required IS TRUE) AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`. (OLD도 보는 이유: 같은 UPDATE에서 verification_required를 끄며 완료하는 우회를 막기 위함. 그 경우 REVIEW `VERIFICATION_REQUIRED_CLEARED`가 붙는다.)
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
@@ -149,7 +164,7 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 - 이벤트 insert는 magi_tasks를 건드리지 않아 재귀 없음. `fn_inherit_domain_from_task`가 domain을 채운다.
 - 쓰기 경로 회귀: (a) 봇 PATCH `approve_task`, (b) 마기(자동) COMPLETED(vr=false → 대상 아님), (c) 에이전트 직접 SQL UPDATE, (d) 비상태 컬럼 UPDATE(트리거 미발동)를 롤백 트랜잭션 안에서 전/후 비교.
 
-## 5. 초안 SQL v1.8 (미적용)
+## 5. 초안 SQL v1.9 (미적용)
 ```sql
 create or replace function public.fn_completion_gate_observe() returns trigger
 language plpgsql security definer set search_path = pg_catalog, public, pg_temp as $$
@@ -244,7 +259,11 @@ begin
         jsonb_build_object('mode','observe',
           'gate_level', case when array_length(v_hard,1) > 0 then 'WARN' else 'REVIEW' end,
           'reasons', v_hard||v_rev,'op',TG_OP,'from_status',v_old_status,'to_status',NEW.status,'task_priority',NEW.priority,
-          'last_judgment_event_id', v_jid,'last_verdict', v_ver,'last_stage', v_stage,'tier_recorded', v_tier,
+          'last_judgment_event_id', v_jid,
+          -- values copied from attacker-writable payloads are reduced to short [A-Z0-9_] tokens (agents read these events)
+          'last_verdict', nullif(left(regexp_replace(coalesce(v_ver,''), '[^A-Z0-9_]', '', 'g'), 32), ''),
+          'last_stage', nullif(left(regexp_replace(coalesce(v_stage,''), '[^A-Z0-9_]', '', 'g'), 32), ''),
+          'tier_recorded', nullif(left(regexp_replace(upper(coalesce(v_tier,'')), '[^A-Z0-9_]', '', 'g'), 32), ''),
           'verdict_class', v_class,
           'checks', jsonb_build_object('independent_evidence',v_c1,'cassandra_events',v_cass_total,
             'secondary_pass_recorded',v_sec_pass,'secondary_events_recorded',v_sec_other)));
@@ -256,6 +275,7 @@ begin
 end $$;
 revoke all on function public.fn_completion_gate_observe() from public, anon, authenticated;
 
+drop trigger if exists trg_magi_tasks_completion_gate_observe on public.magi_tasks;
 create trigger trg_magi_tasks_completion_gate_observe
 after update of status on public.magi_tasks
 for each row
@@ -264,6 +284,7 @@ when ((NEW.verification_required is true or OLD.verification_required is true) a
 execute function public.fn_completion_gate_observe();
 
 -- a task created directly in a terminal state with verification_required = true never passes through an UPDATE
+drop trigger if exists trg_magi_tasks_completion_gate_observe_ins on public.magi_tasks;
 create trigger trg_magi_tasks_completion_gate_observe_ins
 after insert on public.magi_tasks
 for each row
@@ -290,7 +311,7 @@ execute function public.fn_completion_gate_observe();
 **(b) 증거 이벤트 타입 20종 판정: 20/20 일치.** 허용 7(EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE) / 불허 13(VERIFICATION_COMPLETED, CASSANDRA_VALIDATION, CASSANDRA_DESIGN_PASS, IMPLEMENTATION_READY_FOR_VERIFICATION, VERIFICATION_READY, VERIFICATION_REQUESTED, IMPLEMENTATION_REQUESTED, VERIFICATION_REQUEST, CASSANDRA_VALIDATION_REQUESTED, CASSANDRA_EVIDENCE_REQUEST, DESIGN_V2_EVIDENCE_REQUIREMENTS, CASSANDRA_REVALIDATION_REQUESTED, IMPLEMENTATION_PATCH_COMMITTED_REVALIDATION_REQUIRED).
 **(c) verdict·stage 분류 15/15 일치(읽기 전용 SELECT):** PARTIAL_PASS/FINAL, FAIL_DESIGN(과도기 값), HOLD/FINAL, FAIL/DESIGN → NEG / PASS+FINAL, 소문자 pass+final → PASS_FINAL / PASS 단계 누락, PASS+IMPLEMENTATION, 비표준 PASS_FINAL → PASS_PARTIAL_STAGE / PASS+DESIGN, 과도기 PASS_DESIGN, PASS+FINAL이지만 설계 검증 event_type → PASS_DESIGN / MAYBE → UNKNOWN / 판정값 없는 과거 이벤트 → 비구조 / 카산드라가 아닌 actor의 PASS+FINAL → 불인정.
 **(d) 13건 백테스트 재실행:** 3절 표.
-**(f) v1.8 전수 조합 시험: 32,600 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
+**(f) v1.9 전수 조합 시험: 32,606 조합 불일치 0** (0절, `tests/sql/task197_gate_matrix.py`, 변이 3종 검출 확인). 참고치이며 운영 PostgreSQL 독립 재현은 카산드라의 몫.
 **(e) 임시 로컬 PostgreSQL 16에서 실제 트리거 실행: 29/29 통과 (v1.5: 운영과 같은 RLS·identity 스키마, anon 경로 A1·A2 추가 / v1.8: S1 임시 테이블 shadowing, I1~I4 INSERT 경로)** (운영이 아닌 이 작업 환경의 임시 서버, 최소 대역 스키마. 재현: `tests/sql/task197_gate_local_dryrun.py`, 스키마 `tests/sql/task197_gate_schema.sql`). 함수·트리거 생성, 양성 13(P1~P13: 위 (a)의 10개 이력 + 구형 NULL payload, 미정의 판정값, 단계 누락, 타 actor PASS, evidence_kind 경로), 음성 6(N1~N6: 증거+PASS 정상, HOLD 뒤 PASS 최신 우선, vr=false, 비완료 전이, 판정 아닌 카산드라 이벤트, COMPLETED→CLOSED 비재발동 및 재오픈 후 재발동), 회귀 3(R1 fail-open: 위반 이벤트 insert가 막혀도 UPDATE 성공+경고, R3 위반 이벤트에 순라 키·표식 없음, anon 실행 권한 없음).
 **시험 중 발견·수정한 결함 2건:**
 1. (읽기 전용 단계) payload가 NULL인 과거 이벤트가 `NOT NULL`로 평가돼 구형 10건이 HARD로 잘못 분류됨 → 모든 곳에 `coalesce(payload ? 'verdict', false)`.
@@ -303,6 +324,9 @@ execute function public.fn_completion_gate_observe();
 종료증거: 위 시험 결과 이벤트 + 카산드라 독립 PASS. 관찰 2주 후 위반 집계·오탐 검토를 마기에 보고하고, 거부 전환은 별도 설계·승인.
 
 ## 7. 미확인/한계
+- (v1.9 정정) "전이를 막지 않는다"는 내부 오류에는 해당하지만 statement 취소(statement_timeout, 운영 anon 3초)는 포함하지 않는다. 한 태스크에 이벤트가 수십만 건 쌓이면 완료 UPDATE가 취소될 수 있다(현재 태스크당 최대 817건).
+- (v1.9) 쓰기 권한 문제: 운영에서 anon이 events에 INSERT할 수 있고 `event_id`·`actor`도 지정할 수 있어, `OVERRIDING SYSTEM VALUE`로 위조 PASS를 최신으로 고정할 수 있다. 게이트로는 막을 수 없고 권한 조정(별도 결정)이 필요하다.
+- (v1.9) 동시 트랜잭션에서 커밋 전 이벤트는 게이트가 보지 못한다(READ COMMITTED).
 - 봇 외 쓰기 경로(마기·카산드라·영실 커넥터)가 `session_replication_role=replica` 등으로 트리거를 우회할 가능성은 이론상 존재(실사용 증거 없음).
 - 판정값 표준 어휘와 카산드라의 기록 관행이 합의되기 전에는 정상 통과 판정이 불가능하다(2.4절).
 - 증거 이벤트 타입 정규식은 현 관행 기준이라 새 타입이 생기면 오탐/미탐 가능 → 관찰 기간에 오탐 목록으로 보정.

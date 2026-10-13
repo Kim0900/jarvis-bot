@@ -2,7 +2,7 @@
 -- event_id identity ALWAYS, RLS enabled (not forced) with anon/service policies, owner bypass,
 -- domain inheritance trigger, status/priority CHECK constraints.
 do $$ begin if not exists (select 1 from pg_roles where rolname='anon') then create role anon; end if; if not exists (select 1 from pg_roles where rolname='authenticated') then create role authenticated; end if; end $$;
-create table magi_tasks(task_id bigserial primary key, title text, status text, priority text, verification_required boolean default false, domain text default 'magi',
+create table magi_tasks(task_id bigserial primary key, title text, status text not null, priority text, verification_required boolean default false, domain text default 'magi',
   constraint magi_tasks_priority_check check (priority = any (array['P0','P1','P2'])),
   constraint magi_tasks_status_check check (status = any (array['CREATED','ASSIGNED','IN_PROGRESS','WAITING','BLOCKED','HANDOFF','REVIEW','VERIFICATION','COMPLETED','HOLD','CANCELLED','CLOSED'])));
 create table magi_task_events(event_id bigint generated always as identity primary key, task_id bigint references magi_tasks(task_id), event_type text not null, old_status text, new_status text, actor text, detail text, created_at timestamptz not null default now(), domain text, source_type text, source_id text, payload jsonb);
