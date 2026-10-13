@@ -3,6 +3,8 @@
 # 작성일: 2026-03-30
 
 import os
+import sys
+import scheduler_daily_jobs
 import io
 import re
 import json
@@ -1644,6 +1646,44 @@ async def sb_insert(table: str, data: dict) -> dict:
 async def sb_select(table: str, params: dict = None) -> list:
     result = await sb_h("GET", table, params=params or {})
     return result if isinstance(result, list) else []
+
+
+class SupabaseReadError(RuntimeError):
+    """A Supabase GET whose answer cannot be trusted (task #194 / CASSANDRA 5067 F1)."""
+
+
+async def sb_get_strict(table: str, params: dict = None) -> list:
+    """Strict PostgREST GET that returns a JSON list or raises.
+
+    ``sb_h`` is lenient on purpose for legacy callers: HTTP 200 with an empty body or
+    invalid JSON becomes ``[]``.  For a guard or aggregate that is indistinguishable
+    from a verified empty table, so here only a non-empty, valid JSON *list* body on
+    HTTP 200 is accepted (a real empty result is the body ``[]``)."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.request("GET", url, headers=HEADERS_SB, params=params or {})
+    except Exception as exc:
+        raise SupabaseReadError(f"{table}: transport {type(exc).__name__}: {exc!r}") from exc
+    if r.status_code != 200:
+        raise SupabaseReadError(f"{table}: HTTP {r.status_code}")
+    if not r.content or not r.content.strip():
+        raise SupabaseReadError(f"{table}: empty 200 body")
+    try:
+        data = r.json()
+    except Exception as exc:
+        raise SupabaseReadError(f"{table}: invalid JSON body") from exc
+    if not isinstance(data, list):
+        raise SupabaseReadError(f"{table}: non-list body {type(data).__name__}")
+    return data
+
+
+async def sb_select_required(table: str, params: dict = None) -> list:
+    """Task #194: for jobs that compute from the result.  ``sb_select`` turns any failed
+    or malformed PostgREST answer into ``[]``, which makes an outage look like "no data"
+    and lets a job write wrong aggregates or report OK.  Here every untrusted answer
+    raises, so the job is recorded as FAIL and retried."""
+    return await sb_get_strict(table, params)
 
 
 async def sb_select_canonical(start_date: str = None, end_date: str = None) -> list:
@@ -6626,34 +6666,47 @@ def geomnuri_patrol_scheduler():
         time.sleep(max(GEOMNURI_PATROL_INTERVAL_SECONDS - elapsed, 30))
 
 
-async def sync_operated_status(days_back: int = 30):
+async def sync_operated_status(days_back: int = 30, strict: bool = False):
     """task#38: 최근 N일에 대해 operated_status를 3단계 소스로 자동채움.
     confirmed(raw_calls존재)/gpx_proxy(raw_calls없음+GPX있음)는 자동확정,
-    둘다없는 날짜만 미확인(pending)으로 남겨 질문 대상이 됨."""
+    둘다없는 날짜만 미확인(pending)으로 남겨 질문 대상이 됨.
+
+    Task #194 (independent review of the F1 fix): with ``strict=True`` a failed or
+    untrusted read raises instead of being treated as "no data".  Otherwise an outage
+    on raw_calls/gpx_sessions/operated_status would stamp every day as
+    ``operated=None, source=None`` and the 04:00 alert would claim "no data at all".
+    The default stays lenient for the other caller (08:00 question flow)."""
     today = today_kst()
     dates = [str(today - timedelta(days=i)) for i in range(1, days_back+1)]
+    read = sb_get_strict if strict else sb_select
 
     raw_dates = set()
     try:
-        rows = await sb_select("raw_calls", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        rows = await read("raw_calls", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         for r in (rows or []):
             if r.get("날짜"): raw_dates.add(r["날짜"])
     except Exception as e:
         logger.error(f"operated_status 동기화 - raw_calls 조회 실패: {e}")
+        if strict:
+            raise
 
     gpx_dates = set()
     try:
-        rows = await sb_select("gpx_sessions", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        rows = await read("gpx_sessions", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         for r in (rows or []):
             if r.get("날짜"): gpx_dates.add(r["날짜"])
     except Exception as e:
         logger.error(f"operated_status 동기화 - gpx_sessions 조회 실패: {e}")
+        if strict:
+            raise
 
     try:
-        existing_rows = await sb_select("operated_status", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
+        existing_rows = await read("operated_status", {"날짜": [f"gte.{dates[-1]}", f"lte.{dates[0]}"]})
         existing = {r["날짜"]: r for r in (existing_rows or [])}
     except Exception as e:
         logger.error(f"operated_status 동기화 - 기존행 조회 실패: {e}")
+        if strict:
+            raise
         existing = {}
 
     pending = []
@@ -7653,14 +7706,12 @@ async def check_daily_ingestion_detail():
     (완전누락만, 최대 3일 지연) 그대로 유지하고, 이 함수는 매일(대기없이)
     + 부분누락(GPX는 있는데 콜/영수증만 없음, source='gpx_proxy')까지
     구분해서 하루 단위로 먼저 알린다."""
-    await sync_operated_status()
+    await sync_operated_status(strict=True)  # Task #194: untrusted reads must fail the job
 
     yesterday = str(today_kst() - timedelta(days=1))
-    try:
-        rows = await sb_select("operated_status", {"날짜": f"eq.{yesterday}"})
-    except Exception as e:
-        logger.error(f"세분화 인입상태 조회 실패({yesterday}): {e}")
-        return None
+    # Task #194: a failed read must surface as a job failure (retry), not as a
+    # silent "nothing to report" that gets recorded as OK.
+    rows = await sb_select_required("operated_status", {"날짜": f"eq.{yesterday}"})
 
     status = rows[0] if rows else None
     if not status:
@@ -7687,11 +7738,18 @@ async def check_daily_ingestion_detail():
     else:
         return None
 
-    try:
-        await send_telegram_broadcast(msg)
-        logger.info(f"세분화 인입알림 발송: {yesterday} source={source} operated={operated}")
-    except Exception as e:
-        logger.error(f"세분화 인입알림 발송 실패: {e}")
+    # Task #194 (CASSANDRA 5067 F3): a delivery failure must reach the scheduler.  The
+    # old code swallowed it and the job was recorded as OK although nobody was told.
+    # No recipient reached (sent == 0) raises -> FAIL record -> retried.  Partial delivery
+    # (one chat reached) counts as delivered: resending would duplicate to that chat.
+    result = await send_telegram_broadcast(msg)
+    sent = result.get("sent", 0) if isinstance(result, dict) else 0
+    failed = result.get("failed", 0) if isinstance(result, dict) else 0
+    if sent <= 0:
+        raise RuntimeError(f"ingestion alert not delivered (sent={sent} failed={failed})")
+    if failed:
+        logger.error(f"세분화 인입알림 부분 발송: sent={sent} failed={failed}")
+    logger.info(f"세분화 인입알림 발송: {yesterday} source={source} operated={operated}")
     return {"날짜": yesterday, "source": source, "operated": operated}
 
 
@@ -7704,7 +7762,7 @@ async def recalc_daily_summary_totals(days_back: int = 14):
     GPX전용 필드는 PostgREST upsert 특성상 미지정시 기존값 그대로 유지됨."""
     end = today_kst()
     start = end - timedelta(days=days_back-1)
-    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = await sb_select_required("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
     rows = exclude_summary_rows(rows or [])
 
     by_date = {}
@@ -7716,13 +7774,20 @@ async def recalc_daily_summary_totals(days_back: int = 14):
         by_date[d]["총건수"] += 1
 
     updated = []
+    failed = []
     for d, v in by_date.items():
         try:
             await sb_upsert("daily_summary", {"날짜": d, "총매출": v["총매출"], "총건수": v["총건수"]}, on_conflict="날짜")
             updated.append(d)
         except Exception as e:
+            failed.append(d)
             logger.error(f"daily_summary 자동갱신 실패({d}): {e}")
-    logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일 ({start}~{end})")
+    logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일, 실패 {len(failed)}일 ({start}~{end})")
+    if failed:
+        # Task #194 (CASSANDRA 5072 F4): every date is still attempted above, but a
+        # partial or total write failure must fail the job so the scheduler records FAIL
+        # and retries (the per-date upsert is idempotent).
+        raise RuntimeError(f"daily_summary upsert failed for {len(failed)}/{len(by_date)} dates: {sorted(failed)}")
     return updated
 
 
@@ -7735,7 +7800,7 @@ async def recalc_7day_average():
     start = end - timedelta(days=6)
     dates = [str(start + timedelta(days=i)) for i in range(7)]
 
-    rows = await sb_select("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
+    rows = await sb_select_required("raw_calls", {"날짜": [f"gte.{start}", f"lte.{end}"]})
     rows = rows or []
 
     unclassified_days = set()
@@ -7795,6 +7860,12 @@ async def recalc_7day_average():
     return snapshot
 
 
+class SnapshotResult(list):
+    """calc_daily_snapshot result (a list, as before) plus ``partial_reason``: None when
+    complete, else why part of the row (GPX idle time) could not be computed."""
+    partial_reason = None
+
+
 async def calc_daily_snapshot(calc_date_str: str = None):
     """명령서#036: 축A(영업일) 기준 일별 5종 계산 — 시간대별/지역별 콜수, 평균단가,
     콜간격, 공차시간. ARGOS_인수인계[3][5] 규칙: 자정(00:00~05:59대) 이후 콜은 전날
@@ -7803,8 +7874,8 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     calc_date = calc_date_str or str(today_kst() - timedelta(days=1))  # 기본: 어제 영업일(당일 새벽 04시 실행 기준)
     next_date = str(datetime.strptime(calc_date, "%Y-%m-%d").date() + timedelta(days=1))
 
-    same_day = await sb_select("raw_calls", {"날짜": f"eq.{calc_date}"}) or []
-    next_day = await sb_select("raw_calls", {"날짜": f"eq.{next_date}"}) or []
+    same_day = await sb_select_required("raw_calls", {"날짜": f"eq.{calc_date}"})
+    next_day = await sb_select_required("raw_calls", {"날짜": f"eq.{next_date}"})
 
     def hour_of(r):
         bt = r.get("배차시각")
@@ -7874,18 +7945,40 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     # 공차시간(근사치): gpx_sessions 구속시간을 "영업거리/총거리" 비율로 분배.
     # 원본 GPX 포인트가 DB에 없어 정밀계산 불가 — 근사치임을 명시.
     avg_idle_min = total_idle_min = None
+    # Task #194: a failed gpx read must fail the job (retry), not store an idle time of NULL as OK.
+    gpx = await sb_select_required("gpx_sessions", {"날짜": f"eq.{calc_date}"})
+    # Task #194 (마기 5079 ②): GPX 공차시간 입력 정책.
+    #  - 그날 GPX 행 없음            -> 정상(공차 NULL, OK)
+    #  - GPX 행은 있으나 구속시간_h/총주행거리_km가 NULL·0 또는 계산 예외
+    #                               -> 스냅샷은 저장하되 PARTIAL 사유를 반환(스케줄러가
+    #                                  OK가 아니라 "PARTIAL: ..."로 기록). 결정적 입력 문제라
+    #                                  예외로 막으면 스냅샷·catch-up이 영구 차단되기 때문.
+    #                                  (실데이터 gpx_sessions 39행 중 구속시간_h NULL 17행)
+    partial_reason = None
     try:
-        gpx = await sb_select("gpx_sessions", {"날짜": f"eq.{calc_date}"})
-        if gpx:
+        if gpx and len(gpx) > 1:
+            # No unique key on 날짜 and no ordering: do not guess which session is right.
+            partial_reason = f"gpx_idle_unavailable: {len(gpx)} gpx rows for one date"
+        elif gpx:
             g = gpx[0]
             총거리 = g.get("총주행거리_km")
             구속시간_h = g.get("구속시간_h")
-            영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
-            if 총거리 and 구속시간_h and 총거리 > 0:
-                공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
-                total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
-                avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
+            missing = [n for n, v in (("구속시간_h", 구속시간_h), ("총주행거리_km", 총거리)) if v is None]
+            if missing:
+                partial_reason = "gpx_idle_unavailable: null " + ",".join(missing)
+            elif 구속시간_h <= 0 or 총거리 <= 0:
+                partial_reason = "gpx_idle_unavailable: non-positive value"
+            else:
+                영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
+                if 총거리 and 구속시간_h and 총거리 > 0:
+                    공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
+                    total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
+                    avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
+                else:
+                    partial_reason = "gpx_idle_unavailable: unusable value"
     except Exception as e:
+        avg_idle_min = total_idle_min = None
+        partial_reason = f"gpx_idle_compute_error: {type(e).__name__}"
         logger.error(f"공차시간(근사) 계산 실패 {calc_date}: {e}")
 
     # task#42: 패턴지표 3종(경산루프/연속콜/배회) — 마기 지시(2026-08-20).
@@ -7954,8 +8047,11 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     if result is None:
         logger.error(f"daily_calc_snapshot 저장 실패(축A={calc_date}) — sb_upsert가 None 반환(RLS/네트워크 등)")
         raise RuntimeError(f"daily_calc_snapshot 저장 실패: calc_date={calc_date}")
-    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}")
-    return result
+    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}"
+                + (f" [PARTIAL {partial_reason}]" if partial_reason else ""))
+    out = SnapshotResult(result if isinstance(result, list) else [result])
+    out.partial_reason = partial_reason
+    return out
 
 
 async def dual_verify_7day_average() -> dict:
@@ -8531,7 +8627,7 @@ def fish_scheduler(app):
     last_reset_day = -1
     last_recalc_day = -1
     last_dualverify_day = -1
-    last_kpi7day = -1
+    daily_job_state = scheduler_daily_jobs.DailyJobState()
     last_orch_run_ts = 0.0
     last_magi_review_ts = 0.0
 
@@ -8563,34 +8659,14 @@ def fish_scheduler(app):
                 except Exception as e:
                     logger.error(f"마기(자동)검증 실행 실패: {e}")
 
-            # ── 명령서#035+#036: 매일 04:00 7일평균(축B) + 일별5종(축A) 계산 + daily_summary 자동갱신
-            if now.hour == 4 and now.day != last_kpi7day:
-                try:
-                    loop.run_until_complete(recalc_daily_summary_totals())
-                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals"))
-                except Exception as e:
-                    logger.error(f"daily_summary 자동갱신 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {e}"))
-                try:
-                    loop.run_until_complete(recalc_7day_average())
-                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average"))
-                except Exception as e:
-                    logger.error(f"7일평균(명령서#035) 재계산 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("recalc_7day_average", f"FAIL: {e}"))
-                try:
-                    loop.run_until_complete(calc_daily_snapshot())
-                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot"))
-                except Exception as e:
-                    logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("calc_daily_snapshot", f"FAIL: {e}"))
-                # ── task#69: 04:00 세분화 인입알림(부분누락 gpx_proxy 포함, 매일체크)
-                try:
-                    detail = loop.run_until_complete(check_daily_ingestion_detail())
-                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", str(detail) if detail else "OK"))
-                except Exception as e:
-                    logger.error(f"세분화 인입알림(task#69) 실패: {e}")
-                    loop.run_until_complete(mark_scheduler_run("check_daily_ingestion_detail", f"FAIL: {e}"))
-                last_kpi7day = now.day
+            # ── 명령서#035+#036 / Task #194: 04시 일일 통계 4종은 scheduler_daily_jobs 단일 경로.
+            # 운영은 sitecustomize.fish_scheduler가 같은 모듈을 호출한다(두 갈래 방지).
+            try:
+                loop.run_until_complete(
+                    scheduler_daily_jobs.run_daily_jobs(sys.modules[__name__], now, daily_job_state)
+                )
+            except Exception as e:
+                logger.error("Task194 daily jobs dispatch error: %s: %r", type(e).__name__, e)
 
             # ── task_id=31 긴급대응: 매일 08:00 인입중단 조기감지
             if now.hour == 8 and now.day != last_dualverify_day:

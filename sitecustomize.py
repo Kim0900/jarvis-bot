@@ -366,6 +366,8 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
     if getattr(legacy, "_magi_scheduler_dispatch_patched", False):
         return
 
+    import scheduler_daily_jobs  # Task #194: single dispatch path for the 04:00 jobs
+
     def fish_scheduler(app: Any) -> None:
         # CASPER 긴급수정(2026-08-29): 기존엔 "정각 브리핑을 AI작업보다 먼저
         # 실행"하는 순서만 있었는데, 이건 "같은 루프 반복 안에서의 순서"만
@@ -451,6 +453,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_recalc_day = -1
         last_dualverify_day = -1
         last_kpi7day = -1
+        daily_job_state = scheduler_daily_jobs.DailyJobState()
         last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
@@ -491,62 +494,19 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                     except Exception as exc:
                         legacy.logger.error(f"마기(자동)검증 실행 실패: {exc}")
 
+                # Task #194: the four daily statistics jobs run through one module
+                # (scheduler_daily_jobs) that reads success state fail-closed, retries
+                # failures inside a bounded morning window and never stores an empty error.
+                try:
+                    _outcomes = loop.run_until_complete(
+                        scheduler_daily_jobs.run_daily_jobs(legacy, now, daily_job_state)
+                    )
+                    if any(v not in ("done", "outside_window", "cooldown") for v in _outcomes.values()):
+                        legacy.logger.info("Task194 daily jobs tick: %s", _outcomes)
+                except Exception as exc:
+                    legacy.logger.error(f"Task194 daily jobs dispatch error: {type(exc).__name__}: {exc!r}")
                 if now.hour == 4:
-                    try:
-                        kpi7day_done = loop.run_until_complete(legacy.already_ran_today_kst("calc_daily_snapshot"))
-                    except Exception as exc:
-                        legacy.logger.error(f"already_ran_today_kst(calc_daily_snapshot) 조회 실패: {exc}")
-                        kpi7day_done = False
-                    if not kpi7day_done:
-                        try:
-                            loop.run_until_complete(legacy.recalc_daily_summary_totals())
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals"))
-                        except Exception as exc:
-                            legacy.logger.error(f"daily_summary 자동갱신 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_daily_summary_totals", f"FAIL: {exc}"))
-                        try:
-                            loop.run_until_complete(legacy.recalc_7day_average())
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average"))
-                        except Exception as exc:
-                            legacy.logger.error(f"7일평균(명령서#035) 재계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("recalc_7day_average", f"FAIL: {exc}"))
-                        try:
-                            loop.run_until_complete(legacy.calc_daily_snapshot())
-                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot"))
-                        except Exception as exc:
-                            legacy.logger.error(f"daily_calc_snapshot(명령서#036) 계산 실패: {exc}")
-                            loop.run_until_complete(legacy.mark_scheduler_run("calc_daily_snapshot", f"FAIL: {exc}"))
                     last_kpi7day = now.day
-
-                    # task#69: 세분화 인입알림은 KPI 3종과 독립적으로 하루 1회 실행.
-                    # task#146 DB기반 재시작내성 가드 원칙을 동일 적용하여,
-                    # 재배포/재시작 또는 다른 04시 작업 완료 여부와 무관하게 보장한다.
-                    try:
-                        ingestion_detail_done = loop.run_until_complete(
-                            legacy.already_ran_today_kst("check_daily_ingestion_detail")
-                        )
-                    except Exception as exc:
-                        legacy.logger.error(
-                            f"already_ran_today_kst(check_daily_ingestion_detail) 조회 실패: {exc}"
-                        )
-                        ingestion_detail_done = False
-                    if not ingestion_detail_done:
-                        try:
-                            detail = loop.run_until_complete(legacy.check_daily_ingestion_detail())
-                            loop.run_until_complete(
-                                legacy.mark_scheduler_run(
-                                    "check_daily_ingestion_detail",
-                                    str(detail) if detail else "OK",
-                                )
-                            )
-                        except Exception as exc:
-                            legacy.logger.error(f"세분화 인입알림(task#69) 실패: {exc}")
-                            loop.run_until_complete(
-                                legacy.mark_scheduler_run(
-                                    "check_daily_ingestion_detail",
-                                    f"FAIL: {exc}",
-                                )
-                            )
 
                 if now.hour == 8:
                     try:
