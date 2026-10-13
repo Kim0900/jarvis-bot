@@ -72,7 +72,7 @@ async def enqueue(legacy: Any, job_name: str, service_date: str | date, body: st
             "state": "PENDING",
         }
         result = await _post(
-            legacy, "task194_notification_outbox", payload,
+            legacy, "task194_notification_outbox?on_conflict=dedupe_key", payload,
             prefer="resolution=ignore-duplicates,return=representation",
         )
         if not isinstance(result, list):
