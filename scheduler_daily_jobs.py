@@ -132,6 +132,11 @@ async def job_state_today(legacy: Any, job_name: str, now: datetime) -> str:
     if parsed.date() != now.date():
         return "none"
     result = row.get("last_result")
+    # CASSANDRA 5072 F5: scheduler_status.last_result is nullable.  A row stamped today
+    # whose result is null / blank / not a string is ambiguous, not "never ran": running
+    # again could repeat a notification.  Explicit FAIL rows keep their retry semantics.
+    if not isinstance(result, str) or not result.strip():
+        raise SchedulerStateUnknown("last_result missing, null or blank")
     if is_claim_result(result):
         return "claimed"
     return "success" if is_success_result(result) else "none"

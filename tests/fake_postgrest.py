@@ -22,6 +22,8 @@ class FakePostgREST:
         self.fail_methods: set[str] | None = None  # None = every method
         # GET answers that are HTTP 200 but untrustworthy: None | "empty" | "badjson" | "dict"
         self.get_quirk: str | None = None
+        # {table: substring}: a POST to `table` whose body contains the substring answers 503
+        self.fail_body_contains: dict[str, str] = {}
         self.requests: list[tuple[str, str]] = []
         self._lock = threading.Lock()
         outer = self
@@ -59,6 +61,10 @@ class FakePostgREST:
                             self.connection.close()
                             return
                         self._send(503, {"message": "PGRST002 schema cache unavailable"})
+                        return
+                    needle = outer.fail_body_contains.get(table)
+                    if needle and method == "POST" and needle.encode() in body:
+                        self._send(503, {"message": "injected per-row write failure"})
                         return
                     params = parse_qsl(url.query, keep_blank_values=True)
                     rows = outer.tables.setdefault(table, [])

@@ -54,6 +54,7 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.srv.fail_tables = None
         self.srv.fail_methods = None
         self.srv.get_quirk = None
+        self.srv.fail_body_contains = {}
         self.send_result = {"sent": 1, "failed": 0}
         self.srv.requests.clear()
         self.patches = [
@@ -255,6 +256,67 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.send_result = {"sent": 1, "failed": 1}
         out = await self.tick()
         self.assertEqual(out["check_daily_ingestion_detail"], "ok")
+
+    # CASSANDRA 5072 F4: per-date daily_summary write failures must fail the job
+    def add_second_day(self):
+        self.other_day = str(self.now.date() - timedelta(days=2))
+        self.srv.tables["raw_calls"].append({
+            "날짜": self.other_day, "콜유형": "일반", "요금": 8000,
+            "배차시각": f"{self.other_day}T20:10:00+09:00", "verify_status": "verified"})
+
+    def summary_dates(self):
+        return sorted(r["날짜"] for r in self.srv.tables.get("daily_summary", []))
+
+    async def test_one_of_two_daily_summary_writes_failing_is_FAIL_then_recovers(self):
+        self.add_second_day()
+        self.srv.fail_body_contains = {"daily_summary": self.other_day}
+        out = await self.tick()
+        self.assertEqual(out["recalc_daily_summary_totals"], "failed", out)
+        status = self.status("recalc_daily_summary_totals")
+        self.assertTrue(status.startswith("FAIL:") and self.other_day in status, status)
+        self.assertEqual(self.summary_dates(), [self.yesterday])  # the healthy date was still saved
+        self.srv.fail_body_contains = {}
+        self.clock.advance(sdj.retry_interval_seconds() + 1)
+        out = await self.tick(now=self.now + timedelta(minutes=20))
+        self.assertEqual(out["recalc_daily_summary_totals"], "ok", out)
+        self.assertEqual(self.summary_dates(), sorted([self.yesterday, self.other_day]))
+        self.assertEqual(self.status("recalc_daily_summary_totals"), "OK")
+
+    async def test_all_daily_summary_writes_failing_is_FAIL_not_OK(self):
+        self.add_second_day()
+        self.srv.fail_mode = "503"
+        self.srv.fail_tables = {"daily_summary"}
+        self.srv.fail_methods = {"POST"}
+        out = await self.tick()
+        self.assertEqual(out["recalc_daily_summary_totals"], "failed", out)
+        self.assertTrue(self.status("recalc_daily_summary_totals").startswith("FAIL:"))
+        self.srv.fail_mode = self.srv.fail_tables = self.srv.fail_methods = None
+        self.clock.advance(sdj.retry_interval_seconds() + 1)
+        out = await self.tick(now=self.now + timedelta(minutes=20))
+        self.assertEqual(out["recalc_daily_summary_totals"], "ok", out)
+        self.assertEqual(len(self.summary_dates()), 2)
+
+    # CASSANDRA 5072 F5: null / blank result is ambiguous, FAIL still retries
+    async def test_null_blank_result_rows_run_nothing(self):
+        for label, row in (("null", {"last_result": None}), ("blank", {"last_result": ""}),
+                           ("spaces", {"last_result": "   "}), ("missing", {})):
+            with self.subTest(case=label):
+                self.srv.tables["scheduler_status"] = [
+                    {"job_name": j, "last_run_at": self.now.isoformat(), **row} for j in sdj.DAILY_JOBS]
+                self.srv.requests.clear()
+                self.sent.clear()
+                self.state = sdj.DailyJobState()
+                out = await self.tick()
+                self.assertEqual(set(out.values()), {"state_unknown"}, out)
+                self.assertEqual(self.posts("daily_summary") + self.posts("kpi_7day_snapshot")
+                                 + self.posts("daily_calc_snapshot") + self.posts("scheduler_status"), 0)
+                self.assertEqual(self.sent, [])
+
+    async def test_explicit_fail_row_still_retries(self):
+        self.srv.tables["scheduler_status"] = [
+            {"job_name": j, "last_run_at": self.now.isoformat(), "last_result": "FAIL: X"} for j in sdj.DAILY_JOBS]
+        out = await self.tick()
+        self.assertEqual({out[j] for j in JOBS[:3]}, {"ok"}, out)
 
     # independent review: the alert path's own reader (sync_operated_status) must be strict too
     async def test_sync_read_outage_never_produces_false_no_data_alert(self):

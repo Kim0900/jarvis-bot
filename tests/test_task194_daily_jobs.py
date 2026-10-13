@@ -260,6 +260,32 @@ class DailyJobsTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.lg.calls["check_daily_ingestion_detail"], 1)
         self.assertEqual(out["check_daily_ingestion_detail"], "ok")
 
+    async def test_null_blank_missing_last_result_is_state_unknown_not_rerun(self):
+        for value in (None, "", "   ", 7):
+            with self.subTest(value=value):
+                lg = FakeLegacy()
+                lg.rows = {n: {"job_name": n, "last_run_at": kst(4).isoformat(), "last_result": value}
+                           for n in sdj.DAILY_JOBS}
+                out = await sdj.run_daily_jobs(lg, kst(4, 30), sdj.DailyJobState(), self.clock, jobs=lg.actions())
+                self.assertEqual(set(out.values()), {"state_unknown"}, out)
+                self.assertEqual(sum(lg.calls.values()), 0)
+        lg = FakeLegacy()
+        lg.rows = {n: {"job_name": n, "last_run_at": kst(4).isoformat()} for n in sdj.DAILY_JOBS}  # key absent
+        out = await sdj.run_daily_jobs(lg, kst(4, 30), sdj.DailyJobState(), self.clock, jobs=lg.actions())
+        self.assertEqual(set(out.values()), {"state_unknown"})
+
+    async def test_explicit_fail_and_yesterdays_null_still_run(self):
+        lg = FakeLegacy()
+        lg.rows = {n: {"job_name": n, "last_run_at": kst(4).isoformat(), "last_result": "FAIL: X"}
+                   for n in sdj.DAILY_JOBS}
+        out = await sdj.run_daily_jobs(lg, kst(5), sdj.DailyJobState(), self.clock, jobs=lg.actions())
+        self.assertEqual(set(out.values()), {"ok"})
+        lg = FakeLegacy()
+        lg.rows = {n: {"job_name": n, "last_run_at": (kst(4) - timedelta(days=1)).isoformat(), "last_result": None}
+                   for n in sdj.DAILY_JOBS}
+        out = await sdj.run_daily_jobs(lg, kst(5), sdj.DailyJobState(), self.clock, jobs=lg.actions())
+        self.assertEqual(set(out.values()), {"ok"})
+
     async def test_claim_without_outcome_blocks_resend_after_restart(self):
         # process 1 claimed, sent, then died / lost the outcome write
         self.lg.rows["check_daily_ingestion_detail"] = {

@@ -7774,13 +7774,20 @@ async def recalc_daily_summary_totals(days_back: int = 14):
         by_date[d]["총건수"] += 1
 
     updated = []
+    failed = []
     for d, v in by_date.items():
         try:
             await sb_upsert("daily_summary", {"날짜": d, "총매출": v["총매출"], "총건수": v["총건수"]}, on_conflict="날짜")
             updated.append(d)
         except Exception as e:
+            failed.append(d)
             logger.error(f"daily_summary 자동갱신 실패({d}): {e}")
-    logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일 ({start}~{end})")
+    logger.info(f"daily_summary 자동갱신 완료: {len(updated)}일, 실패 {len(failed)}일 ({start}~{end})")
+    if failed:
+        # Task #194 (CASSANDRA 5072 F4): every date is still attempted above, but a
+        # partial or total write failure must fail the job so the scheduler records FAIL
+        # and retries (the per-date upsert is idempotent).
+        raise RuntimeError(f"daily_summary upsert failed for {len(failed)}/{len(by_date)} dates: {sorted(failed)}")
     return updated
 
 
