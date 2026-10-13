@@ -1,9 +1,17 @@
-# TASK#197 완료 게이트(관찰 모드) 설계 v1.9 (캐스퍼, 2026-10-12 KST)
+# TASK#197 완료 게이트(관찰 모드) 설계 v1.9.1 (캐스퍼, 2026-10-12 KST)
 
-상태: 설계 단계(v1.9). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
+상태: 설계 단계(v1.9.1, SQL은 v1.9와 동일). DB·코드·배포 변경 없음. 운영 적용은 카산드라 설계 재검증 PASS 이후.
 범위(마기 지시): verification_required=true 태스크가 증거 이벤트·카산드라 PASS 없이 COMPLETED/CLOSED로 전이되면 위반 이벤트를 기록한다. 1차는 관찰(경고만), 거부 전환은 2주 관찰 후 별도 승인.
 
 ## 0. 변경 이력
+### v1.9 → v1.9.1 (카산드라 5031 CONDITIONAL, 문서 정합만 — SQL 무변경)
+카산드라 5031은 5028의 필수 보완과 이후 개정(최신 판정·철회·재증거·vr 동시 변경·출력 정제)을 코드로 확인하고 **설계 PASS 없이 CONDITIONAL**로 판정했다. 조건 2건:
+| 조건 | 조치 |
+|---|---|
+| 조건2 SPEC_SQL_CONSISTENCY(설계 PASS 전 필수): 2.1/2.2 산문이 구버전 부분 문자열 판정을 설명 | 2.1·2.2·2.3을 v1.9 SQL(정확 일치 허용 목록, 철회 단어 게이트, PASS 뒤 후속 이벤트 점검, JSON 객체 조건, 출력 정제, INSERT 경로)과 일치하도록 다시 씀. 2.5 승인 기준 표 추가. **SQL 블록은 v1.9와 바이트 단위로 동일**(해시 대조, 아래 시험) |
+| 조건1 RECORD_TRUST_BOUNDARY(관찰 배포 전 또는 마기 위험 수용 전): anon이 events에 event_id·actor·payload를 지정해 쓸 수 있어 위조 가능 | 8절 신설: "관찰 전용·위조 방지 기능 없음" 명시, 수용 문안(안), 조치 후보 A/B/C와 사전 확인 사항, 거부 모드 선결 조건 연결. **결정은 마기·대표 몫**이며 캐스퍼는 권한을 변경하지 않음 |
+시험: SQL 블록 해시가 v1.9(b35e208)와 동일함을 확인했고, 시험 스위트 결과는 v1.9와 같다(32,606 조합 0 불일치, 29/29). 운영 롤백 리허설은 설계 PASS 이후.
+
 ### v1.8 → v1.9 (제출 전 독립 검토 에이전트의 적대적 검토 결과)
 작성자와 컨텍스트를 공유하지 않는 별도 검토자(코드·문서와 운영 사실만 제공, 기존 시험 결과·결론 미제공)에게 공격만 시켰다. 재현 5건·의심 4건 중 판정:
 | 구분 | 내용 | 판정·조치 |
@@ -94,24 +102,29 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 대상: `(NEW.verification_required IS TRUE OR OLD.verification_required IS TRUE) AND NEW.status IN ('COMPLETED','CLOSED') AND OLD.status NOT IN ('COMPLETED','CLOSED')`. (OLD도 보는 이유: 같은 UPDATE에서 verification_required를 끄며 완료하는 우회를 막기 위함. 그 경우 REVIEW `VERIFICATION_REQUIRED_CLEARED`가 붙는다.)
 
 ### 2.1 카산드라 판정 이벤트 선택과 분류
-**선택(구조화 여부를 보기 전에):** 같은 태스크에서 `actor ILIKE 'CASSANDRA%'` 이고
-`event_type !~* '(REQUEST|REQUIRE)' AND (event_type ~* '(VALIDATION|REVALIDATION|DESIGN_PASS)' OR coalesce(payload ? 'verdict', false))` (요청 제외는 최상위 AND) 인 이벤트 중 **event_id가 가장 큰 1건(J)** 이 현재 판정이다. 새 event_type이라도 payload.verdict가 있으면 판정 이벤트로 본다. 합의 응답·백로그 검토·증거 요청 등 판정이 아닌 카산드라 이벤트는 J 선택에 영향을 주지 않는다.
+**선택(구조화 여부를 보기 전에):** 같은 태스크에서 `actor ILIKE 'CASSANDRA%'` 이고 다음을 모두 만족하는 이벤트 중 **event_id가 가장 큰 1건(J)** 이 현재 판정이다.
+- (최상위 AND) `event_type !~* '(REQUEST|REQUIRE)'`: 요청 이벤트는 payload에 무엇이 적혀 있어도 판정이 아니다.
+- (후보 조건, 하나 이상) `event_type ~* '(VALIDATION|DESIGN_PASS)'`, 또는 event_type이 철회 계열 단어(아래 2.1.1)를 포함, 또는 payload가 **JSON 객체**이고 `verdict` 키가 있음(배열·문자열 payload는 구조화로 보지 않는다).
+후보 조건은 부분 문자열로 넓게 잡아 "판정일 수 있는 이벤트"를 놓치지 않기 위한 것이며, **통과(PASS_FINAL)는 아래처럼 정확 일치 허용 목록에서만** 나온다. 합의 응답·백로그 검토 등 후보가 아닌 카산드라 이벤트는 J 선택에 영향을 주지 않지만, PASS_FINAL 뒤에 오면 2.3의 LATER_CASSANDRA_EVENT_UNCLASSIFIED 점검 대상이다.
+**2.1.1 어휘 일치 원칙:** event_type은 부분 문자열이 아니라 **밑줄로 구분된 단어 단위(철회·부정 단어)** 또는 **정확 일치 허용 목록**으로 판정한다(INVALIDATION이 VALIDATION을 포함하는 식의 오인을 막기 위함). 철회 단어: REVOKED, REVOKE, REVOCATION, INVALIDATED, INVALIDATION, INVALID, WITHDRAWN, WITHDRAWAL, SUPERSEDED, RETRACTED, RETRACTION, CANCELLED, CANCELED, VOID, VOIDED, ROLLBACK, REVERTED, REJECTED. 증거 제외용 부정 단어는 이에 FAILED, FAILURE, STALE, OBSOLETE, MISSING, NOT, NO를 더한다. 어휘 목록은 완전할 수 없으므로 목록 밖 표현은 2.3의 "PASS 뒤 후속 이벤트" 안전망이 잡는다.
 **분류(J에 대해서만):**
-- J가 없음 → NO_JUDGMENT_EVENT. J에 `payload.verdict`가 없음 → LATEST_VERDICT_UNSTRUCTURED(과거에 구조화 PASS가 있어도 인정하지 않음).
+- J가 없음 → NO_JUDGMENT_EVENT.
+- J의 event_type이 철회 단어를 포함 → **HARD LATEST_JUDGMENT_REVOKED**(payload에 PASS/FINAL이 남아 있어도 통과 아님). 이후 새 판정이 나오면 그것이 J다.
+- J에 `payload.verdict`가 없음 → LATEST_VERDICT_UNSTRUCTURED(과거에 구조화 PASS가 있어도 인정하지 않음).
 - 표준 필드(2.4절): `verdict` ∈ {PASS, PARTIAL_PASS, CONDITIONAL, HOLD, FAIL}, `stage` ∈ {DESIGN, IMPLEMENTATION, FINAL}.
 - NEG: verdict(대문자화)가 `^(PARTIAL|HOLD|FAIL|CONDITIONAL|REJECT)`로 시작(과도기 값 FAIL_DESIGN·FAIL_PATCH 포함).
-- PASS_FINAL: verdict가 정확히 `PASS`이고 `stage = FINAL`이며 verdict·event_type에 DESIGN이 없고(대소문자 무관) **event_type에 VALIDATION이 있는 명시 판정 이벤트**일 것.
-- PASS_NON_VALIDATION: PASS+FINAL이지만 판정 이벤트가 아님(합의·안내 등) → REVIEW `PASS_NOT_FROM_VALIDATION_EVENT`.
+- PASS_FINAL: verdict가 정확히 `PASS`이고 `stage = FINAL`이며 verdict·event_type에 DESIGN이 없고(대소문자 무관), **event_type이 최종 판정 허용 목록(대소문자 무관 정확 일치)에 있을 것**: CASSANDRA_VALIDATION, CASSANDRA_REVALIDATION, CASSANDRA_IMPLEMENTATION_VALIDATION, CASSANDRA_IMPLEMENTATION_REVALIDATION, CASSANDRA_FINAL_VALIDATION, CASSANDRA_FINAL_REVALIDATION.
+- PASS_NON_VALIDATION: PASS+FINAL이지만 event_type이 허용 목록에 없음(합의·안내·상태 이벤트 등) → REVIEW `PASS_NOT_FROM_VALIDATION_EVENT`.
 - PASS_DESIGN: PASS 형태인데 stage=DESIGN, 또는 verdict·event_type에 DESIGN 포함.
 - PASS_PARTIAL_STAGE: PASS인데 stage=IMPLEMENTATION, 또는 stage 누락·미정의 값. 최종으로 인정하지 않는다.
 - UNKNOWN: 그 외 모든 값. UNKNOWN은 PASS가 아니다.
 
 ### 2.2 증거 이벤트(C1): 독립 구현·시험 증거만
-같은 태스크에서 다음을 모두 만족하는 이벤트가 1건 이상:
-- (공통 제외, 모든 경로에 적용) actor가 GEOMNURI_PATROL·마기(자동)·COMPLETION_GATE가 아니고 **CASSANDRA%도 아님**, 그리고 `event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'`.
-- (증거 형태, 둘 중 하나) `event_type ~* '(EVIDENCE|IMPLEMENTATION|CI_)'` **또는** `upper(payload.evidence_kind) ∈ {IMPLEMENTATION, TEST, CI, PRODUCTION}`. evidence_kind가 있어도 공통 제외를 우회할 수 없다.
-- 검증 요청·준비·판정(…_REQUESTED, …_READY, …VALIDATION, VERIFICATION_COMPLETED 등)은 증거가 아니다.
-- 한계: 증거의 "내용 충분성"은 판정하지 않는다(존재 여부만). 충분성은 카산드라 판정의 몫. 과거 이벤트 이름에 의존하므로 구형 태스크에서는 증거를 못 알아볼 수 있다(3절 참고).
+같은 태스크에서 다음을 모두 만족하는 이벤트가 1건 이상(가장 최근 증거의 event_id는 PASS 최신성 점검에 쓴다):
+- (공통 제외, 모든 경로에 적용) actor가 GEOMNURI_PATROL·마기(자동)·COMPLETION_GATE가 아니고 **CASSANDRA%도 아님**.
+- (공통 제외) `event_type !~* '(REQUEST|REQUIRE|READY|VALIDATION|VERIFICATION|CASSANDRA)'`, 그리고 event_type에 **부정·철회 단어**(2.1.1: REVOKED, INVALIDATED, WITHDRAWN, FAILED, MISSING, NOT, NO 등)가 단어 단위로 없음. 검증 요청·준비·판정(…_REQUESTED, …_READY, …VALIDATION, VERIFICATION_COMPLETED 등)과 철회·실패·누락 이벤트는 증거가 아니다.
+- (증거 형태, 둘 중 하나) event_type이 **정확 일치 허용 목록**에 있음: EVIDENCE, MAGI_EVIDENCE, EVIDENCE_SUBMITTED, IMPLEMENTATION_EVIDENCE, IMPLEMENTATION_CI_PASS, IMPLEMENTATION_PR_DRAFT_CREATED, TEST_EVIDENCE, CI_EVIDENCE, PRODUCTION_BRIDGE_GATE_EVIDENCE, FINAL_PRODUCTION_HTTP_E2E_EVIDENCE. **또는** `upper(payload.evidence_kind) ∈ {IMPLEMENTATION, TEST, CI, PRODUCTION}`(신규 관행의 확장 경로). evidence_kind가 있어도 공통 제외를 우회할 수 없다.
+- 한계: 증거의 "내용 충분성"은 판정하지 않는다(존재 여부만). 충분성은 카산드라 판정의 몫. 허용 목록은 현재 관행 기준이라 구형 태스크에서는 증거를 못 알아볼 수 있다(REVIEW 수준, 3절 참고). 새 증거 이름이 필요하면 evidence_kind를 쓰거나 목록 확장을 별도 변경으로 검증한다.
 
 ### 2.3 결과 분류
 | 구분 | reason | 조건 |
@@ -122,7 +135,7 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 | REVIEW | NO_JUDGMENT_EVENT | 카산드라 이벤트는 있으나 판정 이벤트가 없음 |
 | REVIEW | DESIGN_PASS_ONLY | J가 PASS_DESIGN |
 | HARD | LATEST_JUDGMENT_REVOKED | J의 event_type이 철회·무효·취소 계열 단어(REVOKED, INVALIDATION, WITHDRAWN, SUPERSEDED 등, 밑줄 경계 단어 일치)이면 payload에 남은 PASS/FINAL과 무관하게 통과 아님 |
-| REVIEW | LATER_CASSANDRA_EVENT_UNCLASSIFIED | J가 PASS_FINAL이어도 그 뒤에 중립 목록(AGREEMENT_RESPONSE, BACKLOG_REVIEW, OPERATIONAL_GUIDANCE, REGRESSION_STARTED; 정확 일치) 밖의 카산드라 이벤트가 있음. 어휘 목록이 예측하지 못한 표현의 철회를 잡는 안전망 |
+| REVIEW | LATER_CASSANDRA_EVENT_UNCLASSIFIED | J가 PASS_FINAL이어도 그 뒤에 중립 목록(AGREEMENT_RESPONSE, CASSANDRA_BACKLOG_REVIEW, CASSANDRA_OPERATIONAL_GUIDANCE, CASSANDRA_REGRESSION_STARTED; 정확 일치) 밖의 카산드라 이벤트가 있음. 어휘 목록이 예측하지 못한 표현의 철회를 잡는 안전망 |
 | REVIEW | EVIDENCE_NEWER_THAN_PASS | J가 PASS_FINAL이나 그보다 나중에 독립 증거 이벤트가 있음(재오픈 후 변경 가능성, 새 검증 필요) |
 | REVIEW | VERIFICATION_REQUIRED_CLEARED | 같은 UPDATE에서 verification_required를 true→false/NULL로 바꾸며 완료한 경우(우회 차단). 트리거 조건은 OLD 또는 NEW가 true |
 | REVIEW | PASS_NOT_FROM_VALIDATION_EVENT | J가 PASS+FINAL이나 event_type이 최종 판정 허용 목록(정확 일치)에 없음 |
@@ -131,8 +144,8 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 - J가 PASS_FINAL이고 C1도 충족이면 기록 없음.
 - HARD가 하나라도 있으면 gate_level=WARN, REVIEW만 있으면 REVIEW. 증거 없음은 REVIEW 수준이지만 위반 이벤트는 반드시 남으므로 미탐은 아니다.
 - v1의 C2'(다른 태스크에 기재된 PASS 추적)는 트리거에서 제거하고 관찰 기간의 배치 보고서로 이동한다.
-- 기록: magi_task_events에 event_type=`COMPLETION_GATE_VIOLATION`, actor=`COMPLETION_GATE`, old/new_status NULL, payload에 mode·gate_level·reasons·last_judgment_event_id·last_verdict·last_stage·verdict_class·checks·전이 전후 상태·task_priority·tier(판정 payload의 기록용 복사).
-- 항상 fail-open: 트리거 내부 오류는 EXCEPTION으로 삼키고 RAISE WARNING만. 거부 모드는 이 설계 범위 밖.
+- 기록: magi_task_events에 event_type=`COMPLETION_GATE_VIOLATION`, actor=`COMPLETION_GATE`, old/new_status NULL, payload에 mode·gate_level·reasons·op(UPDATE|INSERT)·last_judgment_event_id·last_verdict·last_stage·verdict_class·checks·전이 전후 상태·task_priority·tier_recorded. 판정 payload에서 복사하는 verdict·stage·tier는 `[A-Z0-9_]` 32자로 정제한다(에이전트가 읽는 이벤트이므로). 대상 전이: UPDATE of status, 그리고 INSERT 시점에 이미 종료 상태인 경우(0절 v1.8).
+- fail-open: 트리거 내부 오류는 EXCEPTION으로 삼키고 RAISE WARNING만(statement 취소는 예외, 7절). 거부 모드는 이 설계 범위 밖이며, **거부 모드 전환은 8절의 쓰기 권한 경계가 해결된 뒤에만** 검토한다.
 
 ### 2.4 선결 합의 사항과 tier·보조검증 규칙
 마기 4973(조건부 동의), 카산드라 4996(조건부 동의, 설계 PASS 아님)의 응답을 반영한다.
@@ -143,6 +156,15 @@ v1.6 제출(5025) 직후 검증자 관점으로 공격 점검을 새로 수행�
 5. `payload.tier`와 `payload.target`은 위반 이벤트 payload에 기록용으로 복사할 뿐 판정 로직에는 쓰지 않는다.
 6. 어휘를 코드로 강제하는 입력 검사는 이번 범위 밖이다. 관찰 2주 동안 어휘 이탈 건수를 보고서로 세고 필요하면 별도 태스크로 올린다.
 7. 합의 전까지 이 게이트가 낼 수 있는 결과는 HARD와 REVIEW 뿐이며 "정상 통과"는 합의 이후에만 가능하다(의도된 fail-safe). 카산드라 4996은 합의 응답이며 설계 PASS가 아니다.
+
+### 2.5 승인 기준과 단계별 조건
+| 단계 | 필요 조건 | 이 문서의 상태 |
+|---|---|---|
+| 설계 PASS | 카산드라 설계 PASS(본문 SQL·산문·시험 일치, 결함 없음). 8절 위험 수용 또는 쓰기 경계 조치는 관찰 배포의 전제이며 설계 PASS와 별개 | 카산드라 5031 CONDITIONAL: 조건2(산문·SQL 정합)를 v1.9.1에서 충족, 조건1은 마기 결정 대기 |
+| 운영 롤백 리허설 | 설계 PASS 후, 단일 트랜잭션에서 DDL+6.2 시험 후 강제 ROLLBACK. 시험에는 임시 테이블 shadowing(S1), INSERT 경로(I1~I4), anon 권한 경로(A1·A2), 13건 이력 재생을 포함. 소유자 postgres 확인. 리허설 중 운영 테이블 변경 0건을 확인 | 미실시 |
+| 관찰 배포 | 마기 배정 + 대표 승인 + 8절 위험 수용 명시. 배포 후 첫날 위반 이벤트 수 ↔ 완료 전이 수를 대조(0건이 정상인지 고장인지 구분) | 미실시 |
+| 2주 관찰 | 위반 집계·오탐 목록·어휘 이탈 건수 보고. 정상 판정 근거는 8절 한계를 붙여 "정황 기록"으로만 표기 | 미실시 |
+| 거부 모드 | 별도 설계·카산드라 검증·대표 승인, **쓰기 권한 경계 조치 완료 필수** | 범위 밖 |
 
 ## 3. 백테스트 (read-only, 2026-10-12 17:44 KST 스냅샷 재실행, 완료 vr=true 13건)
 | 태스크 | C1(v1.6) | 카산드라 이벤트 | 최신 판정 이벤트 | v1.6 결과 |
@@ -295,7 +317,7 @@ execute function public.fn_completion_gate_observe();
 
 ## 6. 시험 계획
 ### 6.1 이미 실행한 시험 (2026-10-12 17:4x KST, 운영 무변경, 가상 태스크는 CTE 값으로만 존재)
-**(a) 카산드라 4997 실증 반례 + 추가 반례를 v1.2 선택·분류식에 적용: 10/10 기대와 일치**
+**(a) [v1.2 시점 결과, 현행 판정은 0절의 손기대값 25건이 대체] 카산드라 4997 실증 반례 + 추가 반례를 v1.2 선택·분류식에 적용: 10/10 기대와 일치**
 | 가상 태스크 | 이벤트 이력 | 기대 | 결과 |
 |---|---|---|---|
 | 99001 | 증거 → 카산드라 PASS/FINAL → 카산드라 비구조 검증 이벤트(나중) | REVIEW LATEST_VERDICT_UNSTRUCTURED (과거 PASS 불인정) | 일치 |
@@ -320,6 +342,7 @@ execute function public.fn_completion_gate_observe();
 
 ### 6.2 카산드라 설계 PASS 후 실행(롤백 드라이런, 단일 DO 블록 안에서 DDL+시험 후 강제 롤백)
 6.1(a)의 10개 이력을 실제 magi_tasks 행 전이로 재현(P/N 시험)하고 추가로: (N3) vr=false 전이, (N4) status 외 컬럼 UPDATE, (N5) COMPLETED→CLOSED 재전이 비발동, (N6) 재오픈 후 재완료 재발동, (N7) actor=TAEO가 기재한 verdict=PASS 불인정.
+INSERT 경로 I1~I4와 조합표, 임시 테이블 shadowing S1, anon 권한 경로 A1·A2, 13건 이력 재생(`tests/sql/task197_gate_real_replay.py`)을 운영 롤백 트랜잭션에서 재현하고 함수 소유자가 postgres인지 확인한다.
 회귀·안전: (R1) 트리거 함수가 예외를 내도 UPDATE 성공(fail-open). (R2) 봇 approve_task PATCH 경로. (R3) 위반 이벤트가 순라 underposting/slack_policy 점검을 유발하지 않음(분류기 함수와 순라 판정식에 payload/detail을 직접 입력). (R4) 3절 백테스트 13건과 결과 일치. (R5) 비용: 트리거는 `idx_magi_task_events_task`(task_id) 조회만, task_id 외 전체 스캔 없음.
 종료증거: 위 시험 결과 이벤트 + 카산드라 독립 PASS. 관찰 2주 후 위반 집계·오탐 검토를 마기에 보고하고, 거부 전환은 별도 설계·승인.
 
@@ -332,3 +355,12 @@ execute function public.fn_completion_gate_observe();
 - 증거 이벤트 타입 정규식은 현 관행 기준이라 새 타입이 생기면 오탐/미탐 가능 → 관찰 기간에 오탐 목록으로 보정.
 - 과거 위반(#145, #147, #25) 및 #174 추적성에 대한 소급 기록·정정 여부는 마기·대표님 판단.
 - 이 문서는 설계이며 구현·스키마·배포는 (대표 승인 + 마기 배정 + 카산드라 해당 단계 PASS) 전부 충족 전까지 금지.
+
+## 8. 기록 신뢰 경계와 위험 수용 (카산드라 5031 조건1)
+**사실(운영 읽기 전용 실측, 카산드라 독립 확인 포함):** anon 역할이 `magi_task_events`에 INSERT할 수 있고(정책 with check true), `event_id`·`actor`·`payload` 컬럼도 지정할 수 있다. 따라서 인증 없는 경로에서도 가짜 카산드라 판정·가짜 증거 이벤트를 쓸 수 있고, `OVERRIDING SYSTEM VALUE`로 큰 event_id를 지정하면 위조 PASS를 항상 "최신"으로 고정할 수도 있다(로컬 재현, 실제 악용은 수행하지 않음).
+**결론:** 이 게이트는 **관찰 전용이며 위조 방지 기능이 없다.** 기록은 "정황 기록"이지 검증 근거의 무결성을 보증하지 않는다. 게이트 설계로는 막을 수 없고, 막으려면 원장 쓰기 권한 경계 변경이 필요하다.
+**관찰 배포에 대한 캐스퍼 권고(마기·대표 결정):** 관찰 모드는 아무것도 차단하지 않고 위반 이벤트만 추가하므로 위조의 영향은 "미탐 또는 오탐 기록"에 한정된다. 따라서 **(안) 관찰 모드 배포는 아래 한정 범위 위험 수용으로 진행하고, 쓰기 경계 조치는 별도 보안 태스크로 분리하되 거부 모드의 선결 조건으로 건다.**
+- 수용 문안(안): "완료 게이트 관찰 모드는 위조 방지 기능이 없으며, 위반 이벤트 부재를 검증 완료의 증거로 쓰지 않는다. 결과는 정황 기록으로만 사용하고 어떤 승인·거부 판단의 자동 근거로도 쓰지 않는다. 거부 모드는 쓰기 권한 경계 조치 이후에만 검토한다."
+- 조치 후보(별도 보안 태스크 입력): (A) anon의 events INSERT에서 `event_id` 컬럼 권한 제거 — identity ALWAYS라 정상 쓰기 경로에는 영향이 없을 가능성이 높으나, 현재 쓰기 주체가 anon 키인지 서비스 키인지와 `OVERRIDING SYSTEM VALUE` 사용 여부를 먼저 확인해야 함. (B) CASSANDRA·COMPLETION_GATE actor 기재를 서비스 역할로만 허용하는 BEFORE INSERT 검사 — 카산드라·마기의 현재 기록 경로(커넥터 키)를 확인한 뒤에만 가능. (C) events 쓰기를 서비스 키 전용 경로로 이전 — 영향 범위가 가장 큼.
+- 확인이 필요한 사실: 봇·커넥터가 events에 쓸 때 쓰는 키 종류(코드는 환경변수 `SUPABASE_KEY` 하나를 사용하며 값은 확인하지 않음). 이 확인 없이 권한을 바꾸면 기록 경로가 끊길 수 있다.
+- 캐스퍼는 운영 권한을 변경하지 않는다. 별도 태스크 생성·배정은 마기 결정.
