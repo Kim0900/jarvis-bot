@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import date
+from contextvars import ContextVar
+from datetime import date, timedelta
 from typing import Any
 
 import httpx
@@ -134,3 +135,52 @@ async def count_unknown(legacy: Any) -> int:
         "task194_notification_outbox", {"select": "id", "state": "eq.UNKNOWN", "limit": "100"},
     )
     return len(rows)
+
+# Context-local interception avoids changing Telegram behavior for unrelated jobs.
+# CASSANDRA F7: the legacy 7-day calculation catches send errors, so the wrapper
+# independently propagates an enqueue error after the calculation returns.
+_OUTBOX_CONTEXT: ContextVar[dict | None] = ContextVar("task194_outbox_context", default=None)
+
+
+def install_broadcast_routing(legacy: Any) -> None:
+    """Route ONLY the Task194 daily jobs through the outbox, with no global bleed."""
+    if not enabled() or getattr(legacy, "_task194_outbox_patched", False):
+        return
+    original_send = legacy.send_telegram_broadcast
+
+    async def broadcast_proxy(text: str):
+        ctx = _OUTBOX_CONTEXT.get()
+        if ctx is None:
+            return await original_send(text)
+        try:
+            count = await enqueue(legacy, ctx["job"], ctx["day"], text)
+            # Legacy ingestion code expects a send count. This means QUEUED here,
+            # never a Telegram delivery acknowledgement.
+            return {"sent": count, "failed": 0}
+        except Exception as exc:
+            ctx["error"] = exc
+            raise
+
+    def wrap_job(job: str, original_func, date_func):
+        async def wrapped(*args, **kwargs):
+            ctx = {"job": job, "day": date_func(), "error": None}
+            token = _OUTBOX_CONTEXT.set(ctx)
+            try:
+                result = await original_func(*args, **kwargs)
+                if ctx["error"] is not None:
+                    raise RuntimeError("Task194 outbox enqueue failed") from ctx["error"]
+                return result
+            finally:
+                _OUTBOX_CONTEXT.reset(token)
+        return wrapped
+
+    # Set the proxy before wrapping; ContextVar is isolated across async tasks.
+    legacy.send_telegram_broadcast = broadcast_proxy
+    legacy.recalc_7day_average = wrap_job(
+        "recalc_7day_average", legacy.recalc_7day_average, legacy.today_kst,
+    )
+    legacy.check_daily_ingestion_detail = wrap_job(
+        "check_daily_ingestion_detail", legacy.check_daily_ingestion_detail,
+        lambda: legacy.today_kst() - timedelta(days=1),
+    )
+    legacy._task194_outbox_patched = True
