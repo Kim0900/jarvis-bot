@@ -318,6 +318,28 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2 gpx rows", self.status("calc_daily_snapshot"))
         self.assertIsNone(self.snapshot_rows()[0]["total_idle_min"])
 
+    async def test_real_duplicate_date_fixtures_are_partial(self):
+        """Live gpx_sessions (2026-10-13): 39 rows / 34 dates; 3 dates have several rows
+        (5 surplus rows).  Values copied from production (read-only query)."""
+        real = {
+            "2026-05-30 x4 identical": [(8.14, 191.65)] * 4,
+            "2026-07-14 valid + NULL": [(7.16, 150.07), (None, None)],
+            "2026-07-25 valid + NULL hours, different km": [(7.4, 158.52), (None, 124.78)],
+        }
+        for label, pairs in real.items():
+            with self.subTest(case=label):
+                for t in ("scheduler_status", "daily_calc_snapshot"):
+                    self.srv.tables.pop(t, None)
+                self.state = sdj.DailyJobState()
+                self.srv.tables["gpx_sessions"] = [
+                    {"날짜": self.yesterday, "구속시간_h": h, "총주행거리_km": k} for h, k in pairs]
+                out = await self.tick()
+                self.assertEqual(out["calc_daily_snapshot"], "ok_partial", out)
+                self.assertIn(f"{len(pairs)} gpx rows", self.status("calc_daily_snapshot"))
+                rows = self.snapshot_rows()
+                self.assertEqual(len(rows), 1)
+                self.assertIsNone(rows[0]["total_idle_min"])
+
     async def test_malformed_gpx_value_is_partial_not_ok_and_not_blocking(self):
         self.gpx(구속시간_h="abc", 총주행거리_km="12.5")
         out = await self.tick()
