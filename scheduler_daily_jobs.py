@@ -217,7 +217,7 @@ async def run_daily_jobs(
                 state.confirmed_done.add(key)
                 outcomes[name] = "done"
                 continue
-            if seen == "claimed" and needs_pre_send_claim(name):
+            if seen == "claimed" and name in NON_IDEMPOTENT_JOBS:
                 # A previous process claimed the send and never recorded the outcome
                 # (crash/restart or lost status write).  At-most-once: do not resend.
                 legacy.logger.error("Task194 %s: claim found without outcome -> not re-run (delivery uncertain)", name)
