@@ -50,6 +50,13 @@ DAILY_JOBS = (
 # These jobs send external notifications; never repeat them on an uncertain status write.
 NON_IDEMPOTENT_JOBS = frozenset({"check_daily_ingestion_detail"})
 
+
+def needs_pre_send_claim(name: str) -> bool:
+    # With durable outbox, a daily job only ENQUEUES idempotently. Pre-send
+    # CLAIMED is unsafe and unnecessary: a crash before enqueue must retry.
+    outbox_on = os.getenv("TASK194_OUTBOX_ENABLED", "0").strip().lower() in {"1", "yes", "true"}
+    return name in NON_IDEMPOTENT_JOBS and not outbox_on
+
 RESULT_MAX_LEN = 500
 
 
@@ -226,7 +233,7 @@ async def run_daily_jobs(
 
         state.last_attempt[key] = monotonic()
         state.attempts[key] = state.attempts.get(key, 0) + 1
-        if name in NON_IDEMPOTENT_JOBS:
+        if needs_pre_send_claim(name):
             # Durable claim BEFORE the external side effect (CASSANDRA 5067 F2).  If the
             # claim cannot be stored we do not send; if the process dies after sending,
             # the stored claim stops any re-send after restart.
@@ -253,7 +260,7 @@ async def run_daily_jobs(
             await _write_status(legacy, name, success_value, now)
         except Exception as exc:
             legacy.logger.error("Task194 success status write failed (%s): %r", name, exc)
-            if name in NON_IDEMPOTENT_JOBS:
+            if needs_pre_send_claim(name):
                 state.uncertain_done.add(key)
             outcomes[name] = "ok_status_write_failed"
             continue

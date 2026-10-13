@@ -159,6 +159,41 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["calc_daily_snapshot"], "failed")
         self.assertEqual(self.posts("daily_calc_snapshot"), 0)
 
+    async def test_malformed_present_gpx_fails_without_false_ok_snapshot(self):
+        # Cassandra #5074 F8: a present but corrupt GPX is not the same as no GPX.
+        self.srv.tables["gpx_sessions"] = [{
+            "날짜": self.yesterday, "총주행거리_km": "not-a-number",
+            "구속시간_h": 4,
+        }]
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "failed", out)
+        self.assertTrue(self.status("calc_daily_snapshot").startswith("FAIL:"), self.status("calc_daily_snapshot"))
+        self.assertIn("GPX_COMPUTATION_INVALID", self.status("calc_daily_snapshot"))
+        self.assertEqual(self.posts("daily_calc_snapshot"), 0)
+
+        # Repairing the source permits a retry, rather than preserving the bogus OK.
+        self.srv.tables["gpx_sessions"][0]["총주행거리_km"] = 90
+        self.clock.advance(sdj.retry_interval_seconds() + 1)
+        out = await self.tick(now=self.now + timedelta(minutes=20))
+        self.assertEqual(out["calc_daily_snapshot"], "ok", out)
+        self.assertEqual(self.status("calc_daily_snapshot"), "OK")
+        self.assertEqual(self.posts("daily_calc_snapshot"), 1)
+
+    async def test_missing_gpx_remains_normal_absence(self):
+        # No GPX row is a different condition from a present malformed GPX row.
+        self.srv.tables["gpx_sessions"] = []
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok", out)
+        self.assertEqual(len(self.srv.tables.get("daily_calc_snapshot", [])), 1)
+
+    async def test_nonfinite_gpx_is_never_recorded_as_ok(self):
+        self.srv.tables["gpx_sessions"] = [{
+            "날짜": self.yesterday, "총주행거리_km": "NaN", "구속시간_h": 4,
+        }]
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "failed", out)
+        self.assertEqual(self.posts("daily_calc_snapshot"), 0)
+
     async def test_ingestion_check_read_failure_is_a_failure_not_a_silent_ok(self):
         self.srv.fail_mode = "503"
         self.srv.fail_tables = {"operated_status"}

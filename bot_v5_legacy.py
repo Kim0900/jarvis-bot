@@ -13,6 +13,7 @@ import asyncio
 import logging
 import threading
 import queue
+import math
 import base64
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -7939,20 +7940,35 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     # 공차시간(근사치): gpx_sessions 구속시간을 "영업거리/총거리" 비율로 분배.
     # 원본 GPX 포인트가 DB에 없어 정밀계산 불가 — 근사치임을 명시.
     avg_idle_min = total_idle_min = None
-    # Task #194: a failed gpx read must fail the job (retry), not store an idle time of NULL as OK.
+    # Task #194 / CASSANDRA #5074 F8: distinguish genuinely absent GPX from
+    # invalid PRESENT GPX.  Malformed numeric data cannot become a NULL/OK snapshot.
     gpx = await sb_select_required("gpx_sessions", {"날짜": f"eq.{calc_date}"})
     try:
         if gpx:
             g = gpx[0]
-            총거리 = g.get("총주행거리_km")
-            구속시간_h = g.get("구속시간_h")
-            영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
-            if 총거리 and 구속시간_h and 총거리 > 0:
+            def _nonnegative_finite(value, label):
+                if value is None or isinstance(value, bool):
+                    raise ValueError(f"{label} missing or boolean")
+                number = float(value)
+                if not math.isfinite(number) or number < 0:
+                    raise ValueError(f"{label} must be finite and nonnegative")
+                return number
+
+            총거리 = _nonnegative_finite(g.get("총주행거리_km"), "총주행거리_km")
+            구속시간_h = _nonnegative_finite(g.get("구속시간_h"), "구속시간_h")
+            영업거리합 = sum(
+                _nonnegative_finite(r.get("영업거리_km") or 0, "영업거리_km")
+                for r in valid_rows
+            )
+            if 총거리 == 0 and 구속시간_h > 0:
+                raise ValueError("positive driving hours with zero distance")
+            if 총거리 > 0 and 구속시간_h > 0:
                 공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
                 total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
                 avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
     except Exception as e:
-        logger.error(f"공차시간(근사) 계산 실패 {calc_date}: {e}")
+        logger.error("GPX_COMPUTATION_INVALID (%s): %r", calc_date, e)
+        raise RuntimeError(f"GPX_COMPUTATION_INVALID: calc_date={calc_date}; {type(e).__name__}") from e
 
     # task#42: 패턴지표 3종(경산루프/연속콜/배회) — 마기 지시(2026-08-20).
     # 경산루프: 명령서#015 정의 그대로(요금≥15,000원 + 출발지/도착지에 "경산" 포함).
