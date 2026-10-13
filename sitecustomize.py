@@ -367,6 +367,10 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         return
 
     import scheduler_daily_jobs  # Task #194: single dispatch path for the 04:00 jobs
+    import task194_outbox
+    # Feature off by default; activation requires reviewed DB migration and service-role
+    # credentials.  Interception is scoped to Task194 jobs via ContextVar.
+    task194_outbox.install_broadcast_routing(legacy)
 
     def fish_scheduler(app: Any) -> None:
         # CASPER 긴급수정(2026-08-29): 기존엔 "정각 브리핑을 AI작업보다 먼저
@@ -454,6 +458,7 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
         last_dualverify_day = -1
         last_kpi7day = -1
         daily_job_state = scheduler_daily_jobs.DailyJobState()
+        last_task194_outbox_poll = 0.0
         last_crosscheck_day = -1
         last_orch_run_ts = 0.0
         last_magi_review_ts = 0.0
@@ -505,6 +510,21 @@ def _install_scheduler_dispatch_patch(legacy: Any) -> None:
                         legacy.logger.info("Task194 daily jobs tick: %s", _outcomes)
                 except Exception as exc:
                     legacy.logger.error(f"Task194 daily jobs dispatch error: {type(exc).__name__}: {exc!r}")
+                # Outbox delivery runs independently of whether the 04:00 jobs ran.
+                # This recovers queued notifications after restarts and expired leases.
+                if task194_outbox.enabled() and time.monotonic() - last_task194_outbox_poll >= 60:
+                    last_task194_outbox_poll = time.monotonic()
+                    try:
+                        delivered = loop.run_until_complete(task194_outbox.dispatch_once(legacy))
+                        unknown = loop.run_until_complete(task194_outbox.count_unknown(legacy))
+                        if any(delivered.values()) or unknown:
+                            legacy.logger.warning(
+                                "Task194 outbox: dispatched=%s UNKNOWN=%s (manual review if UNKNOWN)",
+                                delivered, unknown,
+                            )
+                    except Exception as exc:
+                        legacy.logger.error("Task194 outbox dispatch failure: %s: %r",
+                                            type(exc).__name__, exc)
                 if now.hour == 4:
                     last_kpi7day = now.day
 
