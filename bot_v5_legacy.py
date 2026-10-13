@@ -7860,6 +7860,12 @@ async def recalc_7day_average():
     return snapshot
 
 
+class SnapshotResult(list):
+    """calc_daily_snapshot result (a list, as before) plus ``partial_reason``: None when
+    complete, else why part of the row (GPX idle time) could not be computed."""
+    partial_reason = None
+
+
 async def calc_daily_snapshot(calc_date_str: str = None):
     """명령서#036: 축A(영업일) 기준 일별 5종 계산 — 시간대별/지역별 콜수, 평균단가,
     콜간격, 공차시간. ARGOS_인수인계[3][5] 규칙: 자정(00:00~05:59대) 이후 콜은 전날
@@ -7941,17 +7947,38 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     avg_idle_min = total_idle_min = None
     # Task #194: a failed gpx read must fail the job (retry), not store an idle time of NULL as OK.
     gpx = await sb_select_required("gpx_sessions", {"날짜": f"eq.{calc_date}"})
+    # Task #194 (마기 5079 ②): GPX 공차시간 입력 정책.
+    #  - 그날 GPX 행 없음            -> 정상(공차 NULL, OK)
+    #  - GPX 행은 있으나 구속시간_h/총주행거리_km가 NULL·0 또는 계산 예외
+    #                               -> 스냅샷은 저장하되 PARTIAL 사유를 반환(스케줄러가
+    #                                  OK가 아니라 "PARTIAL: ..."로 기록). 결정적 입력 문제라
+    #                                  예외로 막으면 스냅샷·catch-up이 영구 차단되기 때문.
+    #                                  (실데이터 gpx_sessions 39행 중 구속시간_h NULL 17행)
+    partial_reason = None
     try:
-        if gpx:
+        if gpx and len(gpx) > 1:
+            # No unique key on 날짜 and no ordering: do not guess which session is right.
+            partial_reason = f"gpx_idle_unavailable: {len(gpx)} gpx rows for one date"
+        elif gpx:
             g = gpx[0]
             총거리 = g.get("총주행거리_km")
             구속시간_h = g.get("구속시간_h")
-            영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
-            if 총거리 and 구속시간_h and 총거리 > 0:
-                공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
-                total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
-                avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
+            missing = [n for n, v in (("구속시간_h", 구속시간_h), ("총주행거리_km", 총거리)) if v is None]
+            if missing:
+                partial_reason = "gpx_idle_unavailable: null " + ",".join(missing)
+            elif 구속시간_h <= 0 or 총거리 <= 0:
+                partial_reason = "gpx_idle_unavailable: non-positive value"
+            else:
+                영업거리합 = sum(float(r.get("영업거리_km") or 0) for r in valid_rows)
+                if 총거리 and 구속시간_h and 총거리 > 0:
+                    공차비율 = max(0, 1 - min(영업거리합 / 총거리, 1))
+                    total_idle_min = round(구속시간_h * 60 * 공차비율, 2)
+                    avg_idle_min = round(total_idle_min / call_count, 2) if call_count else None
+                else:
+                    partial_reason = "gpx_idle_unavailable: unusable value"
     except Exception as e:
+        avg_idle_min = total_idle_min = None
+        partial_reason = f"gpx_idle_compute_error: {type(e).__name__}"
         logger.error(f"공차시간(근사) 계산 실패 {calc_date}: {e}")
 
     # task#42: 패턴지표 3종(경산루프/연속콜/배회) — 마기 지시(2026-08-20).
@@ -8020,8 +8047,11 @@ async def calc_daily_snapshot(calc_date_str: str = None):
     if result is None:
         logger.error(f"daily_calc_snapshot 저장 실패(축A={calc_date}) — sb_upsert가 None 반환(RLS/네트워크 등)")
         raise RuntimeError(f"daily_calc_snapshot 저장 실패: calc_date={calc_date}")
-    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}")
-    return result
+    logger.info(f"daily_calc_snapshot 저장(축A={calc_date}): {call_count}건, 평균단가{avg_fare}, 공차{total_idle_min}분, 경산루프{gyeongsan_loop_count}, 연속콜{consecutive_call_count}, 배회{baehoe_count}"
+                + (f" [PARTIAL {partial_reason}]" if partial_reason else ""))
+    out = SnapshotResult(result if isinstance(result, list) else [result])
+    out.partial_reason = partial_reason
+    return out
 
 
 async def dual_verify_7day_average() -> dict:

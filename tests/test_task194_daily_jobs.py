@@ -286,6 +286,23 @@ class DailyJobsTests(IsolatedAsyncioTestCase):
         out = await sdj.run_daily_jobs(lg, kst(5), sdj.DailyJobState(), self.clock, jobs=lg.actions())
         self.assertEqual(set(out.values()), {"ok"})
 
+    async def test_partial_result_is_recorded_as_partial_and_counts_as_done(self):
+        class Res(list):
+            partial_reason = "gpx_idle_unavailable: null 구속시간_h"
+        acts = self.lg.actions()
+
+        async def partial_job(*a):
+            self.lg.calls["calc_daily_snapshot"] += 1
+            return Res([{"x": 1}])
+        acts["calc_daily_snapshot"] = partial_job
+        out = await sdj.run_daily_jobs(self.lg, kst(4), sdj.DailyJobState(), self.clock, jobs=acts)
+        self.assertEqual(out["calc_daily_snapshot"], "ok_partial")
+        res = self.lg.rows["calc_daily_snapshot"]["last_result"]
+        self.assertTrue(res.startswith("PARTIAL: ") and sdj.is_success_result(res))
+        self.assertEqual(await sdj.job_state_today(self.lg, "calc_daily_snapshot", kst(5)), "success")
+        out = await sdj.run_daily_jobs(self.lg, kst(5), sdj.DailyJobState(), self.clock, jobs=acts)
+        self.assertEqual(out["calc_daily_snapshot"], "done")
+
     async def test_claim_without_outcome_blocks_resend_after_restart(self):
         # process 1 claimed, sent, then died / lost the outcome write
         self.lg.rows["check_daily_ingestion_detail"] = {

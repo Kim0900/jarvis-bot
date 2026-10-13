@@ -182,7 +182,7 @@ async def run_daily_jobs(
     """One scheduler tick.  Returns ``{job_name: outcome}`` for logging and tests.
 
     Outcomes: ``outside_window``, ``done``, ``state_unknown``, ``cooldown``,
-    ``uncertain_done``, ``claim_failed``, ``ok``, ``failed``, ``ok_status_write_failed``.
+    ``uncertain_done``, ``claim_failed``, ``ok``, ``ok_partial``, ``failed``, ``ok_status_write_failed``.
     """
     outcomes: dict[str, str] = {}
     start_hour, end_hour = window_hours()
@@ -249,6 +249,13 @@ async def run_daily_jobs(
             continue
 
         success_value = str(result) if name == "check_daily_ingestion_detail" and result else "OK"
+        partial = getattr(result, "partial_reason", None)
+        if partial:
+            # Stored, usable result with a known gap: counts as done (the cause is
+            # deterministic input data, a retry would not change it) but is visible in
+            # scheduler_status instead of a plain OK.  Must not start with FAIL and must
+            # not contain MISMATCH (patrol alerts on those).
+            success_value = f"PARTIAL: {partial}"[:RESULT_MAX_LEN]
         try:
             await _write_status(legacy, name, success_value, now)
         except Exception as exc:
@@ -258,7 +265,7 @@ async def run_daily_jobs(
             outcomes[name] = "ok_status_write_failed"
             continue
         state.confirmed_done.add(key)
-        outcomes[name] = "ok"
+        outcomes[name] = "ok_partial" if partial else "ok"
 
     await _maybe_catch_up(legacy, now, outcomes, actions)
     return outcomes
@@ -272,7 +279,7 @@ async def _maybe_catch_up(legacy: Any, now: datetime, outcomes: dict[str, str],
     database is never hit with a burst of historical recomputes.
     """
     days = catchup_days()
-    if days <= 0 or outcomes.get("calc_daily_snapshot") not in ("ok", "done"):
+    if days <= 0 or outcomes.get("calc_daily_snapshot") not in ("ok", "ok_partial", "done"):
         return
     try:
         dates = await missing_snapshot_dates(legacy, now, days)
@@ -281,8 +288,9 @@ async def _maybe_catch_up(legacy: Any, now: datetime, outcomes: dict[str, str],
         return
     for day in dates:
         try:
-            await actions["calc_daily_snapshot"](day)
-            legacy.logger.info("Task194 catch-up recomputed daily_calc_snapshot %s", day)
+            res = await actions["calc_daily_snapshot"](day)
+            legacy.logger.info("Task194 catch-up recomputed daily_calc_snapshot %s%s", day,
+                               f" (PARTIAL {res.partial_reason})" if getattr(res, "partial_reason", None) else "")
         except Exception as exc:
             legacy.logger.error("Task194 catch-up stopped at %s: %s", day, format_failure(exc))
             return

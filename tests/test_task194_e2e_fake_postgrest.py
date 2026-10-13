@@ -257,6 +257,93 @@ class E2E(unittest.IsolatedAsyncioTestCase):
         out = await self.tick()
         self.assertEqual(out["check_daily_ingestion_detail"], "ok")
 
+    # 마기 5079 ②: GPX NULL policy -> snapshot stored, status PARTIAL (not OK, not FAIL)
+    def gpx(self, **cols):
+        self.srv.tables["gpx_sessions"] = [{"날짜": self.yesterday, **cols}]
+
+    def snapshot_rows(self):
+        return [r for r in self.srv.tables.get("daily_calc_snapshot", []) if r["calc_date"] == self.yesterday]
+
+    async def test_no_gpx_row_is_plain_ok(self):
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok")
+        self.assertEqual(self.status("calc_daily_snapshot"), "OK")
+        self.assertEqual(len(self.snapshot_rows()), 1)
+
+    async def test_complete_gpx_is_plain_ok_and_idle_is_computed(self):
+        self.gpx(구속시간_h=7.64, 총주행거리_km=147.21)
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok")
+        self.assertEqual(self.status("calc_daily_snapshot"), "OK")
+        self.assertEqual(self.snapshot_rows()[0]["total_idle_min"], round(7.64 * 60, 2))
+
+    async def test_gpx_with_null_fields_stores_snapshot_and_records_partial(self):
+        cases = {
+            "hours_null": ({"구속시간_h": None, "총주행거리_km": 196.73}, "null 구속시간_h"),   # real sample 2026-07-31
+            "km_null": ({"구속시간_h": 5.0, "총주행거리_km": None}, "null 총주행거리_km"),
+            "both_null": ({"구속시간_h": None, "총주행거리_km": None}, "null 구속시간_h,총주행거리_km"),
+            "zero_km": ({"구속시간_h": 5.0, "총주행거리_km": 0}, "non-positive"),
+            "negative_hours": ({"구속시간_h": -5, "총주행거리_km": 100.0}, "non-positive"),
+            "negative_km": ({"구속시간_h": 5, "총주행거리_km": -100.0}, "non-positive"),
+        }
+        for label, (cols, reason) in cases.items():
+            with self.subTest(case=label):
+                for t in ("scheduler_status", "daily_calc_snapshot"):
+                    self.srv.tables.pop(t, None)
+                self.state = sdj.DailyJobState()
+                self.gpx(**cols)
+                out = await self.tick()
+                self.assertEqual(out["calc_daily_snapshot"], "ok_partial", out)
+                st = self.status("calc_daily_snapshot")
+                self.assertTrue(st.startswith("PARTIAL: gpx_idle_unavailable"), st)
+                self.assertIn(reason, st)
+                rows = self.snapshot_rows()
+                self.assertEqual(len(rows), 1)
+                self.assertIsNone(rows[0]["total_idle_min"])
+                self.assertIsNone(rows[0]["avg_idle_min"])
+                # patrol alerts on startswith FAIL or MISMATCH anywhere; PARTIAL must trigger neither
+                self.assertFalse(st.upper().startswith("FAIL") or "MISMATCH" in st.upper())
+                # PARTIAL counts as done: no re-run in-process and none after a restart
+                before = self.posts("daily_calc_snapshot")
+                out2 = await self.tick(state=sdj.DailyJobState(), now=self.now + timedelta(hours=1))
+                self.assertEqual(out2["calc_daily_snapshot"], "done")
+                self.assertEqual(self.posts("daily_calc_snapshot"), before)
+
+    async def test_two_gpx_rows_for_one_date_is_partial_not_a_guess(self):
+        self.srv.tables["gpx_sessions"] = [
+            {"날짜": self.yesterday, "구속시간_h": 5.0, "총주행거리_km": 100.0},
+            {"날짜": self.yesterday, "구속시간_h": 3.0, "총주행거리_km": 50.0}]
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok_partial", out)
+        self.assertIn("2 gpx rows", self.status("calc_daily_snapshot"))
+        self.assertIsNone(self.snapshot_rows()[0]["total_idle_min"])
+
+    async def test_malformed_gpx_value_is_partial_not_ok_and_not_blocking(self):
+        self.gpx(구속시간_h="abc", 총주행거리_km="12.5")
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok_partial", out)
+        self.assertTrue(self.status("calc_daily_snapshot").startswith("PARTIAL: gpx_idle_compute_error"))
+        self.assertEqual(len(self.snapshot_rows()), 1)
+
+    async def test_catchup_proceeds_when_regular_snapshot_is_partial(self):
+        missing = str(self.now.date() - timedelta(days=2))
+        self.srv.tables["daily_calc_snapshot"] = [
+            {"calc_date": str(self.now.date() - timedelta(days=d)), "axis": "A"} for d in (3, 4)]
+        self.srv.tables["raw_calls"].append({
+            "날짜": missing, "콜유형": "일반", "요금": 9000,
+            "배차시각": f"{missing}T21:00:00+09:00", "verify_status": "verified"})
+        self.gpx(구속시간_h=None, 총주행거리_km=100.0)
+        with patch.dict(os.environ, {"TASK194_CATCHUP_DAYS": "5"}):
+            out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "ok_partial")
+        self.assertIn(missing, {r["calc_date"] for r in self.srv.tables["daily_calc_snapshot"]})
+
+    async def test_gpx_read_outage_still_fails_the_job(self):
+        self.srv.fail_mode = "503"
+        self.srv.fail_tables = {"gpx_sessions"}
+        out = await self.tick()
+        self.assertEqual(out["calc_daily_snapshot"], "failed")
+
     # CASSANDRA 5072 F4: per-date daily_summary write failures must fail the job
     def add_second_day(self):
         self.other_day = str(self.now.date() - timedelta(days=2))
