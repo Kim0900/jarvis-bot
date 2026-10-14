@@ -11,7 +11,7 @@ Questions answered, one test each:
   D3 lookup degraded (503 / reset / empty 200 / garbled 200) -> fail closed, nothing inserted
   D4 two sources carrying the same trips processed at once   -> exactly one copy stored
   D5 asymmetric NULL fare replay                              -> quarantined, nothing inserted
-  D6 the same trip twice inside one batch                     -> stored once
+  D6 the same trip twice inside one batch                     -> quarantined, nothing stored
   D7 genuinely different trips                                -> all inserted (guard not over-blocking)
 """
 import asyncio
@@ -150,11 +150,13 @@ class DedupGuardReplay(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.get("quarantine"))
         self.assertEqual(self.count(), len(KAKAO))
 
-    # D6
-    async def test_d6_same_trip_twice_in_one_batch_stored_once(self):
+    # D6 (CASSANDRA 5126: STRONG duplicate inside one batch -> quarantine whole batch, 0 writes)
+    async def test_d6_same_trip_twice_in_one_batch_is_quarantined(self):
         res = await self.ingest([NEW_TRIPS[0], NEW_TRIPS[0]], "SRC_TWICE")
-        self.assertTrue(res["ok"], res)
-        self.assertEqual(self.count(), len(KAKAO) + 1)
+        self.assertFalse(res["ok"], res)
+        self.assertTrue(res.get("quarantine"))
+        self.assertEqual(res.get("error_code"), "RAW_CALL_IN_BATCH_DUPLICATE")
+        self.assertEqual(self.count(), len(KAKAO))
 
     # D7
     async def test_d7_different_trips_are_not_over_blocked(self):

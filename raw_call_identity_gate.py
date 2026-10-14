@@ -12,6 +12,10 @@ Actions:
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
+
 from canonical_identity_v1 import identity_strength
 
 STRONG_STRENGTHS = {
@@ -76,6 +80,66 @@ def partition_raw_call_payloads(existing_rows, payloads, source_id=None):
     }
 
 
+# Task #206 (D4): keep the read-classify-insert sequence of two batches of the same
+# process from interleaving.  The request server (plain ``HTTPServer``) already handles
+# one ingestion request at a time, so this guard is defensive today; it is a
+# threading.Lock (polled without blocking the event loop) because each request runs its
+# own ``asyncio.run`` and an asyncio.Lock cannot be shared across loops.  It is a
+# SINGLE-PROCESS guard only.  NOT covered (accepted, CASSANDRA 5252 / operating rule): two
+# instances overlapping during a deploy (no upload around a deploy + a duplicate check
+# before the first upload) and the Telegram-side writers that insert into raw_calls
+# without this gate.
+_WRITE_LOCK = threading.Lock()
+WRITE_LOCK_TIMEOUT_SECONDS = 60.0
+
+
+class raw_call_write_guard:
+    def __init__(self, timeout: float | None = None):
+        self._timeout = WRITE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+
+    async def __aenter__(self):
+        deadline = time.monotonic() + self._timeout
+        while not _WRITE_LOCK.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("RAW_CALL_WRITE_LOCK_TIMEOUT")
+            await asyncio.sleep(0.02)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        _WRITE_LOCK.release()
+        return False
+
+
+def find_in_batch_strong_duplicates(payloads):
+    """Pairs of payloads inside ONE batch that are STRONG duplicates of each other.
+
+    Only STRONG evidence counts (same policy function as everything else); WEAK pairs
+    are deliberately not flagged here so ordinary back-to-back trips or same-minute
+    receipts are not newly blocked.  daily_total rows never take part.
+    """
+    pairs = []
+    items = [p for p in (payloads or []) if p.get("raw_row_type") != "daily_total"]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            strength = identity_strength(items[i], items[j])
+            if strength in STRONG_STRENGTHS:
+                pairs.append({
+                    "first": _brief(items[i]),
+                    "second": _brief(items[j]),
+                    "strength": strength,
+                })
+    return pairs
+
+
+def _brief(payload):
+    return {
+        "날짜": payload.get("날짜"),
+        "배차시각": payload.get("배차시각"),
+        "하차시각": payload.get("하차시각"),
+        "요금": payload.get("요금"),
+    }
+
+
 async def persist_raw_call_batch(
     payloads,
     source_id,
@@ -90,6 +154,11 @@ async def persist_raw_call_batch(
     select_rows(date_value) must return existing raw_calls for that calendar date.
     bulk_insert(rows) must insert the supplied list as one database operation.
     """
+    if payloads and not source_id:
+        # Task #206: without a source id the cross-source lookup below is skipped and the
+        # whole batch would be inserted unchecked.  Refuse before anything is written.
+        raise RuntimeError("RAW_CALL_SOURCE_ID_REQUIRED")
+
     prepared = []
     for original in payloads or []:
         payload = dict(original)
@@ -109,6 +178,22 @@ async def persist_raw_call_batch(
             "duplicate_skipped_count": 0,
             "covered_count": 0,
             "duplicate_skipped": [],
+        }
+
+    in_batch = find_in_batch_strong_duplicates(prepared)
+    if in_batch:
+        # Task #206 / CASSANDRA 5126: a STRONG duplicate *inside* one batch is ambiguous
+        # about which row is the true one, so quarantine the whole batch (0 writes)
+        # instead of silently dropping a row.
+        return {
+            "ok": False,
+            "quarantine": True,
+            "error_code": "RAW_CALL_IN_BATCH_DUPLICATE",
+            "inserted_count": 0,
+            "duplicate_skipped_count": 0,
+            "covered_count": len(prepared),
+            "in_batch_duplicate_count": len(in_batch),
+            "in_batch_duplicates": in_batch[:20],
         }
 
     to_insert = prepared

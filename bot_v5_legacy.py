@@ -1678,6 +1678,76 @@ async def sb_get_strict(table: str, params: dict = None) -> list:
     return data
 
 
+_CONTENT_RANGE_TOTAL = re.compile(r"^(?:\d+-\d+|\*)/(\d+)$")
+
+
+async def sb_get_all_strict(
+    table: str,
+    params: dict = None,
+    *,
+    page_size: int = 1000,
+    max_pages: int = 200,
+) -> list:
+    """Task #206: read EVERY matching row, or raise.
+
+    PostgREST silently caps a response at the project's ``db-max-rows`` (often 1000), so
+    "I asked for limit=N and got fewer" can mean "truncated" and "rows == limit" is not
+    a reliable truncation test.  Here the true total comes from ``Content-Range`` (via
+    ``Prefer: count=exact``), pages are fetched by ``offset`` in a stable ``order=id``
+    and the collected row count must equal that total.  HTTP 200 and 206 are accepted;
+    anything else - a missing/garbled ``Content-Range``, a total that changes between
+    pages, an empty page before the total is reached, an invalid/empty/non-list body, a
+    transport error, or too many pages - raises :class:`SupabaseReadError`.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = dict(HEADERS_SB)
+    headers["Prefer"] = "count=exact"
+    # A stable, unique ordering is what makes offset paging trustworthy: the caller's
+    # ``order`` (if any) is ignored on purpose.
+    base = {k: v for k, v in (params or {}).items() if k not in ("limit", "offset", "order")}
+    base["order"] = "id.asc"
+    rows: list = []
+    total = None
+    for _ in range(max_pages):
+        page_params = dict(base, limit=str(page_size), offset=str(len(rows)))
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.request("GET", url, headers=headers, params=page_params)
+        except Exception as exc:
+            raise SupabaseReadError(f"{table}: transport {type(exc).__name__}: {exc!r}") from exc
+        if r.status_code not in (200, 206):
+            raise SupabaseReadError(f"{table}: HTTP {r.status_code}")
+        match = _CONTENT_RANGE_TOTAL.match((r.headers.get("content-range") or "").strip())
+        if not match:
+            raise SupabaseReadError(f"{table}: missing/invalid Content-Range")
+        page_total = int(match.group(1))
+        if total is not None and page_total != total:
+            raise SupabaseReadError(f"{table}: total changed while paging ({total}->{page_total})")
+        total = page_total
+        if not r.content or not r.content.strip():
+            raise SupabaseReadError(f"{table}: empty body")
+        try:
+            page = r.json()
+        except Exception as exc:
+            raise SupabaseReadError(f"{table}: invalid JSON body") from exc
+        if not isinstance(page, list):
+            raise SupabaseReadError(f"{table}: non-list body {type(page).__name__}")
+        rows.extend(page)
+        if len(rows) >= total:
+            break
+        if not page:
+            raise SupabaseReadError(f"{table}: empty page before total ({len(rows)}/{total})")
+    else:
+        raise SupabaseReadError(f"{table}: too many pages")
+    if len(rows) != total:
+        raise SupabaseReadError(f"{table}: collected {len(rows)} rows but total is {total}")
+    ids = [r.get("id") for r in rows if isinstance(r, dict) and r.get("id") is not None]
+    if len(ids) != len(set(ids)):
+        # rows were inserted/deleted between pages: a row was read twice (so another was missed)
+        raise SupabaseReadError(f"{table}: duplicate ids while paging (data changed mid-read)")
+    return rows
+
+
 async def sb_select_required(table: str, params: dict = None) -> list:
     """Task #194: for jobs that compute from the result.  ``sb_select`` turns any failed
     or malformed PostgREST answer into ``[]``, which makes an outage look like "no data"
@@ -4088,23 +4158,24 @@ async def _persist_raw_call_batch(payloads: list[dict], source_id: str = None) -
     from raw_call_identity_gate import persist_raw_call_batch
 
     async def select_rows(date_value):
-        return await sb_h(
-            "GET",
-            "raw_calls",
-            params={"날짜": f"eq.{date_value}", "limit": "5000"},
-        )
+        # Task #206: strict + complete (paged, Content-Range verified). Any doubt raises,
+        # so the gate never treats a degraded answer as "no existing rows".
+        return await sb_get_all_strict("raw_calls", {"날짜": f"eq.{date_value}"})
 
     async def bulk_insert(rows):
         return await sb_h("POST", "raw_calls", json=rows)
 
-    return await persist_raw_call_batch(
-        payloads,
-        source_id,
-        select_rows=select_rows,
-        bulk_insert=bulk_insert,
-        calc_service_date=calc_service_date,
-        validate_call_payload=validate_call_payload,
-    )
+    from raw_call_identity_gate import raw_call_write_guard
+
+    async with raw_call_write_guard():
+        return await persist_raw_call_batch(
+            payloads,
+            source_id,
+            select_rows=select_rows,
+            bulk_insert=bulk_insert,
+            calc_service_date=calc_service_date,
+            validate_call_payload=validate_call_payload,
+        )
 
 
 async def _save_one_raw_call(payload: dict, source_id: str = None) -> bool:
@@ -4122,7 +4193,9 @@ async def _save_repaired_daily_history_batch(parsed: dict, source_id: str) -> di
     if not parsed.get("날짜"):
         raise RuntimeError("REPAIR_DATE_REQUIRED")
 
-    existing = await sb_select("raw_calls", {
+    # Task #206: strict probe - a degraded answer must not read as "no rows of this source yet"
+    # (the identity gate ignores same-source rows, so a false negative here would re-insert them).
+    existing = await sb_get_strict("raw_calls", {
         "source_id": f"eq.{source_id}",
         "limit": "1",
     })
