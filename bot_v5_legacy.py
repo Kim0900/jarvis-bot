@@ -1678,7 +1678,7 @@ async def sb_get_strict(table: str, params: dict = None) -> list:
     return data
 
 
-_CONTENT_RANGE_TOTAL = re.compile(r"^(?:\d+-\d+|\*)/(\d+)$")
+_CONTENT_RANGE = re.compile(r"^(?:(\d+)-(\d+)|\*)/(\d+)$")
 
 
 async def sb_get_all_strict(
@@ -1717,10 +1717,12 @@ async def sb_get_all_strict(
             raise SupabaseReadError(f"{table}: transport {type(exc).__name__}: {exc!r}") from exc
         if r.status_code not in (200, 206):
             raise SupabaseReadError(f"{table}: HTTP {r.status_code}")
-        match = _CONTENT_RANGE_TOTAL.match((r.headers.get("content-range") or "").strip())
+        match = _CONTENT_RANGE.match((r.headers.get("content-range") or "").strip())
         if not match:
             raise SupabaseReadError(f"{table}: missing/invalid Content-Range")
-        page_total = int(match.group(1))
+        range_start = int(match.group(1)) if match.group(1) is not None else None
+        range_end = int(match.group(2)) if match.group(2) is not None else None
+        page_total = int(match.group(3))
         if total is not None and page_total != total:
             raise SupabaseReadError(f"{table}: total changed while paging ({total}->{page_total})")
         total = page_total
@@ -1732,6 +1734,22 @@ async def sb_get_all_strict(
             raise SupabaseReadError(f"{table}: invalid JSON body") from exc
         if not isinstance(page, list):
             raise SupabaseReadError(f"{table}: non-list body {type(page).__name__}")
+        # The claimed range must describe exactly the rows we received at exactly the offset
+        # we asked for ("*" is only valid for an empty page); otherwise a forged/shifted
+        # header could still add up to the right row count.
+        offset = len(rows)
+        if page:
+            if range_start is None or range_start != offset or range_end != offset + len(page) - 1:
+                raise SupabaseReadError(
+                    f"{table}: Content-Range does not match page (offset={offset} rows={len(page)} "
+                    f"range={range_start}-{range_end})")
+            if offset + len(page) > total:
+                raise SupabaseReadError(f"{table}: page exceeds total ({offset + len(page)}>{total})")
+        elif range_start is not None:
+            raise SupabaseReadError(f"{table}: Content-Range lists rows but body is empty")
+        for row in page:
+            if not isinstance(row, dict) or row.get("id") is None or isinstance(row.get("id"), bool):
+                raise SupabaseReadError(f"{table}: row without a valid id (cannot verify paging)")
         rows.extend(page)
         if len(rows) >= total:
             break
@@ -1741,7 +1759,7 @@ async def sb_get_all_strict(
         raise SupabaseReadError(f"{table}: too many pages")
     if len(rows) != total:
         raise SupabaseReadError(f"{table}: collected {len(rows)} rows but total is {total}")
-    ids = [r.get("id") for r in rows if isinstance(r, dict) and r.get("id") is not None]
+    ids = [r["id"] for r in rows]
     if len(ids) != len(set(ids)):
         # rows were inserted/deleted between pages: a row was read twice (so another was missed)
         raise SupabaseReadError(f"{table}: duplicate ids while paging (data changed mid-read)")

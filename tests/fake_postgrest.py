@@ -26,7 +26,7 @@ class FakePostgREST:
         self.fail_body_contains: dict[str, str] = {}
         # Task #206: PostgREST paging stand-in. max_rows emulates the project's db-max-rows cap
         # (a response is silently shortened -> HTTP 206 + Content-Range); range_quirk breaks the
-        # header contract: None | "missing" | "garbled" | "total_changes" | "no_page_progress" | "total_understated" | "overlap"
+        # header contract: None | "missing" | "garbled" | "total_changes" | "no_page_progress" | "total_understated" | "overlap" | "forged_range" | "star_nonempty" | "row_no_id" | "row_nondict" | "range_on_empty"
         self.max_rows: int | None = None
         self.range_quirk: str | None = None
         self._range_calls = 0
@@ -103,8 +103,13 @@ class FakePostgREST:
                                     hit.update(item)
                                     out.append(dict(hit))
                                     continue
-                            rows.append(dict(item))
-                            out.append(dict(item))
+                            new_row = dict(item)
+                            if table == "raw_calls" and new_row.get("id") is None:
+                                # like the real serial primary key
+                                new_row["id"] = 1 + max(
+                                    [r["id"] for r in rows if isinstance(r.get("id"), int)] or [0])
+                            rows.append(new_row)
+                            out.append(dict(new_row))
                         if "return=minimal" in prefer:
                             self._send(201, None)
                         else:
@@ -139,6 +144,17 @@ class FakePostgREST:
                     crange = f"{offset}-{offset + len(page) - 1}/{shown_total}"
                 else:
                     crange = f"*/{shown_total}"
+                if quirk == "forged_range" and page:
+                    crange = f"{offset + 1}-{offset + len(page)}/{shown_total}"  # right count, wrong offsets
+                if quirk == "star_nonempty" and page:
+                    crange = f"*/{shown_total}"
+                if quirk == "row_no_id" and page:
+                    page = [{k: v for k, v in page[0].items() if k != "id"}] + page[1:]
+                if quirk == "row_nondict" and page:
+                    page = page[:-1] + ["not-a-row"]
+                if quirk == "range_on_empty":
+                    page = []
+                    crange = f"0-0/{shown_total}"
                 if quirk == "garbled":
                     crange = "items 0 of many"
                 raw = json.dumps(page).encode()

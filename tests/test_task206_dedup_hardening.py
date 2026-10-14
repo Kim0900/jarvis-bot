@@ -112,6 +112,10 @@ class StrictPagedRead(Base):
             "empty_page_before_total": dict(range_quirk="no_page_progress"),
             "more_rows_than_total": dict(range_quirk="total_understated"),
             "rows_shift_between_pages": dict(range_quirk="overlap"),
+            "forged_range_offsets": dict(range_quirk="forged_range"),
+            "star_range_on_nonempty_page": dict(range_quirk="star_nonempty"),
+            "row_without_id": dict(range_quirk="row_no_id"),
+            "row_not_a_dict": dict(range_quirk="row_nondict"),
         }
         for label, knobs in cases.items():
             with self.subTest(case=label):
@@ -130,6 +134,16 @@ class StrictPagedRead(Base):
         if "fail_mode" in knobs:
             s.fail_tables = {"raw_calls"}
             s.fail_methods = {"GET"}
+
+    async def test_header_listing_rows_for_an_empty_body_raises(self):
+        self.srv.tables["raw_calls"] = []  # a truly empty date must be answered "*/0", not "0-0/0"
+        self.srv.range_quirk = "range_on_empty"
+        with self.assertRaises(legacy.SupabaseReadError):
+            await legacy.sb_get_all_strict("raw_calls", {"날짜": f"eq.{DAY}"})
+
+    async def test_genuinely_empty_date_is_accepted(self):
+        self.srv.tables["raw_calls"] = []
+        self.assertEqual(await legacy.sb_get_all_strict("raw_calls", {"날짜": f"eq.{DAY}"}), [])
 
     async def test_too_many_pages_raises(self):
         self.srv.tables["raw_calls"] = filler_rows(50)
@@ -221,6 +235,21 @@ class GatePath(Base):
         self.assertTrue(res["ok"], res)
         self.assertEqual(self.count(), 2)
 
+    async def test_same_interval_and_fare_with_different_addresses_is_conservatively_quarantined(self):
+        # canonical_identity_v1 calls this STRONG_FULL_INTERVAL (date+platform+fare+start+end);
+        # addresses play no part.  The gate therefore does NOT claim to be false-positive free: two
+        # different trips with identical interval AND fare in one batch quarantine the whole batch
+        # (0 writes) and need a human decision.  Pinned so the policy cannot change silently.
+        a = trip("10:00", "10:10", 5000, frm="• 대구 A 동", to="• 대구 B 동")
+        b = trip("10:00", "10:10", 5000, frm="• 대구 C 동", to="• 대구 D 동")
+        res = await self.ingest([a, b], "SRC_SAMEINTERVAL")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["quarantine"])
+        self.assertEqual(res["error_code"], "RAW_CALL_IN_BATCH_DUPLICATE")
+        self.assertEqual(res["in_batch_duplicates"][0]["strength"], "STRONG_FULL_INTERVAL")
+        self.assertEqual(self.count(), 0)
+        self.assertEqual(self.writes(), [])
+
     async def test_lookup_failure_writes_nothing(self):
         self.srv.fail_mode = "503"
         self.srv.fail_tables = {"raw_calls"}
@@ -231,7 +260,8 @@ class GatePath(Base):
         self.assertEqual(self.count(), 0)
 
     async def test_header_fault_writes_nothing(self):
-        for quirk in ("missing", "garbled", "total_changes", "no_page_progress", "total_understated", "overlap"):
+        for quirk in ("missing", "garbled", "total_changes", "no_page_progress", "total_understated", "overlap",
+                      "forged_range", "star_nonempty", "row_no_id", "row_nondict"):
             with self.subTest(quirk=quirk):
                 self.srv.tables["raw_calls"] = filler_rows(2300)
                 self.srv.range_quirk = quirk
@@ -370,6 +400,12 @@ class LayoutPrimaryPath(Base):
         self.assertTrue(res["ok"], res)
         self.assertEqual((res["saved_count"], res["duplicate_skipped_count"]), (0, 1))
         self.assertEqual(self.count(), 701)
+
+    async def test_same_interval_and_fare_different_addresses_quarantined_here_too(self):
+        res = await self.persist(parsed([item("10:00", "10:10", 5000, "• 대구 A 동", "• 대구 B 동"),
+                                         item("10:00", "10:10", 5000, "• 대구 C 동", "• 대구 D 동")]))
+        self.assertEqual(res["error_code"], "LAYOUT_PRIMARY_IN_BATCH_DUPLICATE")
+        self.assertEqual(self.count(), 0)
 
     async def test_in_batch_strong_duplicate_quarantines_with_zero_writes(self):
         res = await self.persist(parsed([item("10:00", "10:10", 5000), item("10:00", "10:10", 5000)]))
