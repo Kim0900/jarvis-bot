@@ -1,0 +1,25 @@
+name: Task204 Retired Slack Patrol Regression
+
+on:
+  pull_request:
+    paths:
+      - "bot_v5_legacy.py"
+      - "tests/test_task204_retired_slack_patrol.py"
+      - ".github/workflows/task204-retired-slack-patrol.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax check (production module + scoped test)
+        run: python -m py_compile bot_v5_legacy.py tests/test_task204_retired_slack_patrol.py
+      - name: Task204 retired control block and preserved patrol regressions
+        run: python -m unittest discover -s tests -p 'test_task204_retired_slack_patrol.py' -v
