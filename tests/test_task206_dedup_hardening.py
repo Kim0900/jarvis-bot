@@ -116,6 +116,11 @@ class StrictPagedRead(Base):
             "star_range_on_nonempty_page": dict(range_quirk="star_nonempty"),
             "row_without_id": dict(range_quirk="row_no_id"),
             "row_not_a_dict": dict(range_quirk="row_nondict"),
+            "id_non_numeric_string": dict(range_quirk="id_str"),
+            "id_numeric_string": dict(range_quirk="id_numeric_str"),
+            "id_float": dict(range_quirk="id_float"),
+            "id_none": dict(range_quirk="id_none"),
+            "id_bool": dict(range_quirk="id_bool"),
         }
         for label, knobs in cases.items():
             with self.subTest(case=label):
@@ -261,7 +266,8 @@ class GatePath(Base):
 
     async def test_header_fault_writes_nothing(self):
         for quirk in ("missing", "garbled", "total_changes", "no_page_progress", "total_understated", "overlap",
-                      "forged_range", "star_nonempty", "row_no_id", "row_nondict"):
+                      "forged_range", "star_nonempty", "row_no_id", "row_nondict",
+                      "id_str", "id_numeric_str", "id_float", "id_none", "id_bool"):
             with self.subTest(quirk=quirk):
                 self.srv.tables["raw_calls"] = filler_rows(2300)
                 self.srv.range_quirk = quirk

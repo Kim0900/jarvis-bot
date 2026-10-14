@@ -1748,8 +1748,10 @@ async def sb_get_all_strict(
         elif range_start is not None:
             raise SupabaseReadError(f"{table}: Content-Range lists rows but body is empty")
         for row in page:
-            if not isinstance(row, dict) or row.get("id") is None or isinstance(row.get("id"), bool):
-                raise SupabaseReadError(f"{table}: row without a valid id (cannot verify paging)")
+            # Task #206 (CASSANDRA F2): raw_calls.id is an integer; only a real int counts
+            # (not bool, not a numeric string, not a float, not None).
+            if not isinstance(row, dict) or type(row.get("id")) is not int:
+                raise SupabaseReadError(f"{table}: row without a valid integer id (cannot verify paging)")
         rows.extend(page)
         if len(rows) >= total:
             break

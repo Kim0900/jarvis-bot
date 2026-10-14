@@ -26,7 +26,7 @@ class FakePostgREST:
         self.fail_body_contains: dict[str, str] = {}
         # Task #206: PostgREST paging stand-in. max_rows emulates the project's db-max-rows cap
         # (a response is silently shortened -> HTTP 206 + Content-Range); range_quirk breaks the
-        # header contract: None | "missing" | "garbled" | "total_changes" | "no_page_progress" | "total_understated" | "overlap" | "forged_range" | "star_nonempty" | "row_no_id" | "row_nondict" | "range_on_empty"
+        # header contract: None | "missing" | "garbled" | "total_changes" | "no_page_progress" | "total_understated" | "overlap" | "forged_range" | "star_nonempty" | "row_no_id" | "row_nondict" | "id_str" | "id_float" | "id_none" | "id_bool" | "id_numeric_str" | "range_on_empty"
         self.max_rows: int | None = None
         self.range_quirk: str | None = None
         self._range_calls = 0
@@ -150,6 +150,9 @@ class FakePostgREST:
                     crange = f"*/{shown_total}"
                 if quirk == "row_no_id" and page:
                     page = [{k: v for k, v in page[0].items() if k != "id"}] + page[1:]
+                if quirk in ("id_str", "id_float", "id_none", "id_bool", "id_numeric_str") and page and offset == 0:
+                    bad = {"id_str": "abc", "id_float": 7.5, "id_none": None, "id_bool": True, "id_numeric_str": "12"}[quirk]
+                    page = [dict(page[0], id=bad)] + page[1:]
                 if quirk == "row_nondict" and page:
                     page = page[:-1] + ["not-a-row"]
                 if quirk == "range_on_empty":
