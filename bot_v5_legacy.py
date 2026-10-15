@@ -1876,7 +1876,7 @@ def telegram_recipients() -> list:
     out = []
     for cid in (os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")):
         cid = (cid or "").strip()
-        if cid:
+        if cid and cid not in [c for _h, c in out]:       # the same chat twice is one recipient
             out.append((hashlib.sha256(cid.encode()).hexdigest()[:8], cid))
     return out
 
@@ -6439,6 +6439,17 @@ def _patrol_exc_text(exc: BaseException) -> str:
     return text[:300] if text else type(exc).__name__
 
 
+async def _patrol_read_events(cutoff) -> list:
+    """Strict read of the events since ``cutoff``.  New events arriving between two pages change
+    the total and make the strict reader refuse, so the read is repeated once before the
+    detector reports a self-failure."""
+    params = {"created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}"}
+    try:
+        return await sb_get_all_strict("magi_task_events", params, key_col="event_id")
+    except SupabaseReadError:
+        return await sb_get_all_strict("magi_task_events", params, key_col="event_id")
+
+
 class PatrolLedgerIO:
     """Task #198: the real I/O behind patrol_alert_ledger.AlertDispatcher."""
 
@@ -6629,9 +6640,7 @@ async def run_geomnuri_patrol_once() -> dict:
     # 3) 자동 에이전트 이벤트 반복루프 — task#68 Golden Failure Case 대응
     try:
         cutoff = now - timedelta(minutes=GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES)
-        events = await sb_get_all_strict("magi_task_events", {
-            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
-        }, key_col="event_id")
+        events = await _patrol_read_events(cutoff)
         groups = {}
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))
@@ -6750,9 +6759,7 @@ async def run_geomnuri_patrol_once() -> dict:
     # 5) task-linked domain NULL 재발 — task#83 회귀 감시
     try:
         cutoff = now - timedelta(hours=1)
-        events = await sb_get_all_strict("magi_task_events", {
-            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
-        }, key_col="event_id")
+        events = await _patrol_read_events(cutoff)
         bad = []
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))

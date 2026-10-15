@@ -39,6 +39,7 @@ class MemIO:
         self.task_lookups = 0
         self.insert_raises = False
         self.cas_log = []
+        self.after_read_row = None
 
     # --- environment
     def now(self):
@@ -84,9 +85,11 @@ class MemIO:
         await asyncio.sleep(0)
         if self.read_row_error:
             raise RuntimeError("reread failed")
-        if key not in self.rows:
-            return None
-        return LedgerRow(key, *self.rows[key])
+        hook, self.after_read_row = self.after_read_row, None
+        snapshot = None if key not in self.rows else LedgerRow(key, *self.rows[key])
+        if hook:
+            hook()                       # e.g. the earlier, "lost" write commits right after our look
+        return snapshot
 
     async def create_row(self, key, text, lra):
         await asyncio.sleep(0)
@@ -99,7 +102,7 @@ class MemIO:
         if key in self.rows:
             return pal.LOSE, []
         self.rows[key] = [norm(lra), text]
-        return (pal.AMBIGUOUS, None) if mode == "commit" else (pal.WIN, self._row(key))
+        return (pal.AMBIGUOUS, None) if mode == "commit" else (pal.WIN, [self._row(key)])
 
     async def cas_row(self, key, expected, text, lra):
         await asyncio.sleep(0)
@@ -113,7 +116,7 @@ class MemIO:
         if key not in self.rows or self.rows[key][0] != expected:
             return pal.LOSE, []
         self.rows[key] = [norm(lra), text]
-        return (pal.AMBIGUOUS, None) if mode == "commit" else (pal.WIN, self._row(key))
+        return (pal.AMBIGUOUS, None) if mode == "commit" else (pal.WIN, [self._row(key)])
 
     def flush_late(self):
         for kind, key, expected, text, lra in self.late:
@@ -386,6 +389,7 @@ class AmbiguousWriteTests(Base):
         self.assertEqual(self.io.events, {})
         self.assertEqual(self.alert_sends(), [])
         self.assertIn((sk("k1"), "claim_unresolved"), rep.notes)
+        self.assertEqual(len(self.io.sent), 1)
         # the same process does not try again while the hold lasts, even though the ledger says "claim"
         self.io.read_row_error = False
         self.io.rows[sk("k1")] = ["2000-01-01T00:00:00.000000+00:00", "[WARN] old"]
@@ -400,6 +404,68 @@ class AmbiguousWriteTests(Base):
         # CLAIMED landed, EVENT write failed twice -> no Telegram for the alert
         self.assertEqual(len(self.io.events), 1)
         self.assertEqual(self.alert_sends(), [])
+
+
+class LateCommitDeliveryTests(Base):
+    """A write whose answer was lost may commit just AFTER our re-read; the alert must still be delivered."""
+
+    async def test_late_cas_commit_after_reread_is_not_mistaken_for_a_lost_race(self):
+        self.io.put(sk("k1"), "[WARN] old", age=99999)
+        self.io.faults = [("cas", "late")]
+        self.io.after_read_row = self.io.flush_late
+        await self.run_once([cand()])
+        self.assertEqual(len(self.io.events), 1)
+        self.assertEqual(len(self.alert_sends()), 1)
+        self.assertEqual(self.io.value(sk("k1")).state, pal.TG_ACKED)
+
+    async def test_late_create_commit_after_reread_is_not_mistaken_for_a_lost_race(self):
+        self.io.faults = [("create", "late")]
+        self.io.after_read_row = self.io.flush_late
+        await self.run_once([cand()])
+        self.assertEqual(len(self.io.events), 1)
+        self.assertEqual(len(self.alert_sends()), 1)
+        self.assertEqual(self.io.value(sk("k1")).state, pal.TG_ACKED)
+
+    async def test_late_commit_of_the_sending_state_still_sends(self):
+        # fault the 3rd transition (CLAIMED, EVENT ok; TG_SENDING ambiguous+late)
+        orig = self.io.cas_row
+        n = {"i": 0}
+
+        async def counting(key, expected, text, lra):
+            n["i"] += 1
+            if n["i"] == 2:
+                self.io.faults.append(("cas", "late"))
+                self.io.after_read_row = self.io.flush_late
+            return await orig(key, expected, text, lra)
+
+        self.io.cas_row = counting
+        await self.run_once([cand()])
+        self.assertEqual(len(self.io.events), 1)
+        self.assertEqual(len(self.alert_sends()), 1)
+        self.assertEqual(self.io.value(sk("k1")).state, pal.TG_ACKED)
+
+
+class HandEditedRowTests(Base):
+    async def test_unparseable_state_older_than_cooldown_is_replaced(self):
+        self.io.put(sk("k1"), "S2|BROKEN|garbage", age=4000)
+        await self.run_once([cand(cooldown=3600)])
+        self.assertEqual(len(self.io.events), 1)
+        self.assertEqual(self.io.value(sk("k1")).state, pal.TG_ACKED)
+
+    async def test_unicode_digits_are_rejected_not_crashing(self):
+        good = format_value(LedgerValue(state=pal.EVENT, c=5, token="t", e=1))
+        with self.assertRaises(pal.LedgerParseError):
+            parse_value(good.replace("c=5", "c=²"))
+        self.io.put(sk("k1"), good.replace("c=5", "c=²"), age=10)
+        self.io.put(sk("k2"), "[WARN] old", age=99999)
+        await self.run_once([cand("k1"), cand("k2")])
+        self.assertEqual(len(self.io.events), 1)               # k2 still handled
+
+    async def test_many_bad_rows_give_one_notice(self):
+        for i in range(5):
+            self.io.put(sk(f"b{i}"), "S2|BROKEN", age=10)
+        await self.run_once([cand(f"b{i}") for i in range(5)])
+        self.assertEqual(len(self.io.sent), 1)
 
 
 class InsertUnknownTests(Base):

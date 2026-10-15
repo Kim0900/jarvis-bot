@@ -21,6 +21,7 @@ from fake_postgrest import FakePostgREST  # noqa: E402
 
 UTC = timezone.utc
 JOBS = list(legacy._PATROL_SCHEDULER_MAX_AGE_SECONDS)
+ORIG_RECIPIENTS = legacy.telegram_recipients
 
 
 def iso(dt):
@@ -55,6 +56,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         s.rpc = {}
         s.max_rows = None
         s.range_quirk = None
+        s.ts_style = "utc"
         s._range_calls = 0
         s.requests.clear()
         pal.reset_local_state()
@@ -276,6 +278,15 @@ class PatrolIntegrationTests(Base):
         self.assertEqual(len(self.events()), 2)
         self.assertEqual(len(self.alert_sends()), 2)
 
+    async def test_server_timestamp_text_is_reused_not_our_own(self):
+        self.srv.ts_style = "kst"           # the server answers in another zone/format than we sent
+        self.fail_jobs(JOBS[:2])
+        await self.patrol()
+        self.assertEqual(len(self.events()), 2)
+        self.assertEqual(len(self.alert_sends()), 2)
+        for n in JOBS[:2]:
+            self.assertEqual(self.ledger_value(f"patrol_alert::scheduler_fail::{n}").state, pal.TG_ACKED)
+
     async def test_claim_committed_but_response_lost_continues_once(self):
         for mode in ("commit_503", "commit_reset", "commit_empty", "commit_badjson", "commit_dict", "commit_two_rows"):
             with self.subTest(mode=mode):
@@ -286,6 +297,8 @@ class PatrolIntegrationTests(Base):
                 await self.patrol()
                 self.assertEqual(len(self.events()), 1, mode)
                 self.assertEqual(len(self.alert_sends()), 1, mode)
+                self.assertEqual(self.ledger_value(f"patrol_alert::scheduler_fail::{JOBS[0]}").state,
+                                 pal.TG_ACKED, mode)
 
     async def test_claim_dropped_before_commit_is_retried_once(self):
         self.fail_jobs([JOBS[0]])
@@ -301,6 +314,7 @@ class PatrolIntegrationTests(Base):
         await self.patrol()
         await asyncio.sleep(0.6)
         self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alert_sends()), 1)
         self.assertEqual(self.ledger_value(f"patrol_alert::scheduler_fail::{JOBS[0]}").state, pal.TG_ACKED)
 
     async def test_cas_that_commits_late_cannot_duplicate(self):
@@ -315,6 +329,7 @@ class PatrolIntegrationTests(Base):
         await self.patrol()
         await asyncio.sleep(0.6)
         self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len(self.alert_sends()), 1)
         self.assertEqual(self.ledger_value(key).state, pal.TG_ACKED)
 
     async def test_event_insert_with_lost_response_is_never_repeated(self):
@@ -441,6 +456,12 @@ class StrictWriteTests(Base):
         with patch.object(legacy, "SUPABASE_URL", "http://127.0.0.1:1"):
             out, _ = await w("POST", "scheduler_status", json_body={"job_name": "x"}, timeout=1.0)
             self.assertEqual(out, "AMBIGUOUS")
+
+    async def test_duplicate_recipient_is_one_recipient(self):
+        with patch.dict(os.environ, {"ALLOWED_CHAT_ID": "7", "ALLOWED_CHAT_ID2": "7"}):
+            self.assertEqual(len(ORIG_RECIPIENTS()), 1)
+        with patch.dict(os.environ, {"ALLOWED_CHAT_ID": "7", "ALLOWED_CHAT_ID2": "8"}):
+            self.assertEqual(len(ORIG_RECIPIENTS()), 2)
 
     async def test_rpc_strict(self):
         self.srv.rpc = {"ok": [{"a": 1}], "bad": {"x": 1}}

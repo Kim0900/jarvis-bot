@@ -123,7 +123,7 @@ def parse_value(text: str) -> LedgerValue:
         body = field_of(raw, name)
         if body == "" and optional:
             return None
-        if not body.isdigit():
+        if not (body.isascii() and body.isdigit()):
             raise LedgerParseError(f"bad {name}")
         return int(body)
 
@@ -284,6 +284,7 @@ class AlertDispatcher:
         if the row now holds exactly our value the write landed; if it is unchanged the write
         is repeated once; anything else is UNRESOLVED (the caller stops, never guesses)."""
         text = format_value(value)
+        had_ambiguous = False
         for attempt in (1, 2):
             last = self._fresh_last_run_at(expected_raw if not new_row else None)
             if new_row:
@@ -293,7 +294,18 @@ class AlertDispatcher:
             if outcome == WIN:
                 return WIN, _row_last_run_at(row, last), text
             if outcome == LOSE:
+                if not had_ambiguous:
+                    return LOSE, None, None
+                # an earlier attempt of OURS was ambiguous and may have committed after our
+                # re-read: a LOSE now can be our own write -> look at the row before deciding
+                try:
+                    current = await self.io.read_row(state_key)
+                except Exception:
+                    return UNRESOLVED, None, None
+                if current is not None and current.last_result == text:
+                    return WIN, current.last_run_at, text
                 return LOSE, None, None
+            had_ambiguous = True
             # AMBIGUOUS: look at the row
             try:
                 current = await self.io.read_row(state_key)
@@ -326,7 +338,11 @@ class AlertDispatcher:
             return "claim", row.last_run_at
         try:
             val = parse_value(text)
-        except LedgerParseError:
+        except (LedgerParseError, ValueError):
+            # last_run_at only moves when a transition is written, so an unreadable state that is
+            # older than the cooldown is safe to replace; a younger one is held and reported
+            if last is not None and (now - last).total_seconds() >= cand.cooldown_seconds:
+                return "claim", row.last_run_at
             return "bad", "unparseable_state"
         if last is None:
             return "bad", "unparseable_last_run_at"
@@ -387,21 +403,24 @@ class AlertDispatcher:
 
         started = self.io.monotonic()
         handled = 0
+        bad_keys: list = []
         for idx, cand in enumerate(ordered):
             row = ledger.get(cand.state_key)
             hold_until = _LOCAL_HOLD.get(cand.state_key)
             if hold_until is not None and self.io.monotonic() < hold_until:
                 report.skipped.append((cand.state_key, "local_hold"))
                 continue
-            plan, arg = self._decide(cand, row)
+            try:
+                plan, arg = self._decide(cand, row)
+            except Exception as exc:          # a hand-edited row must never stop the run
+                logger.error(f"patrol decide failed for {cand.state_key}: {type(exc).__name__}")
+                plan, arg = "bad", "decide_error"
             if plan == "skip":
                 report.skipped.append((cand.state_key, arg))
                 continue
             if plan == "bad":
                 report.skipped.append((cand.state_key, arg))
-                await self._local_meta_notice(
-                    f"bad_state::{cand.state_key}",
-                    f"⚠️ 순라 장부 상태를 해석하지 못해 경보를 보류했습니다: {cand.state_key[:80]} ({arg})")
+                bad_keys.append(cand.state_key)
                 continue
             if handled >= self.max_alerts or (self.io.monotonic() - started) >= self.deadline_seconds:
                 report.deferred.extend(c.state_key for c in ordered[idx:]
@@ -413,6 +432,11 @@ class AlertDispatcher:
             except Exception as exc:  # one alert must never stop the others
                 logger.error(f"patrol alert {cand.state_key} failed: {type(exc).__name__}: {exc}")
                 report.notes.append((cand.state_key, f"exception:{type(exc).__name__}"))
+        if bad_keys:                           # one local, rate-limited notice for all of them
+            await self._local_meta_notice(
+                "bad_state",
+                f"⚠️ 순라 장부 상태를 해석하지 못해 경보 {len(bad_keys)}건을 보류했습니다: "
+                + ", ".join(k[:60] for k in bad_keys[:3]))
         return report
 
     # ---- per-alert flows --------------------------------------------------------------
@@ -442,7 +466,7 @@ class AlertDispatcher:
             return
         if w == UNRESOLVED:
             # we do not know whether we own the claim: never insert; hold locally
-            _LOCAL_HOLD[sk] = self.io.monotonic() + cand.cooldown_seconds
+            _LOCAL_HOLD[sk] = self.io.monotonic() + min(cand.cooldown_seconds, LOCAL_META_COOLDOWN_SECONDS)
             report.notes.append((sk, "claim_unresolved"))
             await self._notify_unknown(cand, "경보 확보 결과 불명")
             return
@@ -572,6 +596,8 @@ def value_key(dispatcher: AlertDispatcher, state_key: str) -> str:
 def _row_last_run_at(row, fallback: str) -> str:
     """The raw ``last_run_at`` the SERVER reports for the row we just wrote (it may be
     formatted differently from what we sent; the next compare-and-swap must use it)."""
+    if isinstance(row, list) and len(row) == 1:          # sb_write_strict returns [row]
+        row = row[0]
     if isinstance(row, dict) and isinstance(row.get("last_run_at"), str):
         return row["last_run_at"]
     if isinstance(row, LedgerRow) and row.last_run_at:

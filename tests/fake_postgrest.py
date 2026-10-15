@@ -247,15 +247,20 @@ class FakePostgREST:
             return f
         return None
 
-    @staticmethod
-    def _norm_ts(value):
-        """scheduler_status.last_run_at comes back like the real timestamptz: UTC, 6-digit fraction."""
+    ts_style = "utc"      # "utc": ...+00:00 ; "kst": ...+09:00 (a server timezone setting changes the text)
+
+    def _norm_ts(self, value):
+        """scheduler_status.last_run_at comes back like the real timestamptz: 6-digit fraction, in
+        the server's zone, so code that reuses its own timestamp text instead of the server's is caught."""
         try:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError:
             return value
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        if self.ts_style == "kst":
+            from datetime import timedelta
+            return (dt.astimezone(timezone.utc) + timedelta(hours=9)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "+09:00"
         return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "+00:00"
 
     def _norm_row(self, table: str, row: dict) -> dict:
