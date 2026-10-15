@@ -1752,6 +1752,13 @@ async def sb_get_all_strict(
             # (not bool, not a numeric string, not a float, not None).
             if not isinstance(row, dict) or type(row.get("id")) is not int:
                 raise SupabaseReadError(f"{table}: row without a valid integer id (cannot verify paging)")
+        # Task #206 (CASSANDRA 5296): the request asks for order=id.asc, so ids must be strictly
+        # increasing inside a page and across pages; anything else is an unreliable read.
+        prev_id = rows[-1]["id"] if rows else None
+        for row in page:
+            if prev_id is not None and row["id"] <= prev_id:
+                raise SupabaseReadError(f"{table}: ids not strictly increasing (order=id.asc violated)")
+            prev_id = row["id"]
         rows.extend(page)
         if len(rows) >= total:
             break

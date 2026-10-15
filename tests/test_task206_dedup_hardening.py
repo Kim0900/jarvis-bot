@@ -121,6 +121,8 @@ class StrictPagedRead(Base):
             "id_float": dict(range_quirk="id_float"),
             "id_none": dict(range_quirk="id_none"),
             "id_bool": dict(range_quirk="id_bool"),
+            "ids_descending_in_page": dict(range_quirk="ids_reversed"),
+            "id_smaller_than_previous_page": dict(range_quirk="ids_cross_page"),
         }
         for label, knobs in cases.items():
             with self.subTest(case=label):
@@ -267,7 +269,8 @@ class GatePath(Base):
     async def test_header_fault_writes_nothing(self):
         for quirk in ("missing", "garbled", "total_changes", "no_page_progress", "total_understated", "overlap",
                       "forged_range", "star_nonempty", "row_no_id", "row_nondict",
-                      "id_str", "id_numeric_str", "id_float", "id_none", "id_bool"):
+                      "id_str", "id_numeric_str", "id_float", "id_none", "id_bool",
+                      "ids_reversed", "ids_cross_page"):
             with self.subTest(quirk=quirk):
                 self.srv.tables["raw_calls"] = filler_rows(2300)
                 self.srv.range_quirk = quirk
