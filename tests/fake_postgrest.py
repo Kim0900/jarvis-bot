@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlparse
 
@@ -31,6 +33,13 @@ class FakePostgREST:
         self.range_quirk: str | None = None
         self._range_calls = 0
         self.requests: list[tuple[str, str]] = []
+        # Task #198: write fault injection.  Each entry: {"method","table","contains","mode","times","delay"}
+        # mode: "commit_503" (applied, client sees 503) | "commit_reset" (applied, connection dropped) |
+        #       "drop_503" (not applied, 503) | "drop_reset" | "late_commit" (503 now, applied after delay s)
+        self.write_faults: list[dict] = []
+        self.rpc: dict[str, object] = {}                  # rpc function name -> JSON body returned (HTTP 200)
+        self.fail_query_contains: dict[str, str] = {}     # {table: substring}: a GET whose query has it answers 503
+        self.write_log: list[tuple[str, str, str]] = []   # (method, table, body) of every write that reached the server
         self._lock = threading.Lock()
         outer = self
 
@@ -68,6 +77,14 @@ class FakePostgREST:
                             return
                         self._send(503, {"message": "PGRST002 schema cache unavailable"})
                         return
+                    qneedle = outer.fail_query_contains.get(table)
+                    if qneedle and method == "GET" and qneedle in (url.query or "") + self.path:
+                        self._send(503, {"message": "injected query failure"})
+                        return
+                    if "/rpc/" in url.path and method == "POST":
+                        outer.write_log.append((method, "rpc/" + table, body.decode("utf-8", "replace")))
+                        self._send(200, outer.rpc.get(table, []))
+                        return
                     needle = outer.fail_body_contains.get(table)
                     if needle and method == "POST" and needle.encode() in body:
                         self._send(503, {"message": "injected per-row write failure"})
@@ -87,44 +104,54 @@ class FakePostgREST:
                         if "count=exact" in self.headers.get("Prefer", ""):
                             self._send_counted(rows, params)
                             return
-                        self._send(200, outer._select(rows, params))
-                    elif method == "POST":
-                        data = json.loads(body or b"{}")
-                        items = data if isinstance(data, list) else [data]
-                        qp = dict(params)
-                        conflict = qp.get("on_conflict")
+                        out = outer._select(rows, params)
+                        if outer.max_rows is not None:      # PostgREST db-max-rows applies to every read
+                            out = out[: outer.max_rows]
+                        self._send(200, out)
+                    elif method in ("POST", "PATCH"):
+                        outer.write_log.append((method, table, body.decode("utf-8", "replace")))
+                        fault = outer._take_fault(method, table, body)
                         prefer = self.headers.get("Prefer", "")
-                        out = []
-                        for item in items:
-                            if conflict and "merge-duplicates" in prefer:
-                                keys = conflict.split(",")
-                                hit = next((r for r in rows if all(r.get(k) == item.get(k) for k in keys)), None)
-                                if hit is not None:
-                                    hit.update(item)
-                                    out.append(dict(hit))
-                                    continue
-                            new_row = dict(item)
-                            if table == "raw_calls" and new_row.get("id") is None:
-                                # like the real serial primary key
-                                new_row["id"] = 1 + max(
-                                    [r["id"] for r in rows if isinstance(r.get("id"), int)] or [0])
-                            rows.append(new_row)
-                            out.append(dict(new_row))
-                        if "return=minimal" in prefer:
-                            self._send(201, None)
-                        else:
-                            self._send(201, out)
-                    elif method == "PATCH":
-                        data = json.loads(body or b"{}")
-                        for r in outer._filter(rows, params):
-                            r.update(data)
-                        self._send(204, None)
+                        if fault and fault["mode"] in ("drop_503", "drop_reset"):
+                            if fault["mode"] == "drop_reset":
+                                self.connection.close()
+                            else:
+                                self._send(503, {"message": "injected drop"})
+                            return
+                        if fault and fault["mode"] == "late_commit":
+                            def _later(m=method, t=table, b=body, p=params, pr=prefer, d=fault.get("delay", 0.3)):
+                                time.sleep(d)
+                                with outer._lock:
+                                    outer._apply(m, t, b, p, pr)
+                            threading.Thread(target=_later, daemon=True).start()
+                            self._send(503, {"message": "injected late commit"})
+                            return
+                        status, out = outer._apply(method, table, body, params, prefer)
+                        if fault and fault["mode"] in ("commit_empty", "commit_badjson", "commit_two_rows", "commit_dict"):
+                            raw = {"commit_empty": b"", "commit_badjson": b"<html>", "commit_dict": b"{}",
+                                   "commit_two_rows": json.dumps([out[0], out[0]] if out else [{}, {}]).encode()}[fault["mode"]]
+                            self.send_response(status)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(raw)))
+                            self.end_headers()
+                            self.wfile.write(raw)
+                            return
+                        if fault and fault["mode"] in ("commit_503", "commit_reset"):
+                            if fault["mode"] == "commit_reset":
+                                self.connection.close()
+                            else:
+                                self._send(503, {"message": "injected after commit"})
+                            return
+                        self._send(status, out)
                     else:
                         self._send(405, {"message": "unsupported"})
 
             def _send_counted(self, rows, params):
                 qp = dict(params)
                 everything = outer._select(rows, [(k, v) for k, v in params if k not in ("limit", "offset")])
+                keycol = (qp.get("order") or "id.asc").split(".")[0]
+                if outer.range_quirk == "collation":          # a DB collation that differs from Python's str order
+                    everything = sorted(everything, key=lambda r: str(r.get(keycol)).lower())
                 total = len(everything)
                 offset = int(qp.get("offset") or 0)
                 limit = int(qp.get("limit") or total)
@@ -157,6 +184,15 @@ class FakePostgREST:
                     page = list(reversed(page))                       # descending inside the page
                 if quirk == "ids_cross_page" and page and outer._range_calls == 2:
                     page = [dict(page[0], id=0)] + page[1:]           # smaller than everything before
+                if quirk in ("key_missing", "key_none", "key_number", "key_empty", "key_bool") and page and offset == 0:
+                    first = dict(page[0])
+                    if quirk == "key_missing":
+                        first.pop(keycol, None)
+                    else:
+                        first[keycol] = {"key_none": None, "key_number": 12, "key_empty": "", "key_bool": True}[quirk]
+                    page = [first] + page[1:]
+                if quirk == "key_duplicate" and len(page) > 1:
+                    page = [page[0], dict(page[1], **{keycol: page[0].get(keycol)})] + page[2:]
                 if quirk == "row_nondict" and page:
                     page = page[:-1] + ["not-a-row"]
                 if quirk == "range_on_empty":
@@ -199,8 +235,78 @@ class FakePostgREST:
         self._server.shutdown()
         self._server.server_close()
 
+    def _take_fault(self, method: str, table: str, body: bytes):
+        for f in self.write_faults:
+            if f.get("method") not in (None, method) or f.get("table") not in (None, table):
+                continue
+            if f.get("contains") and f["contains"].encode() not in body:
+                continue
+            if f.get("times", 1) <= 0:
+                continue
+            f["times"] = f.get("times", 1) - 1
+            return f
+        return None
+
+    @staticmethod
+    def _norm_ts(value):
+        """scheduler_status.last_run_at comes back like the real timestamptz: UTC, 6-digit fraction."""
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "+00:00"
+
+    def _norm_row(self, table: str, row: dict) -> dict:
+        if table == "scheduler_status" and row.get("last_run_at") is not None:
+            row["last_run_at"] = self._norm_ts(row["last_run_at"])
+        return row
+
+    def _apply(self, method: str, table: str, body: bytes, params, prefer: str):
+        rows = self.tables.setdefault(table, [])
+        data = json.loads(body or b"{}")
+        if method == "PATCH":
+            hit = self._filter(rows, params)
+            for r in hit:
+                r.update(data)
+                self._norm_row(table, r)
+            if "return=representation" in prefer:
+                return 200, [dict(r) for r in hit]
+            return 204, None
+        items = data if isinstance(data, list) else [data]
+        qp = dict(params)
+        conflict = qp.get("on_conflict")
+        out = []
+        for item in items:
+            if conflict and ("merge-duplicates" in prefer or "ignore-duplicates" in prefer):
+                keys = conflict.split(",")
+                hit = next((r for r in rows if all(r.get(k) == item.get(k) for k in keys)), None)
+                if hit is not None:
+                    if "merge-duplicates" in prefer:
+                        hit.update(item)
+                        self._norm_row(table, hit)
+                        out.append(dict(hit))
+                    continue
+            new_row = dict(item)
+            if table == "raw_calls" and new_row.get("id") is None:
+                new_row["id"] = 1 + max([r["id"] for r in rows if isinstance(r.get("id"), int)] or [0])
+            if table == "magi_task_events":
+                if new_row.get("event_id") is None:
+                    new_row["event_id"] = 1 + max([r["event_id"] for r in rows if isinstance(r.get("event_id"), int)] or [0])
+                new_row.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+                new_row.setdefault("domain", "OPS")
+            self._norm_row(table, new_row)
+            rows.append(new_row)
+            out.append(dict(new_row))
+        if "return=minimal" in prefer:
+            return 201, None
+        return 201, out
+
     @staticmethod
     def _match(value, op: str, arg: str) -> bool:
+        if op == "is":
+            return (value is None) if arg == "null" else (value is not None)
         if op == "in":
             return str(value) in [a.strip('"') for a in arg.strip("()").split(",")]
         if value is None:
@@ -218,6 +324,9 @@ class FakePostgREST:
             return left > right
         if op == "neq":
             return left != right
+        if op == "like":
+            import fnmatch
+            return fnmatch.fnmatchcase(left, right.replace("*", "\x00").replace("[", "[[]").replace("\x00", "*"))
         return True
 
     def _filter(self, rows: list[dict], params: list[tuple[str, str]]) -> list[dict]:
