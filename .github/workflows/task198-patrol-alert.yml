@@ -1,0 +1,51 @@
+name: Task198 patrol alert hardening
+
+on:
+  pull_request:
+    paths:
+      - "patrol_alert_ledger.py"
+      - "bot_v5_legacy.py"
+      - "tests/fake_postgrest.py"
+      - "tests/test_task198_patrol_ledger.py"
+      - "tests/test_task198_patrol_integration.py"
+      - "tests/test_task204_retired_slack_patrol.py"
+      - "tests/test_task206_dedup_hardening.py"
+      - ".github/workflows/task198-patrol-alert.yml"
+  push:
+    branches: [main]
+    paths:
+      - "patrol_alert_ledger.py"
+      - "bot_v5_legacy.py"
+      - "tests/fake_postgrest.py"
+      - "tests/test_task198_patrol_ledger.py"
+      - "tests/test_task198_patrol_integration.py"
+      - ".github/workflows/task198-patrol-alert.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: .
+      PYTHONDONTWRITEBYTECODE: "1"
+      SUPABASE_URL: http://127.0.0.1:1
+      SUPABASE_KEY: ci-test-key
+      TELEGRAM_BOT_TOKEN: ci-test-token
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m py_compile patrol_alert_ledger.py bot_v5_legacy.py
+      - name: Patrol alert state machine
+        run: python -m unittest tests.test_task198_patrol_ledger -v
+      - name: Patrol alert integration (real code, fake PostgREST)
+        run: python -m unittest tests.test_task198_patrol_integration -v
+      - name: Retired Slack patrol guard (#204) and strict reader (#206) still hold
+        run: python -m unittest tests.test_task204_retired_slack_patrol tests.test_task206_dedup_hardening -v
