@@ -138,6 +138,20 @@ def _fail(source_id, error_code, **extra):
     }
 
 
+async def strict_select_raw_calls(bot, params):
+    """Task #206: strict reads only for the layout-primary dedup lookups.
+
+    The lenient ``sb_select`` turned HTTP errors and garbled/empty 200 bodies into []
+    ("nothing exists yet") and a ``limit`` silently hid rows.  A one-row existence probe
+    uses the strict single read; every other lookup must return ALL rows (paged and
+    Content-Range verified) or raise.
+    """
+    params = dict(params)
+    if params.get("limit") == "1":
+        return await bot.sb_get_strict("raw_calls", params)
+    return await bot.sb_get_all_strict("raw_calls", params)
+
+
 def install(bot):
     if getattr(bot, "_task164_primary_patch_installed", False):
         return
@@ -218,7 +232,7 @@ def install(bot):
         parsed = layout_to_daily_history(layout)
 
         async def select_rows(params):
-            return await bot.sb_select("raw_calls", params)
+            return await strict_select_raw_calls(bot, params)
 
         async def bulk_insert(payloads):
             return await bot.sb_h("POST", "raw_calls", json=payloads)
@@ -241,16 +255,19 @@ def install(bot):
                 inserted_count=saved_count,
             )
 
-        persist = await persist_layout_primary(
-            parsed,
-            source_id,
-            select_rows=select_rows,
-            bulk_insert=bulk_insert,
-            mark_completed=mark_completed,
-            rollback_source_rows=bot.delete_partial_source_calls,
-            calc_service_date=bot.calc_service_date,
-            validate_call_payload=bot.validate_call_payload,
-        )
+        from raw_call_identity_gate import raw_call_write_guard
+
+        async with raw_call_write_guard():
+            persist = await persist_layout_primary(
+                parsed,
+                source_id,
+                select_rows=select_rows,
+                bulk_insert=bulk_insert,
+                mark_completed=mark_completed,
+                rollback_source_rows=bot.delete_partial_source_calls,
+                calc_service_date=bot.calc_service_date,
+                validate_call_payload=bot.validate_call_payload,
+            )
         if not persist.get("ok"):
             return _fail(
                 source_id,

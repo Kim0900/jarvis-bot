@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date as _date
 
 from canonical_identity_v1 import identity_strength, platform_key
+from raw_call_identity_gate import find_in_batch_strong_duplicates
 
 LAYOUT_COMPLETE_STATUS = "COMPLETE_LAYOUT_VALIDATED"
 ACTION_USE_LAYOUT = "USE_LAYOUT"
@@ -256,6 +257,18 @@ async def persist_layout_primary(
             }
         payloads.append(payload)
 
+    in_batch = find_in_batch_strong_duplicates(payloads)
+    if in_batch:
+        # Task #206 / CASSANDRA 5126: one screen listing the same trip twice is anomalous
+        # and also cannot satisfy inserted+covered==expected honestly -> quarantine, 0 writes.
+        return {
+            "ok": False,
+            "quarantine": True,
+            "error_code": "LAYOUT_PRIMARY_IN_BATCH_DUPLICATE",
+            "overlap_count": len(in_batch),
+            "overlap_candidates": in_batch[:20],
+        }
+
     expected = _int_or_none(parsed.get("표시건수"))
     expected_sum = _int_or_none(parsed.get("표시금액"))
     if not payloads or expected is None or expected_sum is None:
@@ -267,7 +280,9 @@ async def persist_layout_primary(
 
     date_rows = []
     for candidate_date in sorted({str(p.get("날짜")) for p in payloads if p.get("날짜")}):
-        rows = await select_rows({"날짜": f"eq.{candidate_date}", "limit": "500"})
+        # Task #206: no row cap here; the injected reader must return EVERY row for the
+        # date (strict, paged) or raise - a silent cap would hide existing trips.
+        rows = await select_rows({"날짜": f"eq.{candidate_date}"})
         if rows:
             date_rows.extend(rows)
     partitioned = partition_kakao_payloads(date_rows, payloads, source_id)

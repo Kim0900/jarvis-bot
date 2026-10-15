@@ -24,6 +24,12 @@ class FakePostgREST:
         self.get_quirk: str | None = None
         # {table: substring}: a POST to `table` whose body contains the substring answers 503
         self.fail_body_contains: dict[str, str] = {}
+        # Task #206: PostgREST paging stand-in. max_rows emulates the project's db-max-rows cap
+        # (a response is silently shortened -> HTTP 206 + Content-Range); range_quirk breaks the
+        # header contract: None | "missing" | "garbled" | "total_changes" | "no_page_progress" | "total_understated" | "overlap" | "forged_range" | "star_nonempty" | "row_no_id" | "row_nondict" | "id_str" | "id_float" | "id_none" | "id_bool" | "id_numeric_str" | "ids_reversed" | "ids_cross_page" | "range_on_empty"
+        self.max_rows: int | None = None
+        self.range_quirk: str | None = None
+        self._range_calls = 0
         self.requests: list[tuple[str, str]] = []
         self._lock = threading.Lock()
         outer = self
@@ -78,6 +84,9 @@ class FakePostgREST:
                             self.end_headers()
                             self.wfile.write(raw)
                             return
+                        if "count=exact" in self.headers.get("Prefer", ""):
+                            self._send_counted(rows, params)
+                            return
                         self._send(200, outer._select(rows, params))
                     elif method == "POST":
                         data = json.loads(body or b"{}")
@@ -94,8 +103,13 @@ class FakePostgREST:
                                     hit.update(item)
                                     out.append(dict(hit))
                                     continue
-                            rows.append(dict(item))
-                            out.append(dict(item))
+                            new_row = dict(item)
+                            if table == "raw_calls" and new_row.get("id") is None:
+                                # like the real serial primary key
+                                new_row["id"] = 1 + max(
+                                    [r["id"] for r in rows if isinstance(r.get("id"), int)] or [0])
+                            rows.append(new_row)
+                            out.append(dict(new_row))
                         if "return=minimal" in prefer:
                             self._send(201, None)
                         else:
@@ -107,6 +121,58 @@ class FakePostgREST:
                         self._send(204, None)
                     else:
                         self._send(405, {"message": "unsupported"})
+
+            def _send_counted(self, rows, params):
+                qp = dict(params)
+                everything = outer._select(rows, [(k, v) for k, v in params if k not in ("limit", "offset")])
+                total = len(everything)
+                offset = int(qp.get("offset") or 0)
+                limit = int(qp.get("limit") or total)
+                if outer.max_rows is not None:
+                    limit = min(limit, outer.max_rows)
+                page = everything[offset: offset + limit]
+                outer._range_calls += 1
+                quirk = outer.range_quirk
+                if quirk == "no_page_progress" and offset > 0:
+                    page = []
+                if quirk == "overlap" and offset > 0:
+                    page = everything[offset - 1: offset - 1 + limit]  # row read twice, one missed
+                shown_total = total + (1 if quirk == "total_changes" and outer._range_calls > 1 else 0)
+                if quirk == "total_understated":
+                    shown_total = max(total - 1, 0)
+                if page:
+                    crange = f"{offset}-{offset + len(page) - 1}/{shown_total}"
+                else:
+                    crange = f"*/{shown_total}"
+                if quirk == "forged_range" and page:
+                    crange = f"{offset + 1}-{offset + len(page)}/{shown_total}"  # right count, wrong offsets
+                if quirk == "star_nonempty" and page:
+                    crange = f"*/{shown_total}"
+                if quirk == "row_no_id" and page:
+                    page = [{k: v for k, v in page[0].items() if k != "id"}] + page[1:]
+                if quirk in ("id_str", "id_float", "id_none", "id_bool", "id_numeric_str") and page and offset == 0:
+                    bad = {"id_str": "abc", "id_float": 7.5, "id_none": None, "id_bool": True, "id_numeric_str": "12"}[quirk]
+                    page = [dict(page[0], id=bad)] + page[1:]
+                if quirk == "ids_reversed" and len(page) > 1:
+                    page = list(reversed(page))                       # descending inside the page
+                if quirk == "ids_cross_page" and page and outer._range_calls == 2:
+                    page = [dict(page[0], id=0)] + page[1:]           # smaller than everything before
+                if quirk == "row_nondict" and page:
+                    page = page[:-1] + ["not-a-row"]
+                if quirk == "range_on_empty":
+                    page = []
+                    crange = f"0-0/{shown_total}"
+                if quirk == "garbled":
+                    crange = "items 0 of many"
+                raw = json.dumps(page).encode()
+                status = 206 if offset + len(page) < total else 200
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                if quirk != "missing":
+                    self.send_header("Content-Range", crange)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
 
             def do_GET(self):
                 self._handle("GET")
@@ -170,7 +236,8 @@ class FakePostgREST:
         order = qp.get("order")
         if order:
             col, _, direction = order.partition(".")
-            out.sort(key=lambda r: str(r.get(col)), reverse=(direction == "desc"))
+            out.sort(key=lambda r: (0, r.get(col)) if isinstance(r.get(col), (int, float)) else (1, str(r.get(col))),
+                     reverse=(direction == "desc"))
         if qp.get("limit"):
             out = out[: int(qp["limit"])]
         sel = qp.get("select")
