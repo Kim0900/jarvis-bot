@@ -30,7 +30,12 @@ def check(name, ok, info=""):
 def psql(db, sql=None, user="postgres", args=(), env=None, timeout=120, file=None):
     cmd = ["psql", "-X", "-q", "-d", db, "-U", user, "-tA"] + list(args) + (["-f", file] if file else [])
     e = dict(os.environ, **(env or {}))
-    r = subprocess.run(cmd, input=sql, capture_output=True, text=True, env=e, timeout=timeout)
+    # the script goes in through a file handle on stdin (same as a pipe for psql): subprocess.run(input=...) raises
+    # "ValueError: I/O operation on closed file" in CPython 3.12 when the child exits before reading, which hid the real psql error in CI
+    import tempfile
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as fin:
+        if sql is not None: fin.write(sql); fin.flush(); fin.seek(0)
+        r = subprocess.run(cmd, stdin=fin if sql is not None else subprocess.DEVNULL, capture_output=True, text=True, env=e, timeout=timeout)
     return r.returncode, r.stdout, r.stderr
 
 def sup(db, sql): 
