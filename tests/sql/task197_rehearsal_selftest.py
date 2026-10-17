@@ -130,7 +130,7 @@ check("T6c 8 runs against 3 concurrent writer/reader clients: no client error, e
 # ---------------------------------------------------------------- T7 NOTIFY must not leak
 def listen_run(do_run):
     lp = subprocess.Popen(["psql", "-X", "-d", "t_notify", "-U", "postgres"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    lp.stdin.write("listen pgrst;\nselect pg_sleep(4);\nselect 1;\n"); lp.stdin.close()
+    lp.stdin.write("listen pgrst;\nselect pg_sleep(4);\nselect 1;\n"); lp.stdin.flush()   # communicate() below closes stdin (closing it here makes CPython 3.12 raise ValueError)
     time.sleep(1.0); do_run(); o, e = lp.communicate(); return o + e
 clone("t_notify")
 leak = listen_run(lambda: run("t_notify"))
