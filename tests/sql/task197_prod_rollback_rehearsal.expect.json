@@ -1,0 +1,9 @@
+{
+  "sql_sha256": "6fea8acbf7db52644c3d27223eb551adffaa02033644220d81a16894971d1b60",
+  "gate_sql_md5": "768f16b39d7e9a764c97adf39e09a95b",
+  "checks": 57,
+  "scenarios": 39,
+  "replay_ok": 13,
+  "replay_drift": 0,
+  "lock_timeout_ms": 250
+}
