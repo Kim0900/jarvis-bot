@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "tests" / "sql" / "task197_prod_rollback_rehearsal.sql"
 DOC = ROOT / "docs" / "COMPLETION_GATE_DESIGN_V1.md"
 
+LOCK_TIMEOUT_MS = 250
+CHK_COUNT = [0]
 PASSF = {"verdict": "PASS", "stage": "FINAL"}
 EVID = ["EVIDENCE", "캐스퍼", None]
 def cv(p=PASSF, actor="CASSANDRA", et="CASSANDRA_VALIDATION"): return [et, actor, p]
@@ -88,6 +90,7 @@ def gate_sql():
     return sql
 
 def chk(id_, got, want_):
+    CHK_COUNT[0] += 1
     return (f"v_id := {id_!r}; v_got := ({got})::text; v_want := ({want_})::text;\n"
             "  if v_got is not distinct from v_want then n_ok := n_ok + 1; v_log := v_log || (v_id || ':ok');\n"
             "  else n_bad := n_bad + 1; v_log := v_log || (v_id || ':FAIL');\n"
@@ -126,7 +129,7 @@ declare
   n_ok int := 0; n_bad int := 0; n_scn int := 0; n_scn_ok int := 0; n_rep_ok int := 0; n_rep_drift int := 0;
   v_fatal text := ''; v_id text; v_got text; v_want text; v_n int; v_m int; v_tid bigint; v_eid bigint;
   s jsonb; e jsonb; t_id int; v_a timestamptz; v_upd_max numeric := 0; v_ms numeric;
-  v_seq0 bigint; v_seq1 bigint; v_fn_md5 text; v_trg0 text; v_trg1 text; v_etrg0 text; v_etrg1 text; v_mut text; v_proc0 int; v_proc1 int;
+  v_seq0 bigint; v_seq1 bigint; v_lt0 int; v_lt1 int; v_st0 int; v_fn_md5 text; v_trg0 text; v_trg1 text; v_etrg0 text; v_etrg1 text; v_mut text; v_proc0 int; v_proc1 int;
 begin
   -- ---------- G: guards, all read-only, abort BEFORE any DDL ----------
   if current_setting('transaction_read_only') <> 'off' then raise exception 'REHEARSAL_ABORTED_BEFORE_DDL: transaction is read only'; end if;
@@ -140,9 +143,11 @@ begin
   select count(*) into v_n from pg_stat_activity where pid <> pg_backend_pid() and datname = current_database()
     and xact_start is not null and now() - xact_start > interval '10 seconds' and state <> 'idle';
   if v_n > 0 then raise exception 'REHEARSAL_ABORTED_BEFORE_DDL: % session(s) hold a transaction older than 10 s (lock queue risk)', v_n; end if;
-  -- bounded lock wait: never queue behind a busy table for long.  (statement_timeout cannot be tightened from inside a running
-  -- statement; the run is bounded by the session's own statement_timeout, and by its measured length of well under a second.)
-  perform set_config('lock_timeout', '1500ms', true);
+  -- bounded lock wait (corrective spec #5490 P0-FIX-02): cap at LOCK_TIMEOUT_MS and NEVER loosen a stricter value the caller already set.
+  -- statement_timeout cannot be tightened from inside a running statement; the caller (tests/sql/task197_safe_runner.py) sets it BEFORE this statement.
+  v_lt0 := (select setting::int from pg_settings where name = 'lock_timeout'); v_st0 := (select setting::int from pg_settings where name = 'statement_timeout');
+  if v_lt0 = 0 or v_lt0 > {LOCK_TIMEOUT_MS} then perform set_config('lock_timeout', '{LOCK_TIMEOUT_MS}ms', true); end if;
+  v_lt1 := (select setting::int from pg_settings where name = 'lock_timeout');
   select last_value into v_seq0 from pg_sequences where schemaname = 'public' and sequencename = 'magi_task_events_event_id_seq';
   select count(*) into v_proc0 from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public';
   v_trg0 := {TRIGS.format(rel="'public.magi_tasks'")}; v_etrg0 := {TRIGS.format(rel="'public.magi_task_events'")};
@@ -289,19 +294,28 @@ begin
   v_total_ms := extract(epoch from clock_timestamp() - v_t0) * 1000;
   -- UNCONDITIONAL: nothing above can commit; this statement always ends in an error, which rolls the whole statement back.
   raise exception using errcode = 'P0001',
-    message = 'REHEARSAL_ROLLBACK_SENTINEL result=' || case when v_fatal <> '' or n_bad > 0 then 'FAIL' when n_rep_drift > 0 then 'PASS_WITH_REPLAY_DRIFT' else 'PASS' end
+    message = 'REHEARSAL_ROLLBACK_SENTINEL result=' || case when v_fatal <> '' or n_bad > 0 then 'FAIL' when n_rep_drift > 0 then 'REPLAY_DRIFT' else 'PASS' end
       || ' checks=' || n_ok || '/' || (n_ok + n_bad) || ' scenarios=' || n_scn_ok || '/' || n_scn || ' replay_ok=' || n_rep_ok || ' replay_drift=' || n_rep_drift
       || ' hold_ms=' || round(coalesce(v_hold_ms, 0)) || ' total_ms=' || round(v_total_ms) || ' max_gate_update_ms=' || round(v_upd_max)
-      || ' event_seq_consumed=' || coalesce(v_seq1 - coalesce(v_seq0, 0), -1) || ' gate_sql_md5=' || md5(v_gate)
+      || ' lock_timeout_ms=' || v_lt1 || ' lock_timeout_caller_ms=' || v_lt0 || ' statement_timeout_ms=' || v_st0 || ' event_seq_consumed=' || coalesce(v_seq1 - coalesce(v_seq0, 0), -1) || ' gate_sql_md5=' || md5(v_gate)
       || case when v_fatal <> '' then ' FATAL=' || left(v_fatal, 300) else '' end || ' ROLLED_BACK_BY_EXCEPTION',
     detail = array_to_string(v_fail || v_drift || v_info, E'\\n') || E'\\n' || array_to_string(v_log, ' ');
 end $rehearsal$;
 """)
     return "".join(c)
 
+EXPECT = ROOT / "tests" / "sql" / "task197_prod_rollback_rehearsal.expect.json"
+
+def expect_json(text):
+    """what the runner pins: exact artifact hash and the only acceptable verdict numbers"""
+    return json.dumps({"sql_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "gate_sql_md5": hashlib.md5(gate_sql().encode()).hexdigest(),
+                       "checks": CHK_COUNT[0] + len(S), "scenarios": len(S), "replay_ok": len(REPLAY_WANT), "replay_drift": 0,
+                       "lock_timeout_ms": LOCK_TIMEOUT_MS}, indent=2) + "\n"
+
 if __name__ == "__main__":
     text = build()
+    ex = expect_json(text)
     if "--check" in sys.argv:
-        sys.exit(0 if OUT.exists() and OUT.read_text(encoding="utf-8") == text else 1)
-    OUT.write_text(text, encoding="utf-8")
-    print(f"wrote {OUT} ({len(text)} bytes, {len(S)} scenarios, gate md5 {hashlib.md5(gate_sql().encode()).hexdigest()})")
+        sys.exit(0 if OUT.exists() and OUT.read_text(encoding="utf-8") == text and EXPECT.exists() and EXPECT.read_text(encoding="utf-8") == ex else 1)
+    OUT.write_text(text, encoding="utf-8"); EXPECT.write_text(ex, encoding="utf-8")
+    print(f"wrote {OUT} ({len(text)} bytes, {len(S)} scenarios) and {EXPECT.name}\n{ex}")

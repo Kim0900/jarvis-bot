@@ -1,0 +1,16 @@
+PASS R1 mode=begin: strict PASS, exit 0, limits verified on the same connection, session gone, no residue  [do_wall 69 ms, ACCESS EXCLUSIVE seen from outside (0.17, 0.21, 0.04), gone after 0.0 s]
+PASS R1 mode=session: strict PASS, exit 0, limits verified on the same connection, session gone, no residue  [do_wall 70 ms, ACCESS EXCLUSIVE seen from outside (0.17, 0.21, 0.04), gone after 0.1 s]
+PASS R3 wrong pinned hash: refused (exit 2) before any rehearsal connection  [sql sha256 differs from the pinned/expected value]
+PASS R4 edited artifact against the original pin: refused  [sql sha256 differs from the pinned/expected value]
+PASS R5 artifact that contains COMMIT is refused by the lint even when pinned and hash-consistent  [lint: forbidden tokens: commit]
+PASS R5b a looser --lock-timeout-ms than the artifact's cap is refused  [--lock-timeout-ms looser than the artifact's own cap]
+PASS R6 replay drift: exit 2, strict reason recorded, no residue, no retry  [strict verdict: result=REPLAY_DRIFT | strict verdict: replay_ok=12 replay_drift=1]
+PASS R7 busy table: one attempt, gives up at the 250 ms lock_timeout (FATAL 55P03), exit 2, no residue  [do_wall 263 ms]
+PASS R8 statement_timeout 1000 ms cuts a runaway DO; lock held ~1 s as seen from outside; exit 2; no residue  [lock seen (0.19, 1.15, 0.96)]
+PASS R9 client watchdog cancels at 1 s even with a long server limit; exit 2; no residue  [lock seen (0.19, 1.15, 0.96)]
+PASS R10 client SIGKILL during the DO (begin mode): lock freed by the server statement_timeout (~3 s), session gone, no residue  [lock seen (first,last,dur) (0.19, 3.15, 2.96)]
+PASS R11 client frozen (SIGSTOP blackhole) during the DO, begin mode: lock freed when the statement errors (statement_timeout 2 s), the lingering session is ended by the idle-in-transaction timeout, no residue  [lock seen (0.19, 2.16, 1.97), session still present 0]
+PASS R12 control, idle timeout disabled: the lock is STILL freed at statement_timeout (an erroring statement releases its locks at abort, not at ROLLBACK); only the idle session lingers  [lock seen (0.19, 2.16, 1.97), session still present 1]
+PASS R13 session mode, frozen client: the autocommit statement error frees the lock at statement_timeout (~2 s) without any idle timeout  [lock seen (0.23, 2.19, 1.95), session still present 1]
+
+14/14 passed

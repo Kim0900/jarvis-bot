@@ -1,0 +1,58 @@
+name: Task197 rollback-rehearsal harness (PostgreSQL 17, throwaway server only)
+
+on:
+  pull_request:
+    paths:
+      - "tests/sql/task197_*"
+      - "docs/TASK197_ROLLBACK_REHEARSAL_PLAN.md"
+      - ".github/workflows/task197-rollback-rehearsal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pg17:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_PASSWORD: ci_throwaway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin" --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: supabase_admin
+      PGPASSWORD: ci_throwaway
+      PGSUPER: supabase_admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]==3.2.3"
+      - name: Server version (must be 17)
+        run: psql -d postgres -Atc "select version()" | tee /dev/stderr | grep -q "PostgreSQL 17"
+      - name: Generator is current (committed SQL + expect file)
+        run: python tests/sql/task197_rollback_rehearsal_build.py --check
+      - name: Harness self-test (57 checks)
+        run: python tests/sql/task197_rehearsal_selftest.py | tee harness_selftest.log
+      - name: Runner self-test (14 checks)
+        run: python tests/sql/task197_runner_selftest.py --log runner_measurements.json | tee runner_selftest.log
+      - name: Lock/statement-limit matrix (n=10)
+        run: python tests/sql/task197_matrix.py --n 10 --out matrix.json | tee matrix.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task197-pg17-evidence
+          path: |
+            harness_selftest.log
+            runner_selftest.log
+            runner_measurements.json
+            matrix.json
+            matrix.log

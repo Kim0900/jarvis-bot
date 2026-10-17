@@ -1,0 +1,372 @@
+{
+ "env": {
+  "server": "PostgreSQL 17.10 on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 7.5.0-3ubuntu1~18.04) 7.5.0, 64-bit",
+  "n": 20,
+  "host_cpus": 2
+ },
+ "idle_by_lock_cap": {
+  "100": {
+   "outcome": {
+    "PASS": 20
+   },
+   "do_ms": {
+    "n": 20,
+    "p50": 77,
+    "p95": 112,
+    "max": 112
+   },
+   "wall_ms": {
+    "n": 20,
+    "p50": 277,
+    "p95": 334,
+    "max": 334
+   },
+   "wal_bytes_per_run": 169790
+  },
+  "250": {
+   "outcome": {
+    "PASS": 20
+   },
+   "do_ms": {
+    "n": 20,
+    "p50": 75,
+    "p95": 90,
+    "max": 90
+   },
+   "wall_ms": {
+    "n": 20,
+    "p50": 271,
+    "p95": 402,
+    "max": 402
+   },
+   "wal_bytes_per_run": 173496
+  },
+  "500": {
+   "outcome": {
+    "PASS": 20
+   },
+   "do_ms": {
+    "n": 20,
+    "p50": 81,
+    "p95": 109,
+    "max": 109
+   },
+   "wall_ms": {
+    "n": 20,
+    "p50": 297,
+    "p95": 341,
+    "max": 341
+   },
+   "wal_bytes_per_run": 166836
+  }
+ },
+ "busy_by_lock_cap": {
+  "100": {
+   "holder_60ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 81,
+     "p95": 88,
+     "max": 88
+    }
+   },
+   "holder_200ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 91,
+     "p95": 104,
+     "max": 104
+    }
+   },
+   "holder_400ms": {
+    "outcome": {
+     "55P03": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 117,
+     "p95": 118,
+     "max": 118
+    }
+   },
+   "holder_800ms": {
+    "outcome": {
+     "55P03": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 117,
+     "p95": 119,
+     "max": 119
+    }
+   }
+  },
+  "250": {
+   "holder_60ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 82,
+     "p95": 88,
+     "max": 88
+    }
+   },
+   "holder_200ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 91,
+     "p95": 117,
+     "max": 117
+    }
+   },
+   "holder_400ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 267,
+     "p95": 285,
+     "max": 285
+    }
+   },
+   "holder_800ms": {
+    "outcome": {
+     "55P03": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 264,
+     "p95": 266,
+     "max": 266
+    }
+   }
+  },
+  "500": {
+   "holder_60ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 80,
+     "p95": 103,
+     "max": 103
+    }
+   },
+   "holder_200ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 79,
+     "p95": 89,
+     "max": 89
+    }
+   },
+   "holder_400ms": {
+    "outcome": {
+     "PASS": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 250,
+     "p95": 266,
+     "max": 266
+    }
+   },
+   "holder_800ms": {
+    "outcome": {
+     "55P03": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 514,
+     "p95": 516,
+     "max": 516
+    }
+   }
+  }
+ },
+ "concurrent3_by_lock_cap": {
+  "100": {
+   "outcome": {
+    "refused(concurrent session)": 6,
+    "PASS": 9
+   },
+   "do_ms": {
+    "n": 9,
+    "p50": 90,
+    "p95": 144,
+    "max": 144
+   },
+   "runs": 15
+  },
+  "250": {
+   "outcome": {
+    "PASS": 10,
+    "refused(concurrent session)": 5
+   },
+   "do_ms": {
+    "n": 10,
+    "p50": 98,
+    "p95": 128,
+    "max": 128
+   },
+   "runs": 15
+  },
+  "500": {
+   "outcome": {
+    "PASS": 9,
+    "refused(concurrent session)": 6
+   },
+   "do_ms": {
+    "n": 9,
+    "p50": 75,
+    "p95": 127,
+    "max": 127
+   },
+   "runs": 15
+  }
+ },
+ "statement_limit": {
+  "2000": {
+   "normal": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 77,
+     "p95": 103,
+     "max": 103
+    }
+   },
+   "stall_7s": {
+    "outcome": {
+     "other-exit2:": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 2001,
+     "p95": 2001,
+     "max": 2001
+    },
+    "lock_held_ms": {
+     "n": 5,
+     "p50": 1970,
+     "p95": 1979,
+     "max": 1979
+    },
+    "sample": ""
+   },
+   "under_write_checkpoint_load": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 109,
+     "p95": 196,
+     "max": 196
+    }
+   }
+  },
+  "3000": {
+   "normal": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 85,
+     "p95": 132,
+     "max": 132
+    }
+   },
+   "stall_7s": {
+    "outcome": {
+     "other-exit2:": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 3001,
+     "p95": 3001,
+     "max": 3001
+    },
+    "lock_held_ms": {
+     "n": 5,
+     "p50": 2975,
+     "p95": 2981,
+     "max": 2981
+    },
+    "sample": ""
+   },
+   "under_write_checkpoint_load": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 148,
+     "p95": 206,
+     "max": 206
+    }
+   }
+  },
+  "5000": {
+   "normal": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 84,
+     "p95": 103,
+     "max": 103
+    }
+   },
+   "stall_7s": {
+    "outcome": {
+     "other-exit2:": 5
+    },
+    "do_ms": {
+     "n": 5,
+     "p50": 5001,
+     "p95": 5002,
+     "max": 5002
+    },
+    "lock_held_ms": {
+     "n": 5,
+     "p50": 4967,
+     "p95": 4984,
+     "max": 4984
+    },
+    "sample": ""
+   },
+   "under_write_checkpoint_load": {
+    "outcome": {
+     "PASS": 20
+    },
+    "do_ms": {
+     "n": 20,
+     "p50": 115,
+     "p95": 144,
+     "max": 144
+    }
+   }
+  }
+ }
+}

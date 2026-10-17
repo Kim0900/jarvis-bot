@@ -14,6 +14,7 @@ do $r$ begin
   if not exists (select 1 from pg_roles where rolname = 'authenticator') then create role authenticator noinherit login; end if;
 end $r$;
 grant anon, authenticated, service_role to postgres;
+grant pg_read_all_stats to postgres;   -- production postgres can see other sessions in pg_stat_activity (observed)
 alter role anon set statement_timeout = '3s';
 alter role authenticated set statement_timeout = '8s';
 grant all on database gate to postgres;
