@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash   # -eo pipefail: a failing test must not be masked by | tee
+
 jobs:
   pg17:
     runs-on: ubuntu-latest
