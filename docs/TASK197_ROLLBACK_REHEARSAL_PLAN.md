@@ -94,4 +94,4 @@ python3 tests/sql/task197_matrix.py --n 20 --out matrix.json             # 약 3
 **범위:** 이 리허설과 PR#70 설계는 **관찰 전용(observation)** 이다. #202 전까지 deny 모드는 없다. 허가된 운영 리허설·관찰자 배포·모니터링 게이트가 끝나기 전에는 Task#197 종료도 구현 PASS도 없다. PR#70 게이트 함수의 의미는 이 브랜치가 바꾸지 않는다(설계 5절 SQL은 md5로 고정).
 **증명하지 못하는 것:** 운영 동시 트래픽 아래 관찰 배포 후 동작과 첫날 위반 건수 대조, anon 역할의 `statement_timeout` 3초(SET ROLE은 역할별 설정을 적용하지 않음 → `max_gate_update_ms`로 대체 보고), READ COMMITTED에서 커밋 전 이벤트를 게이트가 못 보는 한계, 원장 쓰기 위조(설계 8절 위험 수용), 17.6 실서버 동작.
 
-**CI 실행 기록:** (푸시 후 채움)
+**CI 실행 기록:** PR#77 Actions run 39003813588 (postgres:17 서비스 컨테이너, `bash -eo pipefail`): 서버 버전 확인·생성기 `--check`·하네스 57건·실행기 14건·측정 매트릭스(n=10) 전부 success, 증거 아티팩트 `task197-pg17-evidence`. 앞선 run 39002747165는 `| tee`가 실패를 가린 설정이라 증거로 쓰지 않는다(그 설정을 pipefail로 고치자 3.12에서 시험 코드의 stdin 처리 결함 2건 — `communicate()` 전에 stdin 닫기, 입력 파이프 — 과 TCP용 역할 비밀번호 누락이 드러나 수정; 하네스·게이트·실행기 로직 변경 아님).
