@@ -14,6 +14,7 @@ import logging
 import threading
 import queue
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -6691,28 +6692,31 @@ async def run_geomnuri_patrol_once() -> dict:
         # cannot be proven complete raises and becomes the "ingestion check failed" self-alert.
         fail_cutoff = now - timedelta(hours=1)
         stuck_cutoff = now - timedelta(minutes=GEOMNURI_PATROL_INGEST_STUCK_MINUTES)
+        # Task #198 (CASSANDRA 5707 B4): the table key is (source_type, source_id); the ingestion pipeline only
+        # accepts google_drive, so the scope is pinned to it and a different source_type can never collide in
+        # the source_id uniqueness proof.
+        # Task #198 (CASSANDRA 5707 B1): ALL FAILED rows are read (not just the last hour), so a failure that
+        # happened during an outage / before patrol recovered stays visible as BACKLOG instead of silently aging out.
         processing_rows = await sb_get_all_strict(
-            "call_image_ingestions", {"status": "eq.PROCESSING"},
+            "call_image_ingestions", {"status": "eq.PROCESSING", "source_type": "eq.google_drive"},
             key_col="source_id", key_type=str, headers=_internal_rpc_headers())
         failed_rows = await sb_get_all_strict(
-            "call_image_ingestions",
-            {"status": "eq.FAILED", "updated_at": "gte." + fail_cutoff.astimezone(timezone.utc).isoformat()},
+            "call_image_ingestions", {"status": "eq.FAILED", "source_type": "eq.google_drive"},
             key_col="source_id", key_type=str, headers=_internal_rpc_headers())
         failed_recent = []
+        failed_backlog = []
         stuck = []
         for row in processing_rows + failed_rows:
             updated = _patrol_parse_dt(row.get("updated_at"))
             if updated is None:
+                if row.get("status") == "FAILED" and not _patrol_terminal_ingestion_failure(row):
+                    failed_backlog.append(row)       # unknown age: never dropped silently
                 continue
             local_updated = updated.astimezone(KST)
             if row.get("status") == "PROCESSING" and local_updated < stuck_cutoff:
                 stuck.append(row)
-            if (
-                row.get("status") == "FAILED"
-                and local_updated >= fail_cutoff
-                and not _patrol_terminal_ingestion_failure(row)
-            ):
-                failed_recent.append(row)
+            if row.get("status") == "FAILED" and not _patrol_terminal_ingestion_failure(row):
+                (failed_recent if local_updated >= fail_cutoff else failed_backlog).append(row)
         if stuck:
             sample = ", ".join(str(x.get("source_id"))[:24] for x in stuck[:3])
             await emit(
@@ -6723,8 +6727,7 @@ async def run_geomnuri_patrol_once() -> dict:
                 cooldown_seconds=3600,
             )
 
-        # FAILED는 집계키 하나로 매시간 재경보하지 않는다.
-        # source_id별로 24시간 쿨다운하여 신규 실패는 알리되 동일 파일 반복실패는 스팸 방지.
+        # Recent FAILED: per-source_id alert, 24h cooldown (new failures are told, repeats are not spammed).
         failed_recent.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)     # newest first under the cap
         for row in failed_recent[:10]:
             source_id = str(row.get("source_id") or "unknown")
@@ -6732,6 +6735,23 @@ async def run_geomnuri_patrol_once() -> dict:
             await emit(
                 f"ingestion_failed::{source_id}",
                 f"call_image_ingestions FAILED: source_id={source_id[:24]}, format={fmt}",
+                severity="WARN",
+                cooldown_seconds=24 * 3600,
+            )
+        # Unresolved FAILED older than 1h: ONE daily digest (not one alert per row).  The key carries a hash of the
+        # exact id set, so a changed set is announced again at once while an unchanged set repeats only every 24h.
+        # Rows beyond the recent cap are folded into the digest, so a burst can never be lost behind the cap.
+        overflow = failed_recent[10:]
+        backlog = failed_backlog + overflow
+        if backlog:
+            ids = sorted(str(r.get("source_id") or "unknown") for r in backlog)
+            digest = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:10]
+            ages = [a for a in (_patrol_parse_dt(r.get("updated_at")) for r in backlog) if a is not None]
+            oldest = f"{(now - min(ages).astimezone(KST)).total_seconds() / 3600:.0f}시간" if ages else "알 수 없음"
+            await emit(
+                f"ingestion_failed_backlog::{digest}",
+                f"call_image_ingestions 미해결 FAILED 적체 {len(backlog)}건(1시간 초과 또는 상한 초과), 가장 오래된 {oldest}. "
+                f"sample={', '.join(i[:24] for i in ids[:3])}",
                 severity="WARN",
                 cooldown_seconds=24 * 3600,
             )

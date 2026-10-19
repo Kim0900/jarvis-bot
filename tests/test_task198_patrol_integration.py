@@ -186,7 +186,48 @@ class PatrolIntegrationTests(Base):
         self._ing(n_done=3, failed=[("terminal", 5, "TERMINAL: bad format"), ("oldfail", 120, "X"), ("okfail", 59, "Y")],
                   processing=[("fresh", 3)])
         res = await self.patrol()
-        self.assertEqual(self._ing_findings(res), ["ingestion_failed::okfail"])
+        keys = self._ing_findings(res)
+        self.assertEqual([k for k in keys if not k.startswith("ingestion_failed_backlog::")], ["ingestion_failed::okfail"])
+        # the 120-minute-old FAILED row is no longer dropped: it is reported as backlog (CASSANDRA 5707 B1)
+        self.assertEqual(len([k for k in keys if k.startswith("ingestion_failed_backlog::")]), 1)
+
+    async def test_b1_old_unresolved_failed_rows_are_a_daily_backlog_digest_not_silent(self):
+        # real-DB shape: 6 FAILED rows all older than 1h, nothing recent, nothing processing
+        self._ing(n_done=47, failed=[(f"old{i}", 120 + 600 * i, "OCR_EMPTY") for i in range(6)])
+        res = await self.patrol()
+        keys = self._ing_findings(res)
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("ingestion_failed_backlog::"))
+        f = [x for x in res["findings"] if x["key"] == keys[0]][0]
+        self.assertIn("6건", f["detail"])
+        # the same set a minute later stays under the 24h cooldown (no spam) ...
+        self.assertEqual(len(res["alerts"]), 1)
+        res2 = await self.patrol()
+        self.assertEqual(res2["alerts"], [])
+
+    async def test_b1_changed_backlog_set_is_announced_again_and_terminal_rows_never(self):
+        self._ing(failed=[("old1", 120, "X"), ("termold", 300, "TERMINAL: bad")])
+        k1 = [k for k in self._ing_findings(await self.patrol()) if k.startswith("ingestion_failed_backlog::")]
+        self.assertEqual(len(k1), 1)
+        self._ing(failed=[("old1", 120, "X"), ("old2", 130, "Y"), ("termold", 300, "TERMINAL: bad")])
+        k2 = [k for k in self._ing_findings(await self.patrol()) if k.startswith("ingestion_failed_backlog::")]
+        self.assertEqual(len(k2), 1)
+        self.assertNotEqual(k1, k2)
+
+    async def test_b1_burst_over_the_recent_cap_is_folded_into_backlog_not_lost(self):
+        self._ing(failed=[(f"b{i:02d}", 5 + i, "X") for i in range(14)] + [("old", 200, "X")])
+        res = await self.patrol()
+        keys = self._ing_findings(res)
+        self.assertEqual(len([k for k in keys if k.startswith("ingestion_failed::")]), 10)
+        bl = [f for f in res["findings"] if f["key"].startswith("ingestion_failed_backlog::")]
+        self.assertEqual(len(bl), 1)
+        self.assertIn("5건", bl[0]["detail"])        # 4 overflow + 1 old, all 15 accounted for
+
+    async def test_b4_other_source_type_with_same_source_id_does_not_collide(self):
+        self._ing(failed=[("dup1", 10, "X")])
+        self.srv.tables["call_image_ingestions"].append(dict(self.srv.tables["call_image_ingestions"][0], source_type="other"))
+        keys = self._ing_findings(await self.patrol())
+        self.assertEqual(keys, ["ingestion_failed::dup1"])
 
     async def test_f1_cannot_prove_completeness_is_a_self_failure_not_a_clean_bill(self):
         # (a) quirks that falsify even a single-page answer: never trusted, the check reports its own failure
