@@ -108,7 +108,7 @@ class FakePostgREST:
                         if outer.max_rows is not None:      # PostgREST db-max-rows applies to every read
                             out = out[: outer.max_rows]
                         self._send(200, out)
-                    elif method in ("POST", "PATCH"):
+                    elif method in ("POST", "PATCH", "DELETE"):
                         outer.write_log.append((method, table, body.decode("utf-8", "replace")))
                         fault = outer._take_fault(method, table, body)
                         prefer = self.headers.get("Prefer", "")
@@ -219,6 +219,9 @@ class FakePostgREST:
             def do_PATCH(self):
                 self._handle("PATCH")
 
+            def do_DELETE(self):
+                self._handle("DELETE")
+
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -279,6 +282,10 @@ class FakePostgREST:
             if "return=representation" in prefer:
                 return 200, [dict(r) for r in hit]
             return 204, None
+        if method == "DELETE":
+            hit = self._filter(rows, params)
+            rows[:] = [r for r in rows if r not in hit]
+            return (200, [dict(r) for r in hit]) if "return=representation" in prefer else (204, None)
         items = data if isinstance(data, list) else [data]
         qp = dict(params)
         conflict = qp.get("on_conflict")
@@ -310,6 +317,9 @@ class FakePostgREST:
 
     @staticmethod
     def _match(value, op: str, arg: str) -> bool:
+        if op == "not":                     # not.<op>.<arg>
+            inner, _, rest = arg.partition(".")
+            return not FakePostgREST._match(value, inner, rest)
         if op == "is":
             return (value is None) if arg == "null" else (value is not None)
         if op == "in":
@@ -317,6 +327,15 @@ class FakePostgREST:
         if value is None:
             return False
         left, right = str(value), arg
+        if op in ("eq", "gte", "lte", "lt", "gt", "neq"):
+            # timestamps compare as instants (PostgreSQL timestamptz), not as strings
+            try:
+                from datetime import datetime as _dt
+                lv, rv = _dt.fromisoformat(left.replace("Z", "+00:00")), _dt.fromisoformat(right.replace("Z", "+00:00"))
+                if lv.tzinfo is not None and rv.tzinfo is not None:
+                    return {"eq": lv == rv, "gte": lv >= rv, "lte": lv <= rv, "lt": lv < rv, "gt": lv > rv, "neq": lv != rv}[op]
+            except (ValueError, TypeError):
+                pass
         if op == "eq":
             return left == right
         if op == "gte":

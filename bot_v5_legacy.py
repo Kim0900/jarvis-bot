@@ -1689,6 +1689,7 @@ async def sb_get_all_strict(
     max_pages: int = 200,
     key_col: str = "id",
     key_type: type = int,
+    headers: dict = None,
 ) -> list:
     """Task #206: read EVERY matching row, or raise.
 
@@ -1708,7 +1709,7 @@ async def sb_get_all_strict(
     transport error, or too many pages - raises :class:`SupabaseReadError`.
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = dict(HEADERS_SB)
+    headers = dict(headers or HEADERS_SB)      # Task #198: secret-gated tables pass their own headers
     headers["Prefer"] = "count=exact"
     # A stable, unique ordering is what makes offset paging trustworthy: the caller's
     # ``order`` (if any) is ignored on purpose.
@@ -6434,6 +6435,19 @@ PATROL_SELF_FAILURE_COOLDOWN_SECONDS = 7200
 PATROL_SCHEDULER_COOLDOWN_SECONDS = 6 * 3600
 
 
+def _patrol_dispatch_priority(key: str, severity: str) -> int:
+    """Task #198 (CASSANDRA 5431 F2): explicit dispatch classes under the 8-alerts-per-run cap.
+    Lower runs first.  10 = the patrol's own failures (nothing else can be trusted), 11 = scheduler
+    job FAIL/MISMATCH (a job that ran and reported failure), 20 = other CRITICAL (stale / missing /
+    long-held P0 / stuck ingestion), 30 = everything else.  A flood of stale jobs therefore cannot
+    crowd out the first scheduler FAILs; inside a class the detection order is kept."""
+    if key.startswith("patrol_internal_"):
+        return 10
+    if key.startswith("scheduler_fail::"):
+        return 11
+    return 20 if str(severity).upper() == "CRITICAL" else 30
+
+
 def _patrol_exc_text(exc: BaseException) -> str:
     text = str(exc).strip()
     return text[:300] if text else type(exc).__name__
@@ -6553,7 +6567,8 @@ async def run_geomnuri_patrol_once() -> dict:
         findings.append({"key": key, "detail": detail, "severity": severity, "task_id": task_id})
         candidates.append(pal.Candidate(
             key=key, detail=detail, severity=severity, task_id=task_id,
-            cooldown_seconds=cooldown_seconds or PATROL_DEFAULT_COOLDOWN_SECONDS))
+            cooldown_seconds=cooldown_seconds or PATROL_DEFAULT_COOLDOWN_SECONDS,
+            priority=_patrol_dispatch_priority(key, severity)))
 
     # 1) scheduler 누락/실패
     try:
@@ -6670,16 +6685,22 @@ async def run_geomnuri_patrol_once() -> dict:
 
     # 4) CALL/OCR ingestion 장기 PROCESSING 및 최근 FAILED
     try:
-        ingest_rows = await sb_get_strict(
-            "call_image_ingestions",
-            {"order": "updated_at.asc", "limit": "200"},
-            headers=_internal_rpc_headers(),
-        )
-        failed_recent = []
-        stuck = []
+        # Task #198 (CASSANDRA 5431 F1): COMPLETE, scoped reads instead of "oldest 200 rows".  Each scope is read
+        # with the strict paged reader (true total from Content-Range, stable order, duplicate/forged-range
+        # checks), so a table above db-max-rows can no longer hide newer FAILED/PROCESSING rows; a read that
+        # cannot be proven complete raises and becomes the "ingestion check failed" self-alert.
         fail_cutoff = now - timedelta(hours=1)
         stuck_cutoff = now - timedelta(minutes=GEOMNURI_PATROL_INGEST_STUCK_MINUTES)
-        for row in ingest_rows:
+        processing_rows = await sb_get_all_strict(
+            "call_image_ingestions", {"status": "eq.PROCESSING"},
+            key_col="source_id", key_type=str, headers=_internal_rpc_headers())
+        failed_rows = await sb_get_all_strict(
+            "call_image_ingestions",
+            {"status": "eq.FAILED", "updated_at": "gte." + fail_cutoff.astimezone(timezone.utc).isoformat()},
+            key_col="source_id", key_type=str, headers=_internal_rpc_headers())
+        failed_recent = []
+        stuck = []
+        for row in processing_rows + failed_rows:
             updated = _patrol_parse_dt(row.get("updated_at"))
             if updated is None:
                 continue
@@ -6704,6 +6725,7 @@ async def run_geomnuri_patrol_once() -> dict:
 
         # FAILED는 집계키 하나로 매시간 재경보하지 않는다.
         # source_id별로 24시간 쿨다운하여 신규 실패는 알리되 동일 파일 반복실패는 스팸 방지.
+        failed_recent.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)     # newest first under the cap
         for row in failed_recent[:10]:
             source_id = str(row.get("source_id") or "unknown")
             fmt = str(row.get("format") or "unknown")

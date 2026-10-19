@@ -171,6 +171,15 @@ class Candidate:
     cooldown_seconds: int = 7200
     namespace: str = NS_ALERT
     write_event: bool = True
+    # Task #198 (CASSANDRA 5431 F2): explicit dispatch class, lower = earlier.  None = derived from
+    # the severity (CRITICAL 20, everything else 30).  Detection order is only the tie-break INSIDE a class.
+    priority: Optional[int] = None
+
+    @property
+    def dispatch_priority(self) -> int:
+        if self.priority is not None:
+            return int(self.priority)
+        return 20 if str(self.severity).upper() == "CRITICAL" else 30
 
     @property
     def state_key(self) -> str:
@@ -371,7 +380,7 @@ class AlertDispatcher:
     # ---- main entry --------------------------------------------------------------
     async def dispatch(self, candidates: list) -> Report:
         report = Report()
-        # one candidate per ledger key; CRITICAL first, detection order otherwise
+        # one candidate per ledger key; ordered by explicit dispatch class, detection order inside a class
         seen = set()
         ordered = []
         for cand in candidates:
@@ -379,7 +388,7 @@ class AlertDispatcher:
                 continue
             seen.add(cand.state_key)
             ordered.append(cand)
-        ordered.sort(key=lambda c: 0 if str(c.severity).upper() == "CRITICAL" else 1)
+        ordered.sort(key=lambda c: c.dispatch_priority)      # stable: detection order is the tie-break inside a class
         self._all_candidates = ordered
         if not ordered:
             return report

@@ -8,6 +8,8 @@ on:
       - "tests/fake_postgrest.py"
       - "tests/test_task198_patrol_ledger.py"
       - "tests/test_task198_patrol_integration.py"
+      - "tests/test_task198_live_probe.py"
+      - "tests/live_probe_task198.py"
       - "tests/test_task204_retired_slack_patrol.py"
       - "tests/test_task206_dedup_hardening.py"
       - ".github/workflows/task198-patrol-alert.yml"
@@ -19,15 +21,26 @@ on:
       - "tests/fake_postgrest.py"
       - "tests/test_task198_patrol_ledger.py"
       - "tests/test_task198_patrol_integration.py"
+      - "tests/test_task198_live_probe.py"
+      - "tests/live_probe_task198.py"
       - ".github/workflows/task198-patrol-alert.yml"
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash      # -eo pipefail
+
 jobs:
   regression:
+    # 3.11.9 is what Render runs (runtime.txt); 3.12 is kept because the previous CI used it
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       PYTHONPATH: .
       PYTHONDONTWRITEBYTECODE: "1"
@@ -38,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Syntax check
@@ -47,5 +60,7 @@ jobs:
         run: python -m unittest tests.test_task198_patrol_ledger -v
       - name: Patrol alert integration (real code, fake PostgREST)
         run: python -m unittest tests.test_task198_patrol_integration -v
+      - name: Live-probe script is itself tested (fake PostgREST)
+        run: python -m unittest tests.test_task198_live_probe -v
       - name: Retired Slack patrol guard (#204) and strict reader (#206) still hold
         run: python -m unittest tests.test_task204_retired_slack_patrol tests.test_task206_dedup_hardening -v

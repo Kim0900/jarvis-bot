@@ -151,6 +151,125 @@ class PatrolIntegrationTests(Base):
         await self.patrol()
         self.assertEqual(len(self.events()), 12)
 
+    # ---- F1 (CASSANDRA 5431): the ingestion check must be COMPLETE, not "the oldest 200 rows"
+    def _ing(self, n_done=0, failed=(), processing=(), max_rows=None):
+        """call_image_ingestions fixture: n_done old COMPLETED rows (oldest first) + explicit FAILED/PROCESSING rows"""
+        rows = []
+        for i in range(n_done):
+            rows.append({"source_type": "google_drive", "source_id": f"done{i:05d}", "status": "COMPLETED",
+                         "updated_at": self.srv._norm_ts(iso(self.now - timedelta(days=3, seconds=n_done - i))), "last_error": None, "format": "png"})
+        for sid, age_min, err in failed:
+            rows.append({"source_type": "google_drive", "source_id": sid, "status": "FAILED",
+                         "updated_at": self.srv._norm_ts(iso(self.now - timedelta(minutes=age_min))), "last_error": err, "format": "png"})
+        for sid, age_min in processing:
+            rows.append({"source_type": "google_drive", "source_id": sid, "status": "PROCESSING",
+                         "updated_at": self.srv._norm_ts(iso(self.now - timedelta(minutes=age_min))), "last_error": None, "format": "png"})
+        self.srv.tables["call_image_ingestions"] = rows
+        self.srv.max_rows = max_rows
+
+    def _ing_findings(self, res):
+        return sorted(f["key"] for f in res["findings"] if f["key"].startswith(("ingestion_", "patrol_internal_ingestion")))
+
+    async def test_f1_large_table_does_not_hide_newer_failed_and_processing(self):
+        self._ing(n_done=1500, failed=[("newfail", 10, "OCR_EMPTY")], processing=[("stuckone", 180)], max_rows=1000)
+        res = await self.patrol()
+        self.assertEqual(self._ing_findings(res), ["ingestion_failed::newfail", "ingestion_stuck"])
+
+    async def test_f1_more_than_200_stuck_rows_are_all_counted(self):
+        self._ing(processing=[(f"p{i:04d}", 180 + i) for i in range(250)])
+        res = await self.patrol()
+        stuck = [f for f in res["findings"] if f["key"] == "ingestion_stuck"]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("250건", stuck[0]["detail"])
+
+    async def test_f1_scopes_terminal_old_and_fresh_rows(self):
+        self._ing(n_done=3, failed=[("terminal", 5, "TERMINAL: bad format"), ("oldfail", 120, "X"), ("okfail", 59, "Y")],
+                  processing=[("fresh", 3)])
+        res = await self.patrol()
+        self.assertEqual(self._ing_findings(res), ["ingestion_failed::okfail"])
+
+    async def test_f1_cannot_prove_completeness_is_a_self_failure_not_a_clean_bill(self):
+        # (a) quirks that falsify even a single-page answer: never trusted, the check reports its own failure
+        for quirk in ("total_understated", "forged_range", "total_changes"):
+            self._reset()
+            self._ing(n_done=1200, failed=[("newfail", 10, "OCR_EMPTY")], processing=[("stuckone", 180)], max_rows=1000)
+            self.srv.range_quirk = quirk
+            res = await self.patrol()
+            self.assertEqual(self._ing_findings(res), ["patrol_internal_ingestion_check"], quirk)
+        # (b) quirks that only break reads that need a second page: the scoped single-page reads stay exact ...
+        for quirk in ("no_page_progress", "overlap"):
+            self._reset()
+            self._ing(n_done=1200, failed=[("newfail", 10, "OCR_EMPTY")], processing=[("stuckone", 180)], max_rows=1000)
+            self.srv.range_quirk = quirk
+            res = await self.patrol()
+            self.assertEqual(self._ing_findings(res), ["ingestion_failed::newfail", "ingestion_stuck"], quirk)
+        # (c) ... and a scope that really needs several pages is refused when paging misbehaves
+        for quirk in ("no_page_progress", "overlap"):
+            self._reset()
+            self._ing(processing=[(f"p{i:04d}", 180 + i) for i in range(1300)], max_rows=1000)
+            self.srv.range_quirk = quirk
+            res = await self.patrol()
+            self.assertEqual(self._ing_findings(res), ["patrol_internal_ingestion_check"], quirk)
+        # (d) the same 1300 stuck rows with honest paging: all of them, over two pages
+        self._reset()
+        self._ing(processing=[(f"p{i:04d}", 180 + i) for i in range(1300)], max_rows=1000)
+        res = await self.patrol()
+        stuck = [f for f in res["findings"] if f["key"] == "ingestion_stuck"]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("1300건", stuck[0]["detail"])
+
+    async def test_f1_transport_failure_is_a_self_failure(self):
+        self._ing(n_done=3)
+        self.srv.fail_query_contains = {"call_image_ingestions": "status"}
+        res = await self.patrol()
+        self.assertEqual(self._ing_findings(res), ["patrol_internal_ingestion_check"])
+
+    def _stale(self, names):
+        for row in self.srv.tables["scheduler_status"]:
+            if row["job_name"] in names:
+                row["last_run_at"] = self.srv._norm_ts(iso(self.now - timedelta(days=30)))
+
+    async def test_f2_stale_flood_cannot_crowd_out_scheduler_failures(self):
+        """CASSANDRA 5431 F2: 9 stale CRITICALs are detected BEFORE 4 scheduler FAILs; the 8-per-run cap
+        must still send every FAIL first (explicit class), then stale in detection order."""
+        stale, fails = JOBS[:9], JOBS[9:13]
+        self._stale(stale)
+        self.fail_jobs(fails)
+        await self.patrol()
+        kinds = [e["detail"].split("::")[0] for e in self.events()]
+        details = " ".join(e["detail"] for e in self.events())
+        self.assertEqual(len(self.events()), 8)
+        for j in fails:
+            self.assertIn(f"{j} →", details, f"scheduler FAIL of {j} must be in the first run")
+        self.assertEqual(sum("스케줄러 최근 결과 이상" in e["detail"] for e in self.events()), 4)
+        self.assertEqual(sum("스케줄러 정체" in e["detail"] for e in self.events()), 4)
+        # the first four stale (detection order) went out, the other five are deferred, none is lost
+        for j in stale[:4]:
+            self.assertIn(f"스케줄러 정체: {j},", details)
+        self.assertIn("deferred=5", self.heartbeat())
+        await self.patrol()
+        self.assertEqual(len(self.events()), 13)
+        await self.patrol()
+        self.assertEqual(len(self.events()), 13)
+
+    async def test_f2_same_job_stale_and_fail_and_order_of_classes(self):
+        both = JOBS[0]
+        self._stale([both] + JOBS[1:9])
+        self.fail_jobs([both])
+        await self.patrol()
+        evs = self.events()
+        self.assertEqual(len(evs), 8)
+        self.assertIn("스케줄러 최근 결과 이상", evs[0]["detail"])      # FAIL class first, even though stale of the same job is detected first
+        self.assertIn(both, evs[0]["detail"])
+
+    def test_f2_priority_classes_are_explicit(self):
+        p = legacy._patrol_dispatch_priority
+        order = [p("patrol_internal_task_check", "CRITICAL"), p("scheduler_fail::x", "CRITICAL"),
+                 p("scheduler_stale::x", "CRITICAL"), p("ingestion_stuck", "CRITICAL"), p("ingestion_failed::s", "WARN")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(len(set(order[:3])), 3)
+        self.assertEqual(p("task_long::1", "CRITICAL"), p("scheduler_stale::x", "CRITICAL"))
+
     async def test_scheduler_alert_cooldown_is_six_hours(self):
         job = JOBS[0]
         self.fail_jobs([job])
