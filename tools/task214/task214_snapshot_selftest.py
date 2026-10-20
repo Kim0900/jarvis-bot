@@ -124,7 +124,7 @@ check("F3 effective settings read back: read-only on, statement 8000, lock 500, 
 S = doc.get("sections", {})
 check("F4 full profile has io/checkpointer/bgwriter/wal/database/activity/user_tables, meta has server time + track_io_timing", all(S.get(k, {}).get("ok") for k in ("meta", "io", "checkpointer", "bgwriter", "wal", "database", "activity", "user_tables")) and S["meta"]["data"].get("track_io_timing") in ("on", "off"))
 check("F5 an extension that is not installed (pg_stat_statements) is recorded as unavailable, not as an outage: outcome stays ok", S.get("statements_top", {}).get("unavailable") is True and doc.get("outcome") == "ok", str(S.get("statements_top", {}).get("sqlstate")))
-check("F6 the snapshot contains no user names or query text beyond the 120-char normalised statements", "usename" not in json.dumps(doc) and "supabase_admin" not in json.dumps(doc))
+check("F6 the snapshot contains no user names or query text beyond the 120-char normalised statements", "usename" not in json.dumps(doc) and SUP not in json.dumps(S.get("activity")) and SUP not in json.dumps(S.get("meta")))   # (a database may legitimately be named like the role, e.g. the CI image)
 rc, o, e, _ = run(["--phase", "pre", "--out-dir", str(fdir), "--live", "--auth-event", "5999"], dsn=DIRECT)
 check("F7 second attempt for the same phase refused (exit 2), no new snapshot (no automatic retry)", rc == 2 and len(snaps(fdir)) == 1)
 rc, o, e, _ = run(["--phase", "pre", "--out-dir", str(fdir), "--live", "--auth-event", "5999", "--allow-repeat"], dsn=DIRECT)
