@@ -6706,8 +6706,14 @@ async def run_geomnuri_patrol_once() -> dict:
         failed_recent = []
         failed_backlog = []
         stuck = []
+        invalid_processing = []       # Task #198 (CASSANDRA 5718 P1): PROCESSING rows whose age cannot be trusted
         for row in processing_rows + failed_rows:
             updated = _patrol_parse_dt(row.get("updated_at"))
+            if row.get("status") == "PROCESSING" and (updated is None or updated.tzinfo is None or updated > now + timedelta(minutes=10)):
+                # missing / unparseable / timezone-less / future timestamp: the stuck test below cannot be applied, and silently
+                # skipping such a row would hide a stuck job forever -> explicit internal alarm after the loop
+                invalid_processing.append(row)
+                continue
             if updated is None:
                 if row.get("status") == "FAILED" and not _patrol_terminal_ingestion_failure(row):
                     failed_backlog.append(row)       # unknown age: never dropped silently
@@ -6725,6 +6731,16 @@ async def run_geomnuri_patrol_once() -> dict:
                 f"{len(stuck)}건. sample={sample}",
                 severity="CRITICAL",
                 cooldown_seconds=3600,
+            )
+
+        if invalid_processing:
+            inv_ids = sorted(str(r.get("source_id") or "unknown") for r in invalid_processing)
+            inv_digest = hashlib.sha256("\n".join(inv_ids).encode("utf-8")).hexdigest()[:10]
+            await emit(
+                f"patrol_internal_ingestion_updated_at::{inv_digest}",
+                f"순라 ingestion 점검: PROCESSING {len(inv_ids)}건의 updated_at이 없거나 해석 불가·시간대 없음·미래 값이라 "
+                f"장기 점유 여부를 판정할 수 없음(건너뛰지 않고 경보). sample={', '.join(i[:24] for i in inv_ids[:3])}",
+                severity="CRITICAL",
             )
 
         # Recent FAILED: per-source_id alert, 24h cooldown (new failures are told, repeats are not spammed).

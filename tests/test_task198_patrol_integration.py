@@ -223,6 +223,51 @@ class PatrolIntegrationTests(Base):
         self.assertEqual(len(bl), 1)
         self.assertIn("5건", bl[0]["detail"])        # 4 overflow + 1 old, all 15 accounted for
 
+    def _set_updated_at(self, source_id, value):
+        for r in self.srv.tables["call_image_ingestions"]:
+            if r["source_id"] == source_id:
+                r["updated_at"] = value
+
+    async def test_p1_processing_rows_with_untrustworthy_updated_at_raise_an_internal_alarm_not_silence(self):
+        # CASSANDRA 5718 P1: missing / garbage / timezone-less / future updated_at on a PROCESSING row was silently skipped
+        self._ing(processing=[("nots", 10), ("garbage", 10), ("naive", 10), ("future", 10), ("fine", 10), ("stuck", 180)])
+        self._set_updated_at("nots", None)
+        self._set_updated_at("garbage", "not-a-timestamp")
+        self._set_updated_at("naive", "2026-10-20T10:00:00")
+        self._set_updated_at("future", iso(self.now + timedelta(days=2)))
+        res = await self.patrol()
+        keys = self._ing_findings(res)
+        inv = [k for k in keys if k.startswith("patrol_internal_ingestion_updated_at::")]
+        self.assertEqual(len(inv), 1, keys)
+        f = [x for x in res["findings"] if x["key"] == inv[0]][0]
+        self.assertIn("4건", f["detail"])
+        self.assertEqual(str(f.get("severity", "CRITICAL")).upper(), "CRITICAL")
+        self.assertIn("ingestion_stuck", keys)                      # the one row with a valid old timestamp is still found
+        self.assertEqual([k for k in keys if k not in inv], ["ingestion_stuck"])
+
+    async def test_p1_alarm_is_deduplicated_by_set_and_a_changed_set_is_announced(self):
+        self._ing(processing=[("nots", 10)])
+        self._set_updated_at("nots", None)
+        r1 = await self.patrol()
+        self.assertEqual(len([k for k in self._ing_findings(r1) if k.startswith("patrol_internal_ingestion_updated_at::")]), 1)
+        self.assertEqual(len(r1["alerts"]), 1)
+        r2 = await self.patrol()
+        self.assertEqual(r2["alerts"], [])                           # same set inside the cooldown: no spam
+        self._ing(processing=[("nots", 10), ("nots2", 10)])
+        self._set_updated_at("nots", None); self._set_updated_at("nots2", "")
+        r3 = await self.patrol()
+        self.assertEqual(len(r3["alerts"]), 1)                       # changed set -> new digest key -> announced again
+
+    async def test_p1_valid_timestamps_stay_silent_and_failed_rows_without_timestamp_remain_backlog(self):
+        self._ing(processing=[("p", 10)], failed=[("f", 10, "X")])
+        self.assertEqual(self._ing_findings(await self.patrol()), ["ingestion_failed::f"])
+        self._reset()
+        self._ing(failed=[("f", 10, "X")])
+        self._set_updated_at("f", None)
+        keys = self._ing_findings(await self.patrol())
+        self.assertEqual(len(keys), 1)
+        self.assertTrue(keys[0].startswith("ingestion_failed_backlog::"))
+
     async def test_b4_other_source_type_with_same_source_id_does_not_collide(self):
         self._ing(failed=[("dup1", 10, "X")])
         self.srv.tables["call_image_ingestions"].append(dict(self.srv.tables["call_image_ingestions"][0], source_type="other"))

@@ -1,16 +1,17 @@
-"""The live PostgREST probe (tests/live_probe_task198.py) is itself tested against the fake server, so the script that will
-run against the real service is known to pass on correct behaviour and to FAIL on wrong behaviour."""
-import os, sys, unittest
+"""The READ-ONLY live smoke (tests/live_smoke_task198_readonly.py) is itself tested against the fake server: it must pass on correct behaviour,
+send nothing but GET, stop at the first 5xx / timeout / expired window without retrying, and never leak a key.  The WRITE probe was removed from
+this PR (MAGI #5721, CASSANDRA #5718); there is nothing left here that can write."""
+import json, os, sys, tempfile, unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
-import live_probe_task198 as lp  # noqa: E402
+import httpx  # noqa: E402
+import live_smoke_task198_readonly as ls  # noqa: E402
 from fake_postgrest import FakePostgREST  # noqa: E402
 
-PIN = "ccf6986b8ec232375755a24cdaa456261c88d759"
 
-
-class LiveProbeAgainstFake(unittest.TestCase):
+class ReadSmokeAgainstFake(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = FakePostgREST().start()
@@ -27,113 +28,112 @@ class LiveProbeAgainstFake(unittest.TestCase):
             {"job_name": n, "last_run_at": s._norm_ts((now - timedelta(minutes=i)).isoformat()), "last_result": "OK"}
             for i, n in enumerate(["job_a", "job_b", "patrol_alert::x", "patrol_meta::y"])]
         s.tables["call_image_ingestions"] = [
-            {"source_type": "google_drive", "source_id": f"s{i}", "status": st,
-             "updated_at": s._norm_ts(now.isoformat())} for i, st in enumerate(["COMPLETED", "FAILED", "PROCESSING"])]
+            {"source_type": "google_drive", "source_id": f"s{i}", "status": st, "updated_at": s._norm_ts(now.isoformat())} for i, st in enumerate(["COMPLETED", "FAILED", "PROCESSING"])]
 
-    def approve(self, **kw):
-        """register a MAGI approval event in the fake registry; returns its id"""
-        e = {"event_id": 9001, "task_id": 198, "actor": "마기", "event_type": "DECISION",
-             "created_at": datetime.now(timezone.utc).isoformat(),
-             "detail": f"F4_PROBE_WRITE_APPROVED pin={PIN[:12]} key=patrol_meta::f4_probe"}
-        e.update(kw)
-        self.srv.tables["magi_task_events"] = [e]
-        return e["event_id"]
+    def smoke(self, secret="secret", not_after=None, **kw):
+        return ls.ReadSmoke(self.srv.url, "KEYVALUE", secret, not_after=not_after, **kw)
 
-    def writes(self):
-        return [w for w in self.srv.write_log if w[1] == "scheduler_status"]
-
-    def probe(self):
-        return lp.Probe(self.srv.url, "k", "secret")
-
-    def test_read_only_and_write_pass_on_correct_behaviour(self):
+    def test_passes_on_correct_behaviour_and_sends_only_get(self):
         for style in ("utc", "kst"):        # the server's timezone setting changes the timestamp text
-            self.srv.ts_style = style
-            p = self.probe(); p.run_read_only(); p.run_write(self.approve(), PIN)
-            bad = [r for r in p.results if not r["ok"]]
-            self.assertEqual(bad, [], style)
-            self.assertEqual(self.srv.tables["scheduler_status"].__len__(), 4)     # the probe row is gone again
+            self.srv.ts_style = style; self.srv.requests.clear()
+            p = self.smoke(not_after=datetime.now(timezone.utc) + timedelta(hours=1)); p.run()
+            self.assertEqual([r for r in p.results if not r["ok"]], [], style)
+            self.assertEqual(self.srv.write_log, [])
+            self.assertTrue(self.srv.requests and all(m == "GET" for m, _ in self.srv.requests), self.srv.requests)
+            self.assertTrue(all(e["method"] == "GET" for e in p.requests))
+            self.assertEqual(len(self.srv.tables["scheduler_status"]), 4)
 
-    def test_probe_fails_when_the_server_does_wrong(self):
-        self.srv.range_quirk = "forged_range"
-        p = self.probe(); p.run_read_only()
-        self.assertTrue(all(r["ok"] for r in p.results))      # the probe reads headers only; paging integrity is the reader's job
-        p = lp.Probe(self.srv.url, "k", None); p.run_read_only()
-        self.assertTrue(any(not r["ok"] for r in p.results))   # missing secret is reported, not skipped
+    def test_the_client_exposes_nothing_but_get(self):
+        p = self.smoke()
+        for m in ("post", "patch", "put", "delete", "request", "send", "stream", "head", "options"):
+            with self.assertRaises(ls.Stop, msg=m):
+                getattr(p.client, m)
+        self.assertEqual(self.srv.requests, [])            # no traffic from the attempts
 
-    def test_write_requires_approval_flag(self):
-        os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"] = self.srv.url, "k"
-        self.assertEqual(lp.main(["--allow-write"]), 2)
-        self.assertEqual(lp.main(["--allow-write", "--approval-event", "0"]), 1)       # "0" is not an approval
-        self.assertEqual(self.srv.tables.get("scheduler_status", [])[0]["job_name"], "job_a")
+    def test_without_the_secret_ingestion_checks_are_not_run_and_never_counted_as_passed(self):
+        p = self.smoke(secret=None); p.run()
+        nr = [r for r in p.results if r.get("not_run")]
+        self.assertEqual(len(nr), 2)
+        self.assertTrue(all(not r["ok"] for r in nr))
+        self.assertNotIn("call_image_ingestions", [t for _, t in self.srv.requests])
 
+    def test_first_5xx_stops_the_run_without_retry(self):
+        self.srv.fail_mode = "503"; self.srv.fail_tables = {"scheduler_status"}
+        p = self.smoke()
+        with self.assertRaises(ls.Stop):
+            p.run()
+        self.assertEqual(len(p.requests), 1)
+        self.assertEqual(len(self.srv.requests), 1)           # exactly one request reached the server: no retry, no next probe
+        self.assertEqual(p.requests[0]["status"], 503)
 
-    def run_write_expect_refused(self, event_id, pin=PIN):
-        p = self.probe(); p.run_write(event_id, pin)
-        self.assertFalse(all(r["ok"] for r in p.results))
-        self.assertEqual(self.writes(), [])                    # not one write reached the server
-        return p
+    def test_timeout_and_transport_errors_stop_the_run(self):
+        calls = []
+        def handler(request):
+            calls.append(1); raise httpx.ReadTimeout("slow", request=request)
+        p = self.smoke(transport=httpx.MockTransport(handler))
+        with self.assertRaises(ls.Stop):
+            p.run()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(p.requests[0]["error"], "ReadTimeout")
+        calls.clear()
+        def refuse(request):
+            calls.append(1); raise httpx.ConnectError("no route", request=request)
+        p = self.smoke(transport=httpx.MockTransport(refuse))
+        with self.assertRaises(ls.Stop):
+            p.run()
+        self.assertEqual(len(calls), 1)
 
-    def test_fake_or_unverifiable_approval_is_refused_before_any_write(self):
-        self.approve()
-        for bad in ("0", "", "abc", "-5", "9999", "9001 "[:-1] + "1"):
-            self.run_write_expect_refused(bad)
-        self.run_write_expect_refused(9001, "")
-        self.run_write_expect_refused(9001, "deadbeef")        # wrong / too short pin
+    def test_expired_permission_window_sends_nothing(self):
+        p = self.smoke(not_after=datetime.now(timezone.utc) - timedelta(seconds=1))
+        with self.assertRaises(ls.Stop):
+            p.run()
+        self.assertEqual(self.srv.requests, [])
+        # the window can also end in the middle of a run: the next request is not sent
+        t = {"now": datetime(2026, 10, 20, 13, 59, 58, tzinfo=timezone.utc)}
+        def tick():
+            t["now"] += timedelta(seconds=1); return t["now"]
+        self.srv.requests.clear()
+        p = self.smoke(not_after=datetime(2026, 10, 20, 14, 0, 0, tzinfo=timezone.utc), now=tick)
+        with self.assertRaises(ls.Stop):
+            p.run()
+        self.assertLess(len(self.srv.requests), 3)
 
-    def test_approval_with_wrong_actor_task_scope_pin_or_age_is_refused(self):
-        stale = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
-        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
-        for kw in ({"actor": "캐스퍼"}, {"task_id": 197}, {"detail": "approved"}, {"created_at": stale}, {"created_at": future},
-                   {"detail": f"F4_PROBE_WRITE_APPROVED pin={'f' * 12} key=patrol_meta::f4_probe"}):
-            self.run_write_expect_refused(self.approve(**kw))
+    def _main(self, *args, env=None):
+        base = {"SUPABASE_URL": self.srv.url, "SUPABASE_KEY": "KEYVALUE", "SUPABASE_INTERNAL_RPC_SECRET": "SECRETVALUE"}
+        with mock.patch.dict(os.environ, dict(base, **(env or {})), clear=False):
+            return ls.main(list(args))
 
-    def test_registry_unreachable_fails_closed(self):
-        self.approve()
-        self.srv.fail_tables = {"magi_task_events"}; self.srv.fail_mode = "503"
-        try:
-            self.run_write_expect_refused(9001)
-        finally:
-            self.srv.fail_mode = None; self.srv.fail_tables = None
+    def test_main_requires_a_window_and_writes_a_report_without_secrets(self):
+        with self.assertRaises(SystemExit):
+            self._main()                                      # --not-after is mandatory
+        self.assertEqual(self._main("--not-after", "2026-10-20T14:00:00"), 2)       # no UTC offset
+        with tempfile.TemporaryDirectory() as d:
+            rp = os.path.join(d, "r.json")
+            rc = self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", rp)
+            self.assertEqual(rc, 0)
+            text = open(rp, encoding="utf-8").read()
+            rep = json.loads(text)
+            self.assertTrue(rep["ok"]); self.assertIsNone(rep["stopped_early"])
+            for secret in ("KEYVALUE", "SECRETVALUE", "job_a", "patrol_meta::y"):
+                self.assertNotIn(secret, text)               # no key, no secret, no row contents
+            self.assertTrue(all("param_names" in r and "status" in r for r in rep["requests"]))
+            with self.assertRaises(FileExistsError):
+                self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", rp)     # never overwrite
 
-    def test_preexisting_probe_rows_are_never_deleted_or_modified(self):
-        old = {"job_name": "patrol_meta::f4_probe", "last_run_at": self.srv._norm_ts(datetime.now(timezone.utc).isoformat()), "last_result": "someone else"}
-        self.srv.tables["scheduler_status"].append(dict(old))
-        p = self.probe(); p.run_write(self.approve(), PIN)
-        self.assertEqual([r for r in p.results if not r["ok"]], [])
-        self.assertIn(old, self.srv.tables["scheduler_status"])
-        self.assertEqual(len(self.srv.tables["scheduler_status"]), 5)
+    def test_main_exit_codes(self):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        self.srv.fail_mode = "503"; self.srv.fail_tables = {"scheduler_status"}
+        self.assertEqual(self._main("--not-after", future), 3)
+        self.srv.fail_mode = None
+        self.assertEqual(self._main("--not-after", (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()), 3)
+        self.assertEqual(self._main("--not-after", future, env={"SUPABASE_INTERNAL_RPC_SECRET": ""}), 1)    # not-run checks are not a pass
 
-    def test_key_collision_fails_closed_and_deletes_nothing(self):
-        import uuid as _u
-        fixed = _u.UUID(int=0)
-        key = f"patrol_meta::f4_probe::{fixed.hex[:12]}"
-        victim = {"job_name": key, "last_run_at": self.srv._norm_ts(datetime.now(timezone.utc).isoformat()), "last_result": "victim"}
-        self.srv.tables["scheduler_status"].append(dict(victim))
-        orig = lp.uuid.uuid4
-        lp.uuid.uuid4 = lambda: fixed
-        try:
-            p = self.probe(); p.run_write(self.approve(), PIN)
-        finally:
-            lp.uuid.uuid4 = orig
-        self.assertTrue(any(not r["ok"] for r in p.results))
-        self.assertIn(victim, self.srv.tables["scheduler_status"])
-        self.assertEqual([w for w in self.writes() if w[0] == "DELETE"], [])
-
-    def test_cleanup_only_removes_a_row_that_still_carries_this_runs_tag(self):
-        # someone replaces the row's tag during the run: the conditional DELETE must not remove it, and the probe says so
-        p = self.probe()
-        orig = p.rec
-        def rec(name, ok, info=""):
-            if name.startswith("PATCH CAS with the stale"):
-                for r in self.srv.tables["scheduler_status"]:
-                    if r["job_name"].startswith("patrol_meta::f4_probe::"):
-                        r["last_result"] = "taken over"
-            return orig(name, ok, info)
-        p.rec = rec
-        p.run_write(self.approve(), PIN)
-        taken = [r for r in self.srv.tables["scheduler_status"] if r["job_name"].startswith("patrol_meta::f4_probe::")]
-        self.assertEqual(len(taken), 1)
-        self.assertTrue(any((not r["ok"]) and r["name"].startswith("cleanup") for r in p.results))
+    def test_this_repository_contains_no_write_probe_any_more(self):
+        with open(ls.__file__, encoding="utf-8") as f:
+            src = f.read()
+        for needle in ("--allow-write", "def run_write", "verify_approval", ".post(", ".patch(", ".delete(", "--approval-event"):
+            self.assertNotIn(needle, src, needle)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(__file__), "live_probe_task198.py")))
 
 
 if __name__ == "__main__":

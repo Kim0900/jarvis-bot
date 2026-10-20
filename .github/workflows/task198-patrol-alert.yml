@@ -9,7 +9,7 @@ on:
       - "tests/test_task198_patrol_ledger.py"
       - "tests/test_task198_patrol_integration.py"
       - "tests/test_task198_live_probe.py"
-      - "tests/live_probe_task198.py"
+      - "tests/live_smoke_task198_readonly.py"
       - "tests/test_task204_retired_slack_patrol.py"
       - "tests/test_task206_dedup_hardening.py"
       - ".github/workflows/task198-patrol-alert.yml"
@@ -22,7 +22,7 @@ on:
       - "tests/test_task198_patrol_ledger.py"
       - "tests/test_task198_patrol_integration.py"
       - "tests/test_task198_live_probe.py"
-      - "tests/live_probe_task198.py"
+      - "tests/live_smoke_task198_readonly.py"
       - ".github/workflows/task198-patrol-alert.yml"
 
 permissions:
