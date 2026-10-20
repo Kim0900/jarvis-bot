@@ -1,0 +1,105 @@
+{
+  "happy_begin": {
+    "do_wall_ms": 74,
+    "lock_seen": [
+      0.33,
+      0.37,
+      0.04
+    ],
+    "gone_after_s": 0.0,
+    "sentinel": {
+      "result": "PASS",
+      "checks_ok": "57",
+      "checks_total": "57",
+      "scn_ok": "39",
+      "scn": "39",
+      "replay_ok": "13",
+      "replay_drift": "0",
+      "hold_ms": "60",
+      "total_ms": "67",
+      "max_gate_update_ms": "5",
+      "lock_timeout_ms": "250",
+      "lock_timeout_caller_ms": "250",
+      "statement_timeout_ms": "3000",
+      "event_seq_consumed": "44",
+      "gate_sql_md5": "768f16b39d7e9a764c97adf39e09a95b"
+    }
+  },
+  "happy_session": {
+    "do_wall_ms": 108,
+    "lock_seen": [
+      0.39,
+      0.45,
+      0.06
+    ],
+    "gone_after_s": 0.0,
+    "sentinel": {
+      "result": "PASS",
+      "checks_ok": "57",
+      "checks_total": "57",
+      "scn_ok": "39",
+      "scn": "39",
+      "replay_ok": "13",
+      "replay_drift": "0",
+      "hold_ms": "90",
+      "total_ms": "101",
+      "max_gate_update_ms": "5",
+      "lock_timeout_ms": "250",
+      "lock_timeout_caller_ms": "250",
+      "statement_timeout_ms": "3000",
+      "event_seq_consumed": "44",
+      "gate_sql_md5": "768f16b39d7e9a764c97adf39e09a95b"
+    }
+  },
+  "statement_timeout_1000": {
+    "lock_seen": [
+      0.42,
+      1.38,
+      0.96
+    ],
+    "do_wall_ms": 1001
+  },
+  "watchdog_1s": {
+    "lock_seen": [
+      0.39,
+      1.35,
+      0.97
+    ]
+  },
+  "begin_client_sigkill": {
+    "lock_seen": [
+      0.33,
+      3.29,
+      2.96
+    ],
+    "lock_still_present_at_end": "0",
+    "rehearsal_session_still_present": "0"
+  },
+  "begin_blackhole": {
+    "lock_seen": [
+      0.37,
+      2.34,
+      1.96
+    ],
+    "lock_still_present_at_end": "0",
+    "rehearsal_session_still_present": "0"
+  },
+  "begin_blackhole_no_idle_timeout": {
+    "lock_seen": [
+      0.35,
+      2.31,
+      1.96
+    ],
+    "lock_still_present_at_end": "0",
+    "rehearsal_session_still_present": "1"
+  },
+  "session_blackhole": {
+    "lock_seen": [
+      0.39,
+      2.36,
+      1.97
+    ],
+    "lock_still_present_at_end": "0",
+    "rehearsal_session_still_present": "1"
+  }
+}

@@ -1,0 +1,52 @@
+{
+ "export_redacted_content_sha256": "51f5318e1aa15eb2ed86767e7f7ad56eb1e6d84a31c467d2fd388fa33d6c53fd",
+ "events": 879,
+ "tasks": 16,
+ "events_per_task": {
+  "25": 4,
+  "83": 23,
+  "145": 16,
+  "147": 3,
+  "157": 5,
+  "160": 605,
+  "164": 87,
+  "167": 9,
+  "170": 10,
+  "171": 24,
+  "172": 12,
+  "174": 29,
+  "175": 7,
+  "194": 32,
+  "204": 10,
+  "205": 3
+ },
+ "synthetic_ci_fixture_events": 35,
+ "runner_verdict": "PASS",
+ "reasons": [],
+ "sentinel": {
+  "result": "PASS",
+  "checks_ok": "57",
+  "checks_total": "57",
+  "scn_ok": "39",
+  "scn": "39",
+  "replay_ok": "13",
+  "replay_drift": "0",
+  "hold_ms": "85",
+  "total_ms": "93",
+  "max_gate_update_ms": "3",
+  "lock_timeout_ms": "250",
+  "lock_timeout_caller_ms": "250",
+  "statement_timeout_ms": "3000",
+  "event_seq_consumed": "47",
+  "gate_sql_md5": "768f16b39d7e9a764c97adf39e09a95b"
+ },
+ "info_lines": [
+  "replay #194 events=32 -> REVIEW:[\"EVIDENCE_NEWER_THAN_PASS\"]@UPDATE:VERIFICATION>COMPLETED",
+  "replay #204 events=10 -> WARN:[\"LATEST_VERDICT_NOT_PASS\"]@UPDATE:VERIFICATION>COMPLETED",
+  "replay #205 events=3 -> WARN:[\"NO_CASSANDRA_RECORD\"]@UPDATE:VERIFICATION>COMPLETED",
+  "D1 function exists once:ok D2 owner/secdef/search_path:ok D3 anon/authenticated/public cannot execute:ok D4 four triggers on magi_tasks, all enabled:ok D5 existing triggers untouched:ok D6 gate function is the only new public function:ok D7 DDL is re-runnable, same function body:ok P1 nothing:ok P2 latest HOLD:ok P3 PASS then FAIL:ok P4 design pass only:ok P5 legacy NULL payload:ok P6 requests are not evidence:ok P7 unknown verdict:ok P8 pass then unstructured:ok P9 verifier is not evidence:ok P10 stage missing:ok P11 secondary never lowers HARD:ok P12 PASS by other actor ignored:ok P13 evidence_kind path clean:ok P14 revoked validation event:ok P15 later unknown cassandra event:ok P16 evidence newer than PASS:ok P17 PASS not from validation event:ok P18 array payload is unstructured:ok P19 injected stage text:ok P20 invalidation event:ok P21 revoked evidence:ok P22 patrol evidence ignored:ok P23 vr cleared in same UPDATE:ok P24 closed directly:ok P25 PASS from non-allowlisted validation-like type:ok P26 evidence written by CASSANDRA is not independent:ok N1 evidence + PASS/FINAL:ok N2 latest wins after HOLD:ok N3 vr false:ok N4 title-only update:ok N5 agreement event is neutral:ok N6 operational guidance neutral:ok N7 non-completing status update:ok A1 anon update, violation recorded:ok A2 anon update, clean:ok I1 insert COMPLETED vr:ok I2 insert CLOSED vr:ok I3 insert COMPLETED no vr:ok I4 insert VERIFICATION vr:ok N8 COMPLETED->CLOSED not re-fired; reopen+complete fires again:ok A3 anon direct call denied:ok A4 anon can read violation events:ok S1 temp-table shadowing does not hide the violation (temp,public):ok R1a mutation was applied to the test variant:ok R1 UPDATE succeeds when the gate function fails (fail-open):ok R1b real function restored:ok R3 violation events carry no patrol trigger keys or markers:ok O1 copied verdict/stage/tier tokens are sanitized:ok O2 no violation event outside the fixture task range:ok O3 violation events are attributed to COMPLETION_GATE with domain inherited:ok REPLAY#25:ok REPLAY#145:ok REPLAY#147:ok REPLAY#160:ok REPLAY#174:ok REPLAY#83:ok REPLAY#157:ok REPLAY#164:ok REPLAY#167:ok REPLAY#170:ok REPLAY#171:ok REPLAY#172:ok REPLAY#175:ok"
+ ],
+ "detail_head": "pg=17.10 role=postgres\nreplay #194 events=32 -> REVIEW:[\"EVIDENCE_NEWER_THAN_PASS\"]@UPDATE:VERIFICATION>COMPLETED\nreplay #204 events=10 -> WARN:[\"LATEST_VERDICT_NOT_PASS\"]@UPDATE:VERIFICATION>COMPLETED\nreplay #205 events=3 -> WARN:[\"NO_CASSANDRA_RECORD\"]@UPDATE:VERIFICATION>COMPLETED\nD1 function exists once:ok D2 owner/secdef/search_path:ok D3 anon/authenticated/public cannot execute:ok D4 four triggers on magi_tasks, all enabled:ok D5 existing triggers untouched:ok D6 gate function is the only new public function:ok D7 DDL is re-runnable, same function body:ok P1 nothing:ok P2 latest HOLD:ok P3 PASS then FAIL:ok P4 design pass only:ok P5 legacy NULL payload:ok P6 requests are not evidence:ok P7 unknown verdict:ok P8 pass then unstructured:ok P9 verifier is not evidence:ok P10 stage missing:ok P11 secondary never lowers HARD:ok P12 PASS by other actor ignored:ok P13 evidence_kind path clean:ok P14 revoked validation event:ok P15 later unknown cassandra event:ok P16 evidence newer than PASS:ok P17 PASS not from validation event:ok P18 array payload is unstructured:ok P19 injected stage text:ok P20 invalidation event:ok P21 revoked evidence:ok P22 patrol evidence ignored:ok P23 vr cleared in same UPDATE:ok P24 closed directly:ok P25 PASS from non-allowlisted validation-like type:ok P26 evidence written by CASSANDRA is not independent:ok N1 evidence + PASS/FINAL:ok N2 latest wins after HOLD:ok N3 vr false:ok N4 title-only update:ok N5 agreement event is neutral:ok N6 operational guidance neutral:ok N7 non-completing status update:ok A1 anon update, violation recorded:ok A2 anon update, clean:ok I1 insert COMPLETED vr:ok I2 insert CLOSED vr:ok I3 insert COMPLETED no vr:ok I4 insert VERIFICATION vr:ok N8 COMPLETED->CLOSED not re-fired; reopen+complete fires again:ok A3 anon direct call denied:ok A4 anon can read violation events:ok S1 temp-table shadowing does not hide the violation (temp,public):ok R1a mutation was applied to the test variant:ok R1 UPDATE succeeds when the gate function fails (fail-open):ok R1b real function restored:ok R3 violation events carry no patrol trigger keys or markers:ok O1 copied verdict/stage/tier tokens are sanitized:ok O2 no violation event outside the fixture task range:ok O3 violation events are attributed to COMPLETION_GATE with domain inherited:ok REPLAY#25:ok REPLAY#145:ok REPLAY#147:ok REPLAY#160:ok REPLAY#174:ok REPLAY#83:ok REPLAY#157:ok REPLAY#164:ok REPLAY#167:ok REPLAY#170:ok REPLAY#171:ok REPLAY#172:ok REPLAY#175:ok",
+ "residue_free": true,
+ "server_version": "17.10"
+}

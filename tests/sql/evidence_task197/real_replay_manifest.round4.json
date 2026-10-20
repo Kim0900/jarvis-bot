@@ -1,0 +1,27 @@
+{
+ "as_of_max_event_id": 5707,
+ "n_events": 879,
+ "n_tasks": 16,
+ "raw_sha256": "4d01a5fb86e3f38ff1fa1162b6c76c0651ed9362a603872c5b6467c3ec51d8a2",
+ "redacted_content_sha256": "51f5318e1aa15eb2ed86767e7f7ad56eb1e6d84a31c467d2fd388fa33d6c53fd",
+ "per_task_counts": {
+  "25": 4,
+  "83": 23,
+  "145": 16,
+  "147": 3,
+  "157": 5,
+  "160": 605,
+  "164": 87,
+  "167": 9,
+  "170": 10,
+  "171": 24,
+  "172": 12,
+  "174": 29,
+  "175": 7,
+  "194": 32,
+  "204": 10,
+  "205": 3
+ },
+ "synthetic_ci_fixture_events": 35,
+ "note": "Data itself is not in this repository. raw_sha256 is recomputable from the registry with tests/sql/task197_real_export.sql (as of max event id above); redacted hash is recomputed by task197_real_replay_offline.py."
+}

@@ -34,9 +34,9 @@ _n = [0]
 def runner(db, v, cap, st_ms, watchdog=8.0):
     _n[0] += 1; rp = TMP / f"rep{_n[0]}.json"; sql, ex, sha = v
     t0 = time.time()
-    p = subprocess.run([sys.executable, RUNNER, "--sql", sql, "--expect", ex, "--sha256", sha, "--approval-event", "0", "--report", str(rp),
+    p = subprocess.run([sys.executable, RUNNER, "--test-mode", "--sql", sql, "--expect", ex, "--sha256", sha, "--report", str(rp),
                         "--lock-timeout-ms", str(cap), "--statement-timeout-ms", str(st_ms), "--watchdog-s", str(watchdog)],
-                       capture_output=True, text=True, env=dict(os.environ, PGDSN=dsn(db)), timeout=120)
+                       capture_output=True, text=True, env=dict(os.environ, PGDSN=dsn(db), TASK197_TEST_MODE="throwaway-server"), timeout=120)
     wall = (time.time() - t0) * 1000
     rep = json.loads(rp.read_text()) if rp.exists() else {}
     return dict(rc=p.returncode, wall_ms=round(wall), do_ms=rep.get("do_wall_ms"), verdict=rep.get("verdict"), msg=(rep.get("message") or "")[-90:], reasons=rep.get("reasons", [])[:3])
@@ -51,7 +51,7 @@ def summ(rows, key):
 def outcome(rows):
     c = {}
     for r in rows:
-        k = ("PASS" if r["rc"] == 0 else "refused(concurrent session)" if any("already exists" in x for x in r["reasons"]) else "55P03" if "FATAL=55P03" in r["msg"] else "other-exit%d:%s" % (r["rc"], r["msg"][-50:])); c[k] = c.get(k, 0) + 1
+        k = ("PASS" if r["rc"] == 0 else "refused(single flight)" if any(("already exists" in x or "single flight" in x) for x in r["reasons"]) else "55P03" if "FATAL=55P03" in r["msg"] else "other-exit%d:%s" % (r["rc"], r["msg"][-50:])); c[k] = c.get(k, 0) + 1
     return c
 
 class Holder:
@@ -76,7 +76,7 @@ def wal(db): return int(psql(db, "select pg_current_wal_lsn() - '0/0'::pg_lsn", 
 # ---- A: lock caps, idle table
 OUT["idle_by_lock_cap"] = {}
 for cap in (100, 250, 500):
-    v = variant(cap, f"cap{cap}"); db = f"m_idle{cap}"; clone(db); w0 = wal(db)
+    v = variant(cap, f"cap{cap}"); db = f"t_m_idle{cap}"; clone(db); w0 = wal(db)
     rows = [runner(db, v, cap, 3000) for _ in range(A.n)]
     OUT["idle_by_lock_cap"][cap] = dict(outcome=outcome(rows), do_ms=summ(rows, "do_ms"), wall_ms=summ(rows, "wall_ms"), wal_bytes_per_run=(wal(db) - w0) // A.n)
     print("idle cap", cap, OUT["idle_by_lock_cap"][cap], flush=True)
@@ -84,7 +84,7 @@ for cap in (100, 250, 500):
 # ---- B: busy table (a writer-class lock holder releases after hold_ms)
 OUT["busy_by_lock_cap"] = {}
 for cap in (100, 250, 500):
-    v = variant(cap, f"cap{cap}"); db = f"m_busy{cap}"; clone(db)
+    v = variant(cap, f"cap{cap}"); db = f"t_m_busy{cap}"; clone(db)
     for hold in (60, 200, 400, 800):
         rows = []
         for _ in range(max(5, A.n // 4)):
@@ -95,7 +95,7 @@ for cap in (100, 250, 500):
 # ---- C: 3 concurrent clients on the same database
 OUT["concurrent3_by_lock_cap"] = {}
 for cap in (100, 250, 500):
-    v = variant(cap, f"cap{cap}"); db = f"m_conc{cap}"; clone(db); rows = []
+    v = variant(cap, f"cap{cap}"); db = f"t_m_conc{cap}"; clone(db); rows = []
     for _ in range(max(5, A.n // 4)):
         with cf.ThreadPoolExecutor(3) as ex: rows += list(ex.map(lambda _: runner(db, v, cap, 3000), range(3)))
     OUT["concurrent3_by_lock_cap"][cap] = dict(outcome=outcome(rows), do_ms=summ(rows, "do_ms"), runs=len(rows))
@@ -105,7 +105,7 @@ for cap in (100, 250, 500):
 OUT["statement_limit"] = {}
 for st in (2000, 3000, 5000):
     v = variant(250, "cap250"); stall = variant(250, "stall", inject="    perform pg_sleep(7);\n")
-    db = f"m_st{st}"; clone(db); res = {}
+    db = f"t_m_st{st}"; clone(db); res = {}
     rows = [runner(db, v, 250, st) for _ in range(A.n)]; res["normal"] = dict(outcome=outcome(rows), do_ms=summ(rows, "do_ms"))
     rows = []; held = []
     for _ in range(5):
@@ -115,7 +115,7 @@ for st in (2000, 3000, 5000):
     res["stall_7s"] = dict(outcome=outcome(rows), do_ms=summ(rows, "do_ms"), lock_held_ms=summ([dict(x=h) for h in held], "x"),
                            sample=rows[0]["msg"])
     # slow-I/O proxy: concurrent writers with synchronous commits + CHECKPOINT storm on a different database of the same server
-    ldb = f"m_load{st}"; clone(ldb); psql(ldb, "create table if not exists load_t(i int, pad text)", user=SUP)
+    ldb = f"t_m_load{st}"; clone(ldb); psql(ldb, "create table if not exists load_t(i int, pad text)", user=SUP)
     stop = threading.Event()
     def load():
         with psycopg.connect(dsn(ldb, SUP), autocommit=True) as c:

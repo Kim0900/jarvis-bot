@@ -44,12 +44,14 @@ class LockWatch:
         self.stop.set(); self.th.join(3)
         return (round(self.seen[0], 2), round(self.seen[-1], 2), round(self.seen[-1] - self.seen[0], 2)) if self.seen else None
 
-def runner(db, sha=None, sql=None, expect=None, extra=(), env=None, timeout=90, report="r.json", approval="0"):
+TESTENV = {"TASK197_TEST_MODE": "throwaway-server"}
+
+def runner(db, sha=None, sql=None, expect=None, extra=(), env=None, timeout=90, report="r.json"):
     rp = TMP / report
-    cmd = [sys.executable, RUNNER, "--sha256", sha or EXPECT["sql_sha256"], "--approval-event", approval, "--report", str(rp)] + list(extra)
+    cmd = [sys.executable, RUNNER, "--test-mode", "--sha256", sha or EXPECT["sql_sha256"], "--report", str(rp)] + list(extra)
     if sql: cmd += ["--sql", sql]
     if expect: cmd += ["--expect", expect]
-    p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, PGDSN=dsn(db), **(env or {})), timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, PGDSN=dsn(db), **TESTENV, **(env or {})), timeout=timeout)
     rep = json.loads(rp.read_text()) if rp.exists() else json.loads(p.stdout) if p.stdout.strip().startswith("{") else {}
     if rp.exists(): rp.unlink()
     return p.returncode, rep
@@ -77,7 +79,7 @@ check("R4 edited artifact against the original pin: refused", rc == 2 and "sha25
 p, e, h = variant("lint", replace=("    execute v_gate;\n", "    execute v_gate;\n    commit;\n"))
 rc, rep = runner(db, sha=h, sql=p, expect=e)
 check("R5 artifact that contains COMMIT is refused by the lint even when pinned and hash-consistent", rc == 2 and "lint" in reasons(rep) and not any("rehearsal connection opened" in x for x in rep.get("events", [])), reasons(rep))
-rc, rep = runner(db, extra=["--lock-timeout-ms", "5000"])
+rc, rep = runner(db, extra=["--lock-timeout-ms", "500"])
 check("R5b a looser --lock-timeout-ms than the artifact's cap is refused", rc == 2 and "looser" in reasons(rep), reasons(rep))
 
 # ---- R6 replay drift is a failure, never a pass
@@ -105,14 +107,22 @@ LOG["watchdog_1s"] = dict(lock_seen=hold)
 p30, e30, h30 = variant("sleep30", inject="    perform pg_sleep(30);\n")
 def lossy(mode, stop_signal, idle_ms, st_ms, observe_s, label):
     db = clone("t_run"); s0 = state(db); lw = LockWatch(db)
-    env = dict(os.environ, PGDSN=dsn(db))
-    cmd = [sys.executable, RUNNER, "--sha256", h30, "--approval-event", "0", "--sql", p30, "--expect", e30, "--mode", mode, "--statement-timeout-ms", str(st_ms), "--idle-tx-timeout-ms", str(idle_ms), "--watchdog-s", "60"]
+    env = dict(os.environ, PGDSN=dsn(db), **TESTENV)
+    cmd = [sys.executable, RUNNER, "--test-mode", "--sha256", h30, "--sql", p30, "--expect", e30, "--mode", mode, "--statement-timeout-ms", str(st_ms), "--idle-tx-timeout-ms", str(idle_ms), "--watchdog-s", "30"]
     pr = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    time.sleep(0.9); pr.send_signal(stop_signal)                       # SIGSTOP = silent blackhole (socket stays open); SIGKILL = process dies
+    kid = None
+    for _ in range(100):                                                # wait for the supervisor to start the CHILD (the database client now)
+        kids = [x for x in subprocess.run(["ps", "-o", "pid=", "--ppid", str(pr.pid)], capture_output=True, text=True).stdout.split()]
+        if kids: kid = int(kids[0]); break
+        time.sleep(0.1)
+    time.sleep(0.9)                                                     # let the child reach the injected sleep inside the DO
+    os.kill(kid, stop_signal)                                          # SIGSTOP = silent blackhole (socket stays open); SIGKILL = process dies
     time.sleep(observe_s)
     hold = lw.result()
     lingering = psql(db, "select count(*) from pg_stat_activity where application_name='task197_rehearsal'", user=SUP)[1].strip()
     if pr.poll() is None: pr.kill()
+    try: os.kill(kid, signal.SIGCONT); os.kill(kid, signal.SIGKILL)
+    except ProcessLookupError: pass
     pr.wait(); time.sleep(0.5); s1 = state(db)
     still = psql(db, "select count(*) from pg_locks where relation='public.magi_tasks'::regclass and mode='AccessExclusiveLock'", user=SUP)[1].strip()
     LOG[label] = dict(lock_seen=hold, lock_still_present_at_end=still, rehearsal_session_still_present=lingering)
@@ -121,9 +131,9 @@ h_, still, ok, ling = lossy("begin", signal.SIGKILL, 2000, 3000, 6.0, "begin_cli
 check("R10 client SIGKILL during the DO (begin mode): lock freed by the server statement_timeout (~3 s), session gone, no residue", h_ and h_[1] < 4.5 and still == "0" and ok, f"lock seen (first,last,dur) {h_}")
 h_, still, ok, ling = lossy("begin", signal.SIGSTOP, 1500, 2000, 8.0, "begin_blackhole")
 check("R11 client frozen (SIGSTOP blackhole) during the DO, begin mode: lock freed when the statement errors (statement_timeout 2 s), the lingering session is ended by the idle-in-transaction timeout, no residue", h_ and h_[1] < 3.5 and still == "0" and ok and ling == "0", f"lock seen {h_}, session still present {ling}")
-h_, still, ok, ling = lossy("begin", signal.SIGSTOP, 0, 2000, 9.0, "begin_blackhole_no_idle_timeout")
+h_, still, ok, ling = lossy("begin", signal.SIGSTOP, 30000, 2000, 9.0, "begin_blackhole_no_idle_timeout")
 check("R12 control, idle timeout disabled: the lock is STILL freed at statement_timeout (an erroring statement releases its locks at abort, not at ROLLBACK); only the idle session lingers", h_ and h_[1] < 3.5 and still == "0" and ok and ling == "1", f"lock seen {h_}, session still present {ling}")
-h_, still, ok, ling = lossy("session", signal.SIGSTOP, 0, 2000, 6.0, "session_blackhole")
+h_, still, ok, ling = lossy("session", signal.SIGSTOP, 30000, 2000, 6.0, "session_blackhole")
 check("R13 session mode, frozen client: the autocommit statement error frees the lock at statement_timeout (~2 s) without any idle timeout", h_ and h_[1] < 3.5 and still == "0" and ok, f"lock seen {h_}, session still present {ling}")
 
 (Path(sys.argv[sys.argv.index("--log") + 1]) if "--log" in sys.argv else TMP / "log.json").write_text(json.dumps(LOG, indent=2, ensure_ascii=False))

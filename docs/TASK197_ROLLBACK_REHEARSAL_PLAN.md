@@ -25,16 +25,19 @@
 | `tests/sql/task197_rehearsal_selftest.py` | 하네스 자체 시험 57건 |
 | `tests/sql/task197_runner_selftest.py` | 실행기 시험 14건(R1~R13) |
 | `tests/sql/task197_matrix.py` | 잠금 100/250/500 ms × 문장 한도 2/3/5 s 비교 측정 |
+| `tests/sql/task197_approval.py` | (4차) 서명 승인 검증·MAGI 도구(keygen/make-payload/sign/verify), 신뢰 기준점 상수(출하 `None`) |
+| `tests/sql/task197_runner_adversarial_selftest.py` | (4차) 적대 시험 42건: 승인·고정 매니페스트·단일 실행·종료 경로 |
+| `tests/sql/task197_real_replay_offline.py`, `task197_real_export.sql` | (4차) 마스킹 실제 이력 오프라인 재생 도구와 서버측 내보내기 식(데이터 자체는 저장소에 없음) |
 | `tests/sql/evidence_task197/` | PG17.10 원본 로그·측정 JSON |
 | `.github/workflows/task197-rollback-rehearsal.yml` | PG17 CI(서비스 컨테이너, 임시 서버만) |
 
-## 2. 실행기 (`task197_safe_runner.py`)
+## 2. 실행기 (`task197_safe_runner.py`) — 4차 정정(#5673) 반영
 ```
-PGDSN='<운영 DSN: 환경변수로만>' python3 tests/sql/task197_safe_runner.py \
-  --sha256 <task197_prod_rollback_rehearsal.sql의 sha256> --approval-event <마기 허가 이벤트 id> \
-  --statement-timeout-ms 3000 --lock-timeout-ms 250 --report run.json
+PGDSN='<운영 DSN: 환경변수로만>' python3 tests/sql/task197_safe_runner.py --approval-file <마기 서명 승인 파일> [--report run.json]
 ```
-순서: ① 해시 3중 대조(고정 인자·expect 파일·실제 파일) 및 금지 토큰 린트(commit, savepoint, nextval, delete, notify … ) → ② 관찰자 연결(별도 세션)로 기존 `task197_rehearsal` 세션이 있으면 거부 → ③ 사전 스냅샷 → ④ 리허설 연결: `BEGIN`; `SET LOCAL statement_timeout`; `SET LOCAL lock_timeout`; (세션 수준 `idle_in_transaction_session_timeout`) → ⑤ `show`로 **같은 연결의** 유효값이 요청값과 같은지 확인, 아니면 DO 전에 중단 → ⑥ DO 한 문장 실행(클라이언트 워치독 8초: 취소 후 2초 뒤 프로세스 종료) → ⑦ 예외 `P0001` + `REHEARSAL_ROLLBACK_SENTINEL`이어야 정상, 그 외는 FAIL → ⑧ `ROLLBACK` → ⑨ 관찰자가 리허설 세션 소멸·사후 스냅샷·불변식 대조 → 엄격 판정. **재시도는 없다.** DSN·자격증명은 로그·보고서에 쓰지 않는다(환경변수에서만 읽음). `--lock-timeout-ms`가 산출물의 상한(250)보다 크면 거부한다. `--mode session`(자동 커밋)은 비교용이며 운영 지침은 `begin`이다.
+**운영 모드가 받는 인자는 이것뿐이다.** 한도(3000/250/2000 ms, 워치독 8 s, 모드 begin)와 파일 경로는 코드에 고정이며 어떤 플래그로도 바뀌지 않는다. 시험용 인자(`--sql --expect --snapshot --sha256 --statement-timeout-ms --lock-timeout-ms --idle-tx-timeout-ms --watchdog-s --mode --test-child-fault --test-hold-lock-s`)는 운영 모드에서 **연결 전에 거부**된다.
+구조: **감독자**(이 프로세스) = 검증·관찰자 세션·잠금·스냅샷·보고서 / **관찰자 세션** = `pg_try_advisory_lock` 보유 + 읽기 전용 스냅샷 / **자식 프로세스** = 전용 연결 하나로 `BEGIN; SET LOCAL …; 유효값 확인; DO; ROLLBACK`.
+순서: ① (연결 전) 시험 인자 거부 → 서명 승인 검증(아래 8-A) → 해시 대조·린트 → ② 관찰자 연결(`lock_timeout 1 s`, `statement_timeout 5 s`) → ③ **단일 실행 잠금 획득**(실패 시 아무것도 시작하지 않고 종료) → ④ 승인 id 사용 처리 → ⑤ 기존 `task197_rehearsal` 세션 확인 → ⑥ 사전 스냅샷 → ⑦ 자식 시작(감독자 마감 = 워치독 8 s + 2 s + 3 s = 13 s, 초과 시 SIGKILL) → ⑧ 자식 보고 수신 → ⑨ 관찰자가 세션 소멸 확인·사후 스냅샷·불변식 대조(스냅샷이 잠금에 막히면 "잔여물 증명 불가 — HOLD"로 보고하고 카탈로그 뷰로 확인 가능한 값만 기록) → ⑩ 잠금 해제 → 엄격 판정. 재시도 없음. `--post-check-only`는 감독자 자체가 죽었을 때 쓰는 읽기 전용 점검이다.
 
 ## 3. 엄격 판정과 사후 처리 (사전 등록)
 PASS는 **전부** 충족될 때만: 센티널 `result=PASS`, `checks=57/57`, `scenarios=39/39`, `replay_ok=13`, `replay_drift=0`, `gate_sql_md5` 일치, `lock_timeout_ms=250`, `statement_timeout_ms=3000`, 리허설 세션 소멸, 사후 `INV_*` 불변·게이트 함수/트리거/픽스처/이벤트/교정 로그 잔여 0. 하나라도 어긋나면 실행기는 종료코드 2.
@@ -95,3 +98,29 @@ python3 tests/sql/task197_matrix.py --n 20 --out matrix.json             # 약 3
 **증명하지 못하는 것:** 운영 동시 트래픽 아래 관찰 배포 후 동작과 첫날 위반 건수 대조, anon 역할의 `statement_timeout` 3초(SET ROLE은 역할별 설정을 적용하지 않음 → `max_gate_update_ms`로 대체 보고), READ COMMITTED에서 커밋 전 이벤트를 게이트가 못 보는 한계, 원장 쓰기 위조(설계 8절 위험 수용), 17.6 실서버 동작.
 
 **CI 실행 기록:** PR#77 Actions run 39003813588 (postgres:17 서비스 컨테이너, `bash -eo pipefail`): 서버 버전 확인·생성기 `--check`·하네스 57건·실행기 14건·측정 매트릭스(n=10) 전부 success, 증거 아티팩트 `task197-pg17-evidence`. 앞선 run 39002747165는 `| tee`가 실패를 가린 설정이라 증거로 쓰지 않는다(그 설정을 pipefail로 고치자 3.12에서 시험 코드의 stdin 처리 결함 2건 — `communicate()` 전에 stdin 닫기, 입력 파이프 — 과 TCP용 역할 비밀번호 누락이 드러나 수정; 하네스·게이트·실행기 로직 변경 아님).
+
+## 8. 4차 정정 — 카산드라 #5673 (CONDITIONAL_PASS) 대응
+**범위 선언:** 운영 실행 없음, 병합·배포 없음, 마기 #5486 HOLD 유지. 이 정정은 코드·시험·문서 제출이며 자체 PASS가 아니다. 검증 대상 head는 PR#77의 새 head이고(이전 고정 SHA `f2dd9cf`, 중간 head `ffef37a`는 `__pycache__` 제거만), 새 head는 제출 이벤트에 기록한다.
+| 조건 | 구현 | 시험 (PG17.10, `task197_runner_adversarial_selftest.py` 42건 + 기존 14건) |
+|---|---|---|
+| **P0-A** 승인 게이트 | `task197_approval.py`: MAGI의 Ed25519 서명 승인 파일만 인정. 서명이 task 197·정확한 git 커밋(깨끗한 작업트리)·가드 파일 6개의 SHA256·고정 매니페스트·**30분 이하 시간창**·#5486 HOLD 해제·업로드 없는 시간대·운영자·UUID를 묶는다. 키 지문은 코드 상수 `TRUST_ANCHOR_PUBKEY_SHA256`(출하 시 `None` = 모든 운영 실행 거부)와 대조. 승인 id는 1회용. 레지스트리 행만으로는 승인이 아니다(#202). 문자열 토큰("0") 성공 경로 없음 | A1 정상 종단(서명 승인으로 운영 모드 PASS), A2 재사용 거부, A3~A16 (파일 없음·깨진 파일·만료·미개시·30분 초과·공격자 키·HOLD/업로드 없음 미기재·다른 task·매니페스트 변조 2종·다른 커밋·UUID 아님·가드 파일 누락) 전부 연결 전 거부 + DB 불변 |
+| **P0-B** 시간 한계 불변 | 운영 모드는 플래그 없음. 시험 모드(`--test-mode` + `TASK197_TEST_MODE=throwaway-server` + 로컬 호스트 + 일회용 DB 이름 `t_*`/`gate*`)에서만 변경 가능하고, 모든 수치는 유한·양수·범위 검사(0·음수·NaN·inf·1e999·소수·문자 거부)를 **연결 전에** 통과해야 한다. `--mode session`은 운영에서 거부 | B1 44건, B2 15건(운영 거부), B3~B6, B7(거부 후 DB 불변·DDL 없음) |
+| **P0-C** 원자적 단일 실행 | 관찰자 세션이 사전 스냅샷 **전에** `pg_try_advisory_lock(1970617,197001)` 획득, 잔여물 검사 끝까지 보유, 실패 시 즉시 종료(재시도 없음). **정정:** advisory lock은 *데이터베이스 단위*다(클러스터 전체가 아님). 이 하네스는 단일 DB(운영 `postgres`)에서만 의미가 있으므로 충분하며, 서로 다른 프로세스·호스트가 같은 DB에 접속하면 모두 같은 잠금을 다툰다. 세션 종료(크래시·워치독·kill)로 잠금은 서버가 해제한다 | C1 3개 동시 중 정확히 1건만 통과·2건은 스냅샷·리허설 연결 이전에 거부, C2 6개 중 1건, C3 이후 재진입 가능, C4 감독자 SIGKILL 후 잠금 해제 확인. 매트릭스 conc: 배치마다 정확히 1건 PASS(5 PASS·10 거부) — 이전 "10 PASS/5 거부"를 대체 |
+| **P0-D** 종료 경로 | 감독자/자식 분리. 자식이 취소 정지·강제 종료·SIGKILL·네트워크 단절이어도 감독자가 자체 마감(13 s)에서 자식을 죽이고 보고서를 직접 쓰며 사후 스냅샷으로 세션·잠금·객체·픽스처 잔여를 기록한다. 증명 불가이면 그렇게 보고하고 HOLD를 지시(자동 정리·세션 종료 없음) | D1 자식 SIGKILL(잠금 2.98 s에 해제), D2 `os._exit`, D3 소켓 shutdown(네트워크 단절), D4 취소 호출 정지+서버 3 s 한도, **D5 서버 한도가 없는 시험 전용 긴 한도+취소 정지: 감독자가 SIGKILL하고 "세션 잔존·HOLD"로 보고(깨끗하다고 하지 않음)**, D6 잔여 소멸 후 `--post-check-only` 통과, D7 종료 후 응답 없는 자식, D8 감독자 SIGTERM, D9 커밋된 잔여물 검출 |
+| **P1-E** 실제 805건 재생 | 아래 8-B | `task197_real_replay_offline.py`, 결과 `evidence_task197/real_replay_result.round4.pg17.10.json` |
+| **P1-F** 신뢰 기준점 | 승인이 커밋·가드 파일 해시를 묶고 키는 상수로 고정. 호출자가 sql/expect/해시를 고를 방법이 운영 모드에 없다 | A17 적대적이지만 서로 일관된 SQL+expect 세트(승인은 옛 커밋) 거부, A18 같은 세트를 공격자 키로 재서명 거부, A19 커밋 안 된 수정(작업트리 더러움) 거부, A20 공개키 파일을 바꾸고 일관되게 서명 → 지문≠기준점 거부, A21 기준점 없음 거부, A22 출하 기준점 `None` |
+| **P1-G** 가정·범위 | 아래 8-C | — |
+
+### 8-A. 승인 흐름 (MAGI 쪽)
+1. 마기가 `task197_approval.py keygen`으로 키 쌍 생성, **개인키는 저장소·세션에 두지 않는다**. 2. 지문을 `TRUST_ANCHOR_PUBKEY_SHA256`에 넣는 커밋과 `tests/sql/task197_approval_pubkey.pem` 추가를 카산드라가 검토. 3. 그 커밋 SHA와 시간창으로 `make-payload`→`sign`. 4. 운영 DSN은 승인 파일과 **함께** 전달. 한계(숨기지 않음): 실행기를 고친 운영자는 코드 검사를 건너뛸 수 있다. 대응은 코드가 아니라 절차다 — 승인이 정확한 커밋·파일 해시를 묶으므로 고친 실행기는 승인된 것과 다르고, 마기·카산드라가 실행 전 체크아웃을 재해시하며, 자격증명은 승인과 함께만 전달된다.
+
+### 8-B. 실제 이력 오프라인 재생 (원본·마스킹본 모두 저장소와 CI에 올리지 않는다)
+- 마기 레지스트리에서 읽기 전용 SELECT로 재생 대상 16개 태스크의 **현재 전체 이벤트 879건**(기준 시점 `max(event_id)=5707`; 마기 #5490 기준 805건은 이후 증가)을 내보냈다. 보존: 이벤트 순서, `event_type`, `actor`, 게이트가 읽는 payload 키 5개(`verdict stage tier evidence_kind verifier_role`; 토큰 모양이 아닌 값은 `H:<sha256 12자>`로 대체). 폐기: detail 본문, 시각, 원 id, 나머지 payload 키.
+- 출처 증명: 서버에서 계산한 **원본 해시** `raw_sha256 = 4d01a5fb86e3f38ff1fa1162b6c76c0651ed9362a603872c5b6467c3ec51d8a2`(879행 `task|id|type|actor|payload` 정렬 연결; 마기·카산드라가 레지스트리에서 같은 식으로 재계산 가능, 식은 `task197_real_export.sql`)와 **마스킹본 해시** `51f5318e1aa15eb2ed86767e7f7ad56eb1e6d84a31c467d2fd388fa33d6c53fd`(스크립트가 적재한 데이터에서 재계산해 대조: E1).
+- 실제 결과(PG17.10 임시 서버): 하네스 **57/57, 39/39, replay_ok=13, replay_drift=0**, 실행기 엄격 판정 PASS, 잔여물 없음. 합성 CI 고정 데이터는 35건(16개 태스크) — **실제는 879건**이다(태스크 160 하나가 605건). 정보용 3건(기대값 없음): #194 `REVIEW EVIDENCE_NEWER_THAN_PASS`, #204 `WARN LATEST_VERDICT_NOT_PASS`, #205 `WARN NO_CASSANDRA_RECORD` — 이후 이벤트로 달라진 것을 있는 그대로 기록한다.
+- 한계: 마스킹이 판정에 영향을 주는지는 게이트가 읽는 키만 남겼다는 근거로 판단했고, 원본 payload 전체로 돌린 결과와의 직접 대조는 하지 않았다(원본은 이 환경 밖으로 내보내지 않는다는 조건이 우선). 원 event_id는 순번으로 대체했다(순서 보존). 운영 17.6·실제 디스크에서의 동작은 여전히 미검증.
+
+### 8-C. 가정 분리 (P1-G)
+- **측정 신뢰도와 보장은 다르다.** 위 시간 수치(DO 구간 p95 약 90~112 ms, 정지 시 문장 한도에서 컷, 잠금 보유 약 1.97/2.98/4.97 s)는 PG17.10 임시 서버의 *측정 신뢰도*다. *보장되는 보호*는 서버 설정이 강제하는 것뿐이다: `statement_timeout 3000 ms`, `lock_timeout 250 ms`(DO 안에서 더 느슨하게 만들 수 없음), `idle_in_transaction_session_timeout 2000 ms`, 오류 종료 시 잠금 해제. 이 보호는 버전과 무관하게 서버 의미론이지만, 17.6 운영 서버에서 직접 확인한 것은 아니다.
+- 17.10(시험) 대 17.6(운영) 차이, 실제 DB 규모·디스크 지연, #214의 호스트 I/O 정지가 시간 수치에 주는 영향은 **모른다**. 정지 중에는 `BEGIN` 자체가 19~25 s 걸린 기록이 있어 3 s 한도가 클라이언트 쪽에서는 의미가 다르게 보일 수 있다.
+- 따라서: 운영 실행은 마기가 시각을 지정한 허가(서명 승인), 업로드 없는 시간대, #214 방향 결정 이후에만 가능하며 이 문서는 어떤 허가도 대신하지 않는다.

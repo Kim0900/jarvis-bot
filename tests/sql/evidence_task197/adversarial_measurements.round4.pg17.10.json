@@ -1,0 +1,42 @@
+{
+  "sigkill": {
+    "rc": 2,
+    "wall_s": 3.42,
+    "lock_held_s": 2.97,
+    "reasons": "child produced no report (returncode -9): the outcome of the DO is unprovable from the client side, residue check follows | no sentinel",
+    "child_signal": 9,
+    "child_returncode": -9
+  },
+  "exit": {
+    "rc": 2,
+    "wall_s": 3.38,
+    "lock_held_s": 2.98,
+    "reasons": "child produced no report (returncode 7): the outcome of the DO is unprovable from the client side, residue check follows | no sentinel",
+    "child_signal": null,
+    "child_returncode": 7
+  },
+  "netbreak": {
+    "rc": 2,
+    "wall_s": 3.43,
+    "lock_held_s": 2.97,
+    "reasons": "OperationalError: consuming input failed: server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request. | ROLLBACK failed: OperationalError('the connection is closed",
+    "child_signal": null,
+    "child_returncode": 0
+  },
+  "cancelhang_bounded": {
+    "rc": 2,
+    "wall_s": 3.38,
+    "lock_held_s": 2.97,
+    "reasons": "QueryCanceled: canceling statement due to statement timeout\nCONTEXT:  SQL statement \"SELECT pg_sleep(30)\"\nPL/pgSQL function inline_code_block line 173 at PERFORM | no sentinel",
+    "child_signal": null,
+    "child_returncode": 0
+  },
+  "cancelhang_unbounded_test_only": {
+    "rc": 2,
+    "wall_s": 13.24,
+    "lock_held_s": 12.87,
+    "reasons": "child exceeded the supervisor deadline (6.0 s) and was SIGKILLed | child produced no report (returncode -9): the outcome of the DO is unprovable from the client side, residue check follows | the rehearsal session is still present (possible ",
+    "child_signal": 9,
+    "child_returncode": -9
+  }
+}
