@@ -1,0 +1,78 @@
+name: Task197 rollback-rehearsal harness (PostgreSQL 17, throwaway server only)
+
+on:
+  pull_request:
+    paths:
+      - "tests/sql/task197_*"
+      - "docs/TASK197_ROLLBACK_REHEARSAL_PLAN.md"
+      - ".github/workflows/task197-rollback-rehearsal.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash   # -eo pipefail: a failing test must not be masked by | tee
+
+jobs:
+  pg17:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_PASSWORD: ci_throwaway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin" --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: supabase_admin
+      PGPASSWORD: ci_throwaway
+      PGSUPER: supabase_admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]==3.2.3" "cryptography==43.0.3"
+      - name: Server version (must be 17)
+        run: psql -d postgres -Atc "select version()" | tee /dev/stderr | grep -q "PostgreSQL 17"
+      - name: Roles that the tests log in as (TCP needs passwords; the schema file only creates them if missing)
+        run: |
+          psql -d postgres -v ON_ERROR_STOP=1 -c "create role postgres nosuperuser login createrole createdb bypassrls password 'ci_throwaway'" \
+                                                -c "create role authenticator noinherit login password 'ci_throwaway'"
+      - name: Generator is current (committed SQL + expect file)
+        run: python tests/sql/task197_rollback_rehearsal_build.py --check
+      - name: Harness self-test (57 checks)
+        run: |
+          python tests/sql/task197_rehearsal_selftest.py > harness_selftest.log 2>&1 || { grep -E '^(FAIL|Traceback|SQL ERROR)|Error' harness_selftest.log | head -8 | sed 's/^/::error::/'; tail -n 5 harness_selftest.log | sed 's/^/::error::/'; exit 1; }
+          tail -n 3 harness_selftest.log
+      - name: Runner self-test (14 checks)
+        run: |
+          python tests/sql/task197_runner_selftest.py --log runner_measurements.json > runner_selftest.log 2>&1 || { grep -E '^(FAIL|Traceback|SQL ERROR)|Error' runner_selftest.log | head -8 | sed 's/^/::error::/'; tail -n 5 runner_selftest.log | sed 's/^/::error::/'; exit 1; }
+          tail -n 3 runner_selftest.log
+      - name: Runner ADVERSARIAL self-test (approval gate, fixed manifest, single flight, exit paths; 42 checks)
+        run: |
+          python tests/sql/task197_runner_adversarial_selftest.py --log adversarial_measurements.json > adversarial_selftest.log 2>&1 || { grep -E '^(FAIL|Traceback|SQL ERROR)|Error' adversarial_selftest.log | head -8 | sed 's/^/::error::/'; tail -n 5 adversarial_selftest.log | sed 's/^/::error::/'; exit 1; }
+          tail -n 3 adversarial_selftest.log
+      - name: Lock/statement-limit matrix (n=10)
+        run: |
+          python tests/sql/task197_matrix.py --n 10 --out matrix.json > matrix.log 2>&1 || { grep -E '^(FAIL|Traceback|SQL ERROR)|Error' matrix.log | head -8 | sed 's/^/::error::/'; tail -n 5 matrix.log | sed 's/^/::error::/'; exit 1; }
+          tail -n 3 matrix.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task197-pg17-evidence
+          path: |
+            harness_selftest.log
+            runner_selftest.log
+            runner_measurements.json
+            adversarial_selftest.log
+            adversarial_measurements.json
+            matrix.json
+            matrix.log

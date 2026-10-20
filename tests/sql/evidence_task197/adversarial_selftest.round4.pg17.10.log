@@ -1,0 +1,45 @@
+PASS B1 test mode: 0 / negative / huge / NaN / inf / 1e999 / fractional / garbage for every limit flag is rejected before any connection (44 cases)  [44/44]
+PASS B2 production mode refuses EVERY limit/file/mode/fault option (even the manifest's own values, even --mode session) before any connection (15 cases)  [15/15]
+PASS B3 --test-mode without TASK197_TEST_MODE=throwaway-server is refused  [--test-mode needs TASK197_TEST_MODE=throwaway-server]
+PASS B4 test mode against a database that does not look like a throwaway (dbname=postgres) is refused  [test mode is only allowed against a local server and a throwaway database name]
+PASS B5 test mode against a non-local host (even with a throwaway-looking name) is refused before any DNS/connection  [test mode is only allowed against a local server and a throwaway database name]
+PASS B6 production mode without an approval file is refused  [production mode needs --approval-file (MAGI-signed approval)]
+PASS B7 none of the refusals touched the database (catalog/data/invariants identical, no DDL)
+PASS A1 end-to-end PRODUCTION mode with a valid signed approval: strict PASS, exit 0, fixed manifest 3000/250/2000/8, no residue
+PASS A2 an approval is single use: the second run with the same approval_id is refused before connecting  [approval refused: approval_id was already used (single use)]
+PASS A3 no approval content ('0'): refused before any connection, exit 2, database untouched  [approval unreadable: FileNotFoundError]
+PASS A4 malformed approval file: refused before any connection, exit 2, database untouched  [approval refused: approval file malformed]
+PASS A5 expired window: refused before any connection, exit 2, database untouched  [approval refused: outside the approved time window]
+PASS A6 window not yet open: refused before any connection, exit 2, database untouched  [approval refused: outside the approved time window]
+PASS A7 window longer than 30 minutes: refused before any connection, exit 2, database untouched  [approval refused: approval window is empty or longer than 30 minutes]
+PASS A8 signed by an attacker key (valid signature, wrong key) while the repository key is the anchor: refused before any connection, exit 2, database untouched  [approval refused: approval signature invalid]
+PASS A9 HOLD #5486 not stated as cleared: refused before any connection, exit 2, database untouched  [approval refused: approval does not state that the #5486 HOLD is cleared for an upload-free window]
+PASS A10 window not marked upload-free: refused before any connection, exit 2, database untouched  [approval refused: approval does not state that the #5486 HOLD is cleared for an upload-free window]
+PASS A11 approval for a different task: refused before any connection, exit 2, database untouched  [approval refused: approval is not a task-197 approval (schema/task)]
+PASS A12 manifest in the approval differs from the fixed production manifest (statement_timeout 0): refused before any connection, exit 2, database untouched  [approval refused: approval manifest differs from the fixed production manifest]
+PASS A13 manifest with a loosened lock_timeout: refused before any connection, exit 2, database untouched  [approval refused: approval manifest differs from the fixed production manifest]
+PASS A14 approval for another commit: refused before any connection, exit 2, database untouched  [approval refused: approval is for a different commit]
+PASS A15 approval_id not a UUID: refused before any connection, exit 2, database untouched  [approval refused: approval_id is not a UUID]
+PASS A16 approval does not list exactly the guarded files: refused before any connection, exit 2, database untouched  [approval refused: approval does not list exactly the guarded files]
+PASS A17 hostile SQL + matching expect.sha256 committed, original approval (pins the old commit): refused before any connection, exit 2, database untouched  [approval refused: approval is for a different commit]
+PASS A18 same hostile trio, approval re-signed by the attacker for the NEW commit and NEW hashes: refused before any connection, exit 2, database untouched  [approval refused: approval signature invalid]
+PASS A19 hostile uncommitted edit of the DO statement (working tree dirty): refused before any connection, exit 2, database untouched  [approval refused: working tree has uncommitted changes to tracked files]
+PASS A20 attacker swaps the public key file and signs everything consistently (fingerprint != trust anchor): refused before any connection, exit 2, database untouched  [approval refused: approval public key does not match the trust anchor]
+PASS A21 no trust anchor configured (the repository default): live runs are impossible: refused before any connection, exit 2, database untouched  [approval refused: no trust anchor is configured in this checkout: live runs are not possible]
+PASS A22 the committed trust anchor is unset (None) until MAGI sets it in a reviewed commit  [None]
+PASS C1 exactly ONE of 3 simultaneous runs is admitted (exit 0); the other two fail on the admission lock BEFORE any snapshot or rehearsal connection  [admitted 1, refused ['single flight: another rehearsal holds t', 'single flight: another rehearsal holds t']]
+PASS C2 six simultaneous attempts: still exactly one admitted
+PASS C3 the admission lock was released after the runs: a later run is admitted and passes
+PASS C4 supervisor SIGKILLed while holding the admission lock: the lock dies with its session; the next run is admitted
+PASS D1 child SIGKILLed mid-DO (production limits): report still written by the supervisor, exit 2, no sentinel; lock bounded by statement_timeout; residue recorded and zero  [lock held 2.97s, wall 3.4s]
+PASS D2 child forced exit (os._exit) mid-DO: same guarantees  [lock held 2.98s]
+PASS D3 network break (socket shut down under the child) mid-DO: client-side error recorded, exit 2, lock bounded by statement_timeout, no residue  [OperationalError: consuming input failed: server closed the connection unexpectedly
+	This  lock held 2.97s]
+PASS D4 cancel hangs (the client's cancel call never returns) but the server statement_timeout 3000 ms still cuts the DO: report written, exit 2, lock <= ~3 s, no residue  [lock held 2.97s, wall 3.4s]
+PASS D5 (test-only long limits) cancel-hang with NO server cut: the supervisor SIGKILLs the child at its deadline, the report states that residue is still present and says HOLD/manual review - it never claims a clean result; the residue clears later and --post-check-only then proves it  [wall 13.2s residual {'rehearsal_sessions': 1, 'exclusive_locks_on_gate_tables': 2}]
+PASS D6 --post-check-only after the residue cleared: exit 0, read-only
+PASS D7 child hangs after the DO and ignores SIGTERM: killed at the supervisor deadline (~6 s), exit 2, no report from the child, residue zero and recorded  [6.3s]
+PASS D8 supervisor SIGTERM mid-run: it kills the child, still takes the residual snapshot and writes a FAIL report (nothing left behind)  [supervisor interrupted (exit 143); residue check follows | no sentinel]
+PASS D9 --post-check-only reports committed gate residue (exit 2, names the invariant)  [residue: INV_gate_functions=1]
+
+42/42 passed

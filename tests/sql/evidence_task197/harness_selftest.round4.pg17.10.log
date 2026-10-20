@@ -1,0 +1,59 @@
+PASS T1a committed .sql equals a fresh build (no stale artifact)
+PASS T1b header md5 equals md5 of docs section 5
+PASS T1c harness body has no commit/savepoint/sequence/notify/grant/delete or other non-transactional step  [[]]
+PASS T1d embedded gate SQL has none of them either  [[]]
+PASS T1e the statement ends with the unconditional RAISE EXCEPTION and nothing after it
+PASS T1f exactly one statement (one DO block)
+PASS T2a harness passes on a production-shaped database  [checks 57/57, scenarios 39/39, replay_ok 13, hold 52 ms, total 58 ms, event_seq 44]
+PASS T2b the run ends with the sentinel ERROR (rollback by exception)
+PASS T2c schema dump identical before/after
+PASS T2d table contents identical before/after (tasks, events, correction_log)
+PASS T2e snapshot identical except the event sequence
+PASS T2f the only residue is the event identity sequence, exactly as reported  [consumed 44]
+PASS T2g magi_tasks identity sequence untouched (fixtures use explicit ids)
+PASS T2h second run gives the same verdict and consumes the same sequence amount
+PASS T2i harness reports the embedded gate md5
+PASS T3 explicit BEGIN ... COMMIT around it: sentinel returned, no residue
+PASS T3 psql --single-transaction: sentinel returned, no residue
+PASS T3 psql -c (one simple-query message): sentinel returned, no residue
+PASS T3 ON_ERROR_STOP off (statements after the error still run): sentinel returned, no residue
+PASS T3 pipelined with a trailing COMMIT-like noise: sentinel returned, no residue
+PASS T4 division by zero right after the DDL: reported as FAIL with the cause, still rolled back, no residue  [NOTICE:  trigger "trg_magi_tasks_completion_gate_observe" for relation "public.magi_tasks" does not exist, skipping]
+PASS T4 integrity violation after fixtures are inserted: reported as FAIL with the cause, still rolled back, no residue  [NOTICE:  trigger "trg_magi_tasks_completion_gate_observe" for relation "public.magi_tasks" does not exist, skipping]
+PASS T4 permission failure mid-way (SET ROLE to a role it may not assume): reported as FAIL with the cause, still rolled back, no residue  [NOTICE:  trigger "trg_magi_tasks_completion_gate_observe" for relation "public.magi_tasks" does not exist, skipping]
+PASS T4 backend terminated mid-run: no residue, no lock left  [locks while running=1, after=0]
+PASS T4 client killed (SIGKILL) mid-run: server finishes/aborts, no residue, no lock left  [locks=0]
+PASS T4 session statement_timeout cancels a runaway run, no residue, no lock left  [3.0s]
+PASS T5 guard 'gate already installed' aborts before DDL, no change  [ERROR:  REHEARSAL_ABORTED_BEFORE_DDL: gate objects already exist (not a first-time rehearsal)]
+PASS T5 guard 'fixture task id range occupied' aborts before DDL, no change  [ERROR:  REHEARSAL_ROLLBACK_SENTINEL result=FAIL checks=0/0 scenarios=0/0 replay_ok=0 replay_drift=0 hold_ms=1 total_ms=9 max_gate_update_ms=]
+PASS T5 guard 'fixture event id range occupied' aborts before DDL, no change  [ERROR:  REHEARSAL_ROLLBACK_SENTINEL result=FAIL checks=0/0 scenarios=0/0 replay_ok=0 replay_drift=0 hold_ms=1 total_ms=12 max_gate_update_ms]
+PASS T5 guard 'read-only transaction' aborts before DDL, no change  [ERROR:  REHEARSAL_ABORTED_BEFORE_DDL: transaction is read only]
+PASS T5 guard 'role cannot SET ROLE anon' aborts before DDL, no change  [ERROR:  REHEARSAL_ABORTED_BEFORE_DDL: current_user authenticator cannot SET ROLE anon]
+PASS T5 guard 'another session holds a transaction older than 10 s' aborts before DDL
+PASS T6a busy table: harness gives up after its 250 ms lock_timeout, reports it, no residue  [0.30s]
+PASS T6b a reader queued behind the waiting harness is delayed at most about the 250 ms lock_timeout  [reader waited 0.25s]
+PASS T6c 8 runs against 3 concurrent writer/reader clients: no client error, every run is either PASS or a clean 55P03 give-up, worst client stall stays near lock_timeout + hold  [8 PASS, 0 lock give-ups, hold 52-81 ms, worst client latency 86 ms over 354949 client txns]
+PASS T7 no PostgREST schema-reload NOTIFY escapes the rolled-back DDL (control: a committed DDL does notify)  [control saw it]
+PASS T8 mutant 'search_path without pg_temp and unqualified table' is detected  [fails: DETAIL:  D2 owner/secdef/sea]
+PASS T8 mutant 'INSERT trigger never fires' is detected  [fails: DETAIL:  I1 insert COMPLETED; I2 insert CLOSED vr]
+PASS T8 mutant 'final-validation allowlist replaced by substring' is detected  [fails: DETAIL:  P25 PASS from non-a]
+PASS T8 mutant 'revocation gate removed' is detected  [fails: DETAIL:  P14 revoked validat; P20 invalidation event]
+PASS T8 mutant 'CASSANDRA actors allowed as implementation evidence' is detected  [fails: DETAIL:  P26 evidence writte]
+PASS T8 mutant 'JSON object check removed' is detected  [fails: DETAIL:  P18 array payload i]
+PASS T8 mutant 'output sanitizing removed' is detected  [fails: DETAIL:  O1 copied verdict/s]
+PASS T8 mutant 'fail-open handler narrowed (errors escape)' is detected  [fails:  FATAL]
+PASS T8 mutant 'transition filter drops OLD.status check (re-fires)' is detected  [fails: DETAIL:  N8 COMPLETED->CLOSE]
+PASS T8 mutant 'vr-cleared rule removed' is detected  [fails: DETAIL:  P23 vr cleared in s]
+PASS T8 mutant 'EXECUTE left granted (revoke removed)' is detected  [fails: DETAIL:  D3 anon/authenticat; A3 anon direct call denied]
+PASS T8 mutant 'later-event rule removed' is detected  [fails: DETAIL:  P15 later unknown c]
+PASS T8 mutant 'newer-evidence rule removed' is detected  [fails: DETAIL:  P16 evidence newer ]
+PASS T8 mutant 'neutral list widened to everything' is detected  [fails: DETAIL:  P15 later unknown c]
+PASS T9 a changed real history shows up as REPLAY DRIFT (not hidden, not a harness FAIL)  [REPLAY_DRIFT]
+PASS T10 patrol classifier: violation events are non_control_event and never look explicitly critical (no underposting alert)  [44 events checked, explicit-critical 0]
+PASS T11 caller lock_timeout=100ms: in force inside the harness = 100 ms  [(100, 100)]
+PASS T11 caller lock_timeout=250ms: in force inside the harness = 250 ms  [(250, 250)]
+PASS T11 caller lock_timeout=5s: in force inside the harness = 250 ms  [(5000, 250)]
+PASS T11 caller lock_timeout=0: in force inside the harness = 250 ms  [(0, 250)]
+PASS T11 caller statement_timeout=3000 ms is visible inside the harness and the run still passes  [3000]
+
+57/57 passed
