@@ -1,0 +1,50 @@
+name: Task214 snapshot tools self-test (PostgreSQL 17, throwaway server only)
+
+on:
+  pull_request:
+    paths:
+      - "tools/task214/**"
+      - "docs/TASK214_SNAPSHOT_PROCEDURE.md"
+      - ".github/workflows/task214-snapshot-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pg17:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_PASSWORD: ci_throwaway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin" --health-interval 3s --health-timeout 3s --health-retries 20
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGPASSWORD: ci_throwaway
+      PGSUPER: supabase_admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "psycopg[binary]==3.2.3"
+      - name: Server version (must be 17)
+        run: psql -U supabase_admin -d postgres -Atc "select version()" | tee /dev/stderr | grep -q "PostgreSQL 17"
+      - name: Snapshot tools self-test (read-only, outage behaviour, analysis)
+        run: python tools/task214/task214_snapshot_selftest.py 2>&1 | tee selftest.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task214-selftest-log
+          path: selftest.log
