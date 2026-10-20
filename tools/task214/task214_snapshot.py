@@ -5,7 +5,7 @@ NOTHING HERE RUNS AGAINST PRODUCTION UNLESS MAGI HAS SAID "수집 시작".  Defa
 opens no connection and does not even read the DSN variable.
 
     python3 task214_snapshot.py --phase pre --out-dir D                                    # dry run (default)
-    TASK214_DSN=... python3 task214_snapshot.py --phase pre --out-dir D --live --auth-event <registry event id of MAGI's "수집 시작">
+    TASK214_DSN=... python3 task214_snapshot.py --phase pre --out-dir D --live --approval A.json --approval-pubkey P.pem   # MAGI-signed approval
 
 Phases (one snapshot each):  pre | during1 | during2 | post_immediate | post_normal
 Profiles: 'full' (pre, post_immediate, post_normal) and 'light' (during1, during2: fewer, cheaper queries, shorter limits).
@@ -23,16 +23,26 @@ Safety properties (each one is tested in task214_snapshot_selftest.py):
   * the DSN and the credentials, host names and IP addresses in error texts never reach stdout, stderr or the file (scrubbed).
   * output: <out-dir>/task214_snap_<phase>_<UTC time>.json (0600, atomic rename) and a .sha256 beside it.
 
-Stated limits: --auth-event is an audit number, not an authorization the tool can check (registry rows are spoofable, #202); whoever runs this
-must have seen MAGI's "수집 시작" first.  track_io_timing is off on the production server (CASSANDRA #5715), so the *_time columns of pg_stat_io
+Execution gate (v2, CASSANDRA C214-79-03): --live needs an Ed25519-signed approval (--approval, --approval-pubkey) made by MAGI's key.  The tool
+checks, before the DSN is read: the key's SHA-256 equals TRUST_ANCHOR_PUBKEY_SHA256 (shipped as None => live runs are impossible until MAGI sets
+it, which changes this file's hash), the signature, that THIS file's sha256 equals the one the approval names (recorded SHA), phase, time window
+(<= 6 h), the registry event number and the expected DB role.  There is no self-issued switch: --auth-event and --allow-repeat no longer exist; a
+second attempt for a phase is possible only if the SIGNED approval lists it in repeat_phases.  After connecting, the session role must equal the
+approved db_role and must not be a superuser/createrole/createdb/replication/bypassrls role unless the signed approval says allow_privileged_role.
+Stated limits: a person who can edit this file or run arbitrary Python can bypass any check inside it (the trust anchor is a constant in the file);
+the mitigation is procedural: MAGI compares the file's sha256 with the one it signed, and the DB role is read-only on the server side.  track_io_timing is off on the production server (CASSANDRA #5715), so the *_time columns of pg_stat_io
 will be 0: counts and bytes are measurable, timing is not, and this tool does not change the setting.  Exit codes: 0 ok, 2 refused/usage, 3 a
 measurement failure was recorded.
 """
-import argparse, hashlib, json, os, re, sys, threading, time
+import argparse, base64, hashlib, json, os, re, sys, threading, time, uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-SCHEMA = "task214-snapshot-v1"
+SCHEMA = "task214-snapshot-v2"
+SCHEMAS_OK = ("task214-snapshot-v1", "task214-snapshot-v2")
+APPROVAL_SCHEMA = "task214-snapshot-approval-v1"
+TRUST_ANCHOR_PUBKEY_SHA256 = None      # MAGI sets the SHA-256 (hex) of the raw Ed25519 public key it holds; None => no live run is possible
+MAX_APPROVAL_WINDOW = timedelta(hours=6)
 KST = timezone(timedelta(hours=9))
 PHASES = ("pre", "during1", "during2", "post_immediate", "post_normal")
 LIGHT_PHASES = ("during1", "during2")
@@ -57,11 +67,14 @@ SECTIONS = [
      "max(extract(epoch from now() - xact_start))::int as max_xact_age_s from pg_stat_activity group by 1, 2, 3, 4 order by 1, 2, 3, 4) a"),
     ("statements_info", ("full",), "select to_jsonb(i) from pg_stat_statements_info i"),
     ("statements_top", ("full",),
-     "with s as (select queryid, calls, total_exec_time, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, shared_blks_written, "
+     "with s as (select dbid, userid, queryid, toplevel, calls, total_exec_time, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, shared_blks_written, "
      "left(query, 120) as q from pg_stat_statements), "
      "t as (select * from s order by total_exec_time desc limit 20), c as (select * from s order by calls desc limit 20), "
      "r as (select * from s order by rows desc limit 20) "
      "select coalesce(jsonb_agg(to_jsonb(u)), '[]'::jsonb) from (select * from t union select * from c union select * from r) u"),
+    ("statements_totals", ("full",),
+     "select to_jsonb(x) from (select count(*) as n_entries, coalesce(sum(calls), 0) as sum_calls, coalesce(sum(total_exec_time), 0) as sum_total_exec_time, "
+     "coalesce(sum(rows), 0) as sum_rows from pg_stat_statements) x"),
     ("user_tables", ("full",),
      "select coalesce(jsonb_agg(to_jsonb(u)), '[]'::jsonb) from (select schemaname, relname, seq_scan, idx_scan, n_tup_ins, n_tup_upd, n_tup_del, "
      "n_live_tup, n_dead_tup, vacuum_count, autovacuum_count, analyze_count, autoanalyze_count from pg_stat_user_tables) u"),
@@ -69,7 +82,9 @@ SECTIONS = [
 GUARD_SQL = ("select current_setting('transaction_read_only'), "
              "(select setting from pg_settings where name = 'statement_timeout'), "
              "(select setting from pg_settings where name = 'lock_timeout'), "
-             "(select setting from pg_settings where name = 'idle_in_transaction_session_timeout')")
+             "(select setting from pg_settings where name = 'idle_in_transaction_session_timeout'), "
+             "(select rolsuper or rolcreaterole or rolcreatedb or rolreplication or rolbypassrls from pg_roles where rolname = current_user), "
+             "current_user::text")
 
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}\b")
 _HOST_RE = re.compile(r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:supabase\.(?:co|com|net)|pooler\.supabase\.com|invalid|local|internal)\b", re.I)
@@ -133,6 +148,85 @@ class Abort(Exception):
         self.outcome = outcome
 
 
+def _canon(o):
+    return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _utc(x, name):
+    try:
+        d = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except Exception:
+        raise ValueError(f"{name} is not an ISO time")
+    if d.tzinfo is None:
+        raise ValueError(f"{name} has no timezone")
+    return d.astimezone(timezone.utc)
+
+
+def verify_approval(approval, pubkey_pem, *, phase, tool_sha256, now, anchor):
+    """Returns the verified payload or raises ValueError(reason).  Pure function (no I/O) so the self-test can drive every branch."""
+    if not anchor:
+        raise ValueError("no trust anchor in this tool (TRUST_ANCHOR_PUBKEY_SHA256 is None): MAGI must set it before any live run")
+    from cryptography.hazmat.primitives.serialization import load_pem_public_key, Encoding, PublicFormat
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+    try:
+        pub = load_pem_public_key(pubkey_pem)
+    except Exception:
+        raise ValueError("public key is not a PEM public key")
+    if not isinstance(pub, Ed25519PublicKey):
+        raise ValueError("public key is not Ed25519")
+    fp = hashlib.sha256(pub.public_bytes(Encoding.Raw, PublicFormat.Raw)).hexdigest()
+    if fp != anchor:
+        raise ValueError("public key does not match the trust anchor shipped in this tool")
+    if not isinstance(approval, dict) or set(approval) != {"payload", "signature_b64"} or not isinstance(approval.get("payload"), dict):
+        raise ValueError("approval file has the wrong shape")
+    try:
+        sig = base64.b64decode(approval["signature_b64"], validate=True)
+        pub.verify(sig, _canon(approval["payload"]))
+    except (InvalidSignature, ValueError, TypeError):
+        raise ValueError("signature does not verify")
+    p = approval["payload"]
+    need = {"schema", "approval_id", "magi_event", "tool_sha256", "phases", "repeat_phases", "not_before", "not_after", "operator", "db_role", "allow_privileged_role"}
+    if set(p) != need:
+        raise ValueError("payload fields differ from the schema: " + ",".join(sorted(set(p) ^ need)))
+    if p["schema"] != APPROVAL_SCHEMA:
+        raise ValueError("unknown approval schema")
+    if not isinstance(p["approval_id"], str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", p["approval_id"]):
+        raise ValueError("approval_id is not a uuid")
+    if not isinstance(p["magi_event"], int) or isinstance(p["magi_event"], bool) or p["magi_event"] <= 0:
+        raise ValueError("magi_event must be a positive integer")
+    if p["tool_sha256"] != tool_sha256:
+        raise ValueError("this tool file's sha256 is not the one the approval names (recorded SHA mismatch)")
+    if not (isinstance(p["phases"], list) and p["phases"] and all(x in PHASES for x in p["phases"])) or phase not in p["phases"]:
+        raise ValueError("phase is not approved")
+    if not (isinstance(p["repeat_phases"], list) and all(x in p["phases"] for x in p["repeat_phases"])):
+        raise ValueError("repeat_phases must be a subset of phases")
+    if not isinstance(p["operator"], str) or not p["operator"].strip() or not isinstance(p["db_role"], str) or not p["db_role"].strip() or not isinstance(p["allow_privileged_role"], bool):
+        raise ValueError("operator/db_role/allow_privileged_role malformed")
+    nb, na = _utc(p["not_before"], "not_before"), _utc(p["not_after"], "not_after")
+    if na <= nb or na - nb > MAX_APPROVAL_WINDOW:
+        raise ValueError("approval window is empty or longer than 6 hours")
+    if not (nb <= now <= na):
+        raise ValueError("outside the approved time window")
+    return p
+
+
+def claim_attempt(out, phase, payload):
+    """Exclusive markers in the output directory.  First attempt: .attempt_<phase>.  A second one only if the SIGNED approval lists the phase
+    in repeat_phases (marker .attempt_<phase>.2); never a third.  The approval id is stamped into the marker."""
+    stamp = (iso(now_utc()) + " " + payload["approval_id"] + "\n").encode()
+    for name in (f".attempt_{phase}", f".attempt_{phase}.2"):
+        if name.endswith(".2") and phase not in payload["repeat_phases"]:
+            return False, f"phase {phase} was already attempted here; the signed approval does not allow a repeat"
+        try:
+            fd = os.open(out / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(fd, stamp); os.close(fd)
+            return True, name
+        except FileExistsError:
+            continue
+    return False, f"phase {phase} was already attempted twice here; no further attempt"
+
+
 def open_readonly(dsn, *, connect_timeout, application_name, statement_timeout_ms):
     """One connection, one READ ONLY transaction with SET LOCAL limits.  Returns the connection (transaction open)."""
     import psycopg
@@ -160,6 +254,12 @@ def collect(args, dsn, info, scrub, writer, state):
         g = conn.execute(GUARD_SQL).fetchone()
         eff = {"transaction_read_only": g[0], "statement_timeout_ms": g[1], "lock_timeout_ms": g[2], "idle_in_transaction_session_timeout_ms": g[3]}
         state["effective_settings"] = eff
+        appr = state.get("_approval") or {}
+        state["role_check"] = {"matches_approved_role": g[5] == appr.get("db_role"), "privileged_role": bool(g[4]), "privileged_allowed": bool(appr.get("allow_privileged_role"))}
+        if not state["role_check"]["matches_approved_role"] or (g[4] and not appr.get("allow_privileged_role")):
+            state["skipped"] = [s[0] for s in SECTIONS if state["profile"] in s[1]]
+            state["guard_note"] = "session role differs from the approved db_role, or is a privileged role that the signed approval does not allow"
+            return writer.finalize("guard_failed", 3)
         if g[0] != "on" or g[1] != str(prof["statement_timeout_ms"]) or g[2] != str(LOCK_TIMEOUT_MS) or g[3] != str(IDLE_TX_MS):
             state["skipped"] = [s[0] for s in SECTIONS if state["profile"] in s[1]]
             return writer.finalize("guard_failed", 3)
@@ -207,7 +307,7 @@ def plan_text(args, profile):
     for name, profs, sql in SECTIONS:
         if profile in profs:
             lines.append(f"  [{name}] {sql}")
-    lines.append("To run for real: set TASK214_DSN, add  --live --auth-event <event id of MAGI's 수집 시작>.  Do NOT run before MAGI says 수집 시작.")
+    lines.append("To run for real: set TASK214_DSN, add  --live --approval A.json --approval-pubkey P.pem  (MAGI-signed; there is no self-issued switch).  Do NOT run before MAGI says 수집 시작.")
     return "\n".join(lines)
 
 
@@ -218,19 +318,25 @@ def main(argv=None):
     ap.add_argument("--profile", choices=tuple(PROFILES), default=None, help="default: light for during1/during2, full otherwise (override is recorded)")
     ap.add_argument("--planned-at", default="", help="the scheduled time label for this snapshot (free text, recorded)")
     ap.add_argument("--live", action="store_true")
-    ap.add_argument("--auth-event", type=int, default=None)
+    ap.add_argument("--approval", default=None, help="MAGI-signed approval (json); required with --live")
+    ap.add_argument("--approval-pubkey", default=None, help="MAGI's Ed25519 public key (PEM); its SHA-256 must equal the trust anchor in this tool")
     ap.add_argument("--dsn-env", default="TASK214_DSN")
     ap.add_argument("--connect-timeout", type=int, default=DEFAULT_CONNECT_TIMEOUT)
     ap.add_argument("--deadline-s", type=int, default=0, help="hard deadline override (5..120); default per profile")
-    ap.add_argument("--allow-repeat", action="store_true", help="allow a second attempt for the same phase (never use during an outage without MAGI)")
     a = ap.parse_args(argv)
     profile = a.profile or ("light" if a.phase in LIGHT_PHASES else "full")
     if not (1 <= a.connect_timeout <= 30) or (a.deadline_s and not (5 <= a.deadline_s <= 120)):
         print("refused: connect-timeout must be 1..30 s, deadline 5..120 s", file=sys.stderr); return 2
     if not a.live:
         print(plan_text(a, profile)); return 0
-    if a.auth_event is None or a.auth_event <= 0:
-        print("refused: --live needs --auth-event <registry event id of MAGI's 수집 시작>", file=sys.stderr); return 2
+    if not a.approval or not a.approval_pubkey:
+        print("refused: --live needs --approval <MAGI-signed approval json> and --approval-pubkey <PEM>", file=sys.stderr); return 2
+    tool_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    try:
+        approval = json.loads(Path(a.approval).read_text(encoding="utf-8"))
+        payload = verify_approval(approval, Path(a.approval_pubkey).read_bytes(), phase=a.phase, tool_sha256=tool_sha, now=now_utc(), anchor=TRUST_ANCHOR_PUBKEY_SHA256)
+    except (ValueError, OSError) as e:
+        print(f"refused: approval not accepted: {e}", file=sys.stderr); return 2
     dsn = os.environ.get(a.dsn_env, "")
     if not dsn:
         print(f"refused: environment variable {a.dsn_env} is not set", file=sys.stderr); return 2
@@ -242,16 +348,12 @@ def main(argv=None):
     except Exception:
         print("refused: the DSN is not parseable (not shown)", file=sys.stderr); return 2
     scrub = make_scrubber(dsn, info)
-    marker = out / f".attempt_{a.phase}"
-    try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, (iso(now_utc()) + "\n").encode()); os.close(fd)
-    except FileExistsError:
-        if not a.allow_repeat:
-            print(f"refused: phase {a.phase} was already attempted here ({marker.name}); no automatic second attempt", file=sys.stderr); return 2
+    ok, why = claim_attempt(out, a.phase, payload)
+    if not ok:
+        print(f"refused: {why}", file=sys.stderr); return 2
     t0 = now_utc()
     state = {"schema": SCHEMA, "phase": a.phase, "profile": profile, "profile_overridden": bool(a.profile and a.profile != ("light" if a.phase in LIGHT_PHASES else "full")),
-             "planned_at": a.planned_at, "auth_event": a.auth_event, "tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+             "planned_at": a.planned_at, "auth_event": payload["magi_event"], "approval_id": payload["approval_id"], "operator": payload["operator"], "tool_sha256": tool_sha, "_approval": payload,
              "t_start_utc": iso(t0), "t_start_kst": t0.astimezone(KST).isoformat(timespec="milliseconds"),
              "limits": {"connect_timeout_s": a.connect_timeout, "statement_timeout_ms": PROFILES[profile]["statement_timeout_ms"], "lock_timeout_ms": LOCK_TIMEOUT_MS,
                         "idle_tx_ms": IDLE_TX_MS, "deadline_s": a.deadline_s or PROFILES[profile]["deadline_s"]},

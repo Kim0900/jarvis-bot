@@ -38,7 +38,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "psycopg[binary]==3.2.3"
+      - run: pip install "psycopg[binary]==3.2.3" "cryptography>=42"
       - name: Server version (must be 17)
         run: psql -U supabase_admin -d postgres -Atc "select version()" | tee /dev/stderr | grep -q "PostgreSQL 17"
       - name: Snapshot tools self-test (read-only, outage behaviour, analysis)

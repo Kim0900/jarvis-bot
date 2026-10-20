@@ -22,7 +22,7 @@ SKIP_KEYS = {"stats_reset", "datid", "oid"}
 
 def load(p):
     d = json.loads(Path(p).read_text(encoding="utf-8"))
-    if d.get("schema") != "task214-snapshot-v1":
+    if d.get("schema") not in ("task214-snapshot-v1", "task214-snapshot-v2"):
         raise SystemExit(f"{p}: not a task214 snapshot")
     d["_file"] = Path(p).name
     return d
@@ -55,6 +55,19 @@ def row_delta(a, b, skip=()):
     return out, bad
 
 
+STMT_KEY = ("dbid", "userid", "queryid", "toplevel")
+
+
+def find_duplicates(rows, idkeys):
+    seen, dup = set(), []
+    for r in rows:
+        k = tuple(r.get(x) for x in idkeys)
+        if k in seen:
+            dup.append(list(k))
+        seen.add(k)
+    return dup
+
+
 def rows_delta(ra, rb, idkeys, secs):
     ia = {tuple(r.get(k) for k in idkeys): r for r in ra}
     res, flagged = [], []
@@ -62,7 +75,7 @@ def rows_delta(ra, rb, idkeys, secs):
         key = tuple(r.get(k) for k in idkeys)
         if key not in ia:
             continue
-        d, bad = row_delta(ia[key], r)
+        d, bad = row_delta(ia[key], r, skip=idkeys)
         if bad:
             flagged.append({"id": list(key), "backwards": bad}); continue
         res.append({"id": list(key), "delta": d, "rate": {k: v / secs for k, v in d.items()}})
@@ -73,6 +86,28 @@ def resets_equal(ra, rb, idkeys=None):
     def m(rows):
         return {tuple(r.get(k) for k in (idkeys or ())): r.get("stats_reset") for r in rows}
     return m(ra) == m(rb)
+
+
+def coverage(x, y, ta, tb):
+    """Top-N sets are cut per snapshot (top 20 by time, calls and rows): a query may be in one set and not the other.  Rates exist only for the
+    intersection; everything else is listed so nobody reads the table as 'all activity'."""
+    ka, kb = {tuple(r.get(k) for k in STMT_KEY) for r in x}, {tuple(r.get(k) for k in STMT_KEY) for r in y}
+    inter, entered, exited = ka & kb, kb - ka, ka - kb
+    cov = {"keys_from": len(ka), "keys_to": len(kb), "in_both": len(inter), "entered": [list(k) for k in sorted(entered, key=str)], "exited": [list(k) for k in sorted(exited, key=str)],
+           "complete": not entered and not exited}
+    cov["warning"] = None if cov["complete"] else (f"top-N membership changed between the snapshots: {len(entered)} entered, {len(exited)} left; rates cover the {len(inter)} queries present in both only. "
+                                                  "Activity of queries outside the top sets, and of those that entered/left, is NOT in this table.")
+    if ta and tb and all(isinstance(t.get(k), (int, float)) for t in (ta, tb) for k in ("sum_calls", "sum_total_exec_time")):
+        dcalls, dtime = tb["sum_calls"] - ta["sum_calls"], tb["sum_total_exec_time"] - ta["sum_total_exec_time"]
+        ia = {tuple(r.get(k) for k in STMT_KEY): r for r in x}
+        shown_calls = sum(max(0, r["calls"] - ia[tuple(r.get(k) for k in STMT_KEY)]["calls"]) for r in y if tuple(r.get(k) for k in STMT_KEY) in ia)
+        shown_time = sum(max(0, r["total_exec_time"] - ia[tuple(r.get(k) for k in STMT_KEY)]["total_exec_time"]) for r in y if tuple(r.get(k) for k in STMT_KEY) in ia)
+        cov["totals"] = {"delta_calls_all": dcalls, "delta_calls_shown": shown_calls, "delta_exec_ms_all": dtime, "delta_exec_ms_shown": shown_time,
+                         "calls_share": (shown_calls / dcalls) if dcalls > 0 else None, "exec_share": (shown_time / dtime) if dtime > 0 else None,
+                         "note": "'all' comes from pg_stat_statements totals; entries evicted from pg_stat_statements make 'all' a lower bound too (see statements_info dealloc)"}
+    else:
+        cov["totals"] = None
+    return cov
 
 
 def pair(a, b):
@@ -92,10 +127,21 @@ def pair(a, b):
     r["elapsed_s"] = secs
     r["valid"] = True
     r["verdict"] = "VALID"
-    for name, idk in (("io", ("backend_type", "object", "context")), ("database", ("datname",)), ("statements_top", ("queryid",))):
+    for name, idk in (("io", ("backend_type", "object", "context")), ("database", ("datname",)), ("statements_top", STMT_KEY)):
         x, y = sec(a, name), sec(b, name)
         if x is None or y is None:
             r["notes"].append(f"{name}: missing in one snapshot"); continue
+        rejected = False
+        for label, rows in (("from", x), ("to", y)):
+            if name == "statements_top" and any(k not in row for row in rows for k in idk):
+                r["notes"].append(f"statements_top: {label}-snapshot lacks the composite key {list(idk)} (old schema v1: queryid alone is not unique across users/databases/toplevel) -> section discarded")
+                rejected = True; break
+            dup = find_duplicates(rows, idk)
+            if dup:
+                r["notes"].append(f"{name}: DUPLICATE KEY in the {label}-snapshot {dup[:3]} (+{max(0, len(dup) - 3)} more) -> section REJECTED, nothing computed from it")
+                rejected = True; break
+        if rejected:
+            continue
         if name != "statements_top" and not resets_equal(x, y, idk):
             r["notes"].append(f"{name}: stats_reset differs -> section discarded"); continue
         if name == "statements_top":
@@ -104,6 +150,8 @@ def pair(a, b):
                 r["notes"].append("statements_top: stats_reset differs or unknown -> section discarded"); continue
         rows, flagged = rows_delta(x, y, idk, secs)
         r["sections"][name] = {"rows": rows, "flagged_backwards": flagged}
+        if name == "statements_top":
+            r["sections"][name]["coverage"] = coverage(x, y, sec(a, "statements_totals"), sec(b, "statements_totals"))
     for name in ("checkpointer", "bgwriter", "wal"):
         x, y = sec(a, name), sec(b, name)
         if x is None or y is None:
@@ -157,9 +205,21 @@ def render(snaps, pairs):
                 L.append(f"\ndatabase {r['id'][0]}: xact_commit={fmt(k.get('xact_commit', 0))}/s rollback={fmt(k.get('xact_rollback', 0))}/s blks_read={fmt(k.get('blks_read', 0))}/s tup_updated={fmt(k.get('tup_updated', 0))}/s")
         st = p["sections"].get("statements_top", {}).get("rows", [])
         if st:
-            L += ["", "pg_stat_statements: top by delta total_exec_time (queries present in both top sets only)", "", "| queryid | calls/s | exec ms/s | rows/s |", "|---|---|---|---|"]
+            L += ["", "pg_stat_statements: top by delta total_exec_time (queries present in both top sets only; key = dbid/userid/queryid/toplevel)", "",
+                  "| dbid | userid | queryid | toplevel | calls/s | exec ms/s | rows/s |", "|---|---|---|---|---|---|---|"]
             for r in sorted(st, key=lambda r: -r["rate"].get("total_exec_time", 0))[:8]:
-                L.append(f"| {r['id'][0]} | {fmt(r['rate'].get('calls', 0))} | {fmt(r['rate'].get('total_exec_time', 0))} | {fmt(r['rate'].get('rows', 0))} |")
+                L.append(f"| {' | '.join(str(v) for v in r['id'])} | {fmt(r['rate'].get('calls', 0))} | {fmt(r['rate'].get('total_exec_time', 0))} | {fmt(r['rate'].get('rows', 0))} |")
+        cv = p["sections"].get("statements_top", {}).get("coverage")
+        if cv:
+            L += ["", f"statements coverage: {cv['in_both']} queries in both top sets ({cv['keys_from']} -> {cv['keys_to']}); entered {len(cv['entered'])}, left {len(cv['exited'])}."]
+            if cv["warning"]:
+                L.append(f"- WARNING: {cv['warning']}")
+            t = cv.get("totals")
+            if t:
+                sh = lambda v: "n/a" if v is None else f"{v * 100:.1f}%"
+                L.append(f"- the shown queries account for {sh(t['calls_share'])} of all calls and {sh(t['exec_share'])} of all exec time in this interval (all: {t['delta_calls_all']} calls, {fmt(t['delta_exec_ms_all'])} ms).")
+            else:
+                L.append("- no totals section in these snapshots: the share of all activity that this table covers is unknown.")
         for sname, sv in p["sections"].items():
             for f in sv.get("flagged_backwards", []):
                 L.append(f"- flagged (counter went backwards, row dropped): {sname} {f['id']} {f['backwards']}")
