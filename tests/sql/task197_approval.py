@@ -66,10 +66,44 @@ def file_hashes(root: Path, names=GUARDED_FILES) -> dict:
     return {n: hashlib.sha256((root / n).read_bytes()).hexdigest() for n in names}
 
 
+GIT_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+THROWAWAY_DB = re.compile(r"^(t_[a-z0-9_]+|gate[a-z0-9_]*|task197_throwaway_[a-z0-9_]+)$")
+LOCAL_HOSTS = ("", "localhost", "127.0.0.1", "::1")
+
+
+def git_bin() -> str:
+    """git is looked up at fixed system paths only, never through the caller's PATH, and runs with a scrubbed environment
+    (no GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / config from the caller): a hostile environment cannot make it report another repository."""
+    for c in ("/usr/bin/git", "/usr/local/bin/git", "/bin/git"):
+        if os.access(c, os.X_OK):
+            return c
+    raise Refused("git not found at a fixed system path (cannot prove the commit)")
+
+
+def default_state_dir() -> Path:
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".task197"
+
+
+def state_dir(host: str, dbname: str, environ=None) -> Path:
+    """Where single-use approval ids are recorded.  TASK197_STATE_DIR is honoured ONLY for the isolated test setup (TASK197_TEST_MODE +
+    local host + throwaway database name); in production it is ignored, so the caller cannot point the replay record at an empty directory."""
+    environ = os.environ if environ is None else environ
+    local = host in LOCAL_HOSTS or str(host).startswith("/")
+    if environ.get("TASK197_TEST_MODE") == "throwaway-server" and local and THROWAWAY_DB.match(dbname or "") and environ.get("TASK197_STATE_DIR"):
+        return Path(environ["TASK197_STATE_DIR"])
+    return default_state_dir()
+
+
+def claimed(used_ids_file, key) -> bool:
+    used = Path(used_ids_file)
+    return used.exists() and key in set(used.read_text().split())
+
+
 def git_state(root: Path) -> dict:
     """{'commit': <40 hex>, 'dirty': bool}.  Raises Refused if this is not a git checkout (a live run needs a provable commit)."""
     def run(*a):
-        r = subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True, timeout=20)
+        r = subprocess.run([git_bin(), "-c", f"safe.directory={root}", "-C", str(root), *a], capture_output=True, text=True, timeout=20, env=GIT_ENV)
         if r.returncode:
             raise Refused("not a git checkout (cannot prove the commit): " + r.stderr.strip()[:120])
         return r.stdout.strip()

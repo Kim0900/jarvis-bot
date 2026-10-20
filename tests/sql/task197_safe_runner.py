@@ -10,6 +10,15 @@ Three processes/sessions, each with one job:
   CHILD process              ONE dedicated connection: BEGIN; SET LOCAL statement_timeout / lock_timeout; verify them on the same
                              connection; the pinned DO (one statement, ends in an unconditional RAISE); expect P0001 + sentinel; ROLLBACK.
 
+THE CHILD IS NOT A COMMAND-LINE MODE (CASSANDRA #5719 C197-CHILD-BYPASS, P0-FIX-197-01).  There is no --child option: the supervisor starts the
+child as `python -I -c "...child_entry(<fd>)"` and hands it ONE sealed capability over an inherited pipe (a JSON document: the signed approval, the
+manifest, a random nonce).  The child accepts nothing from argv or the files named there: it independently (1) re-verifies the Ed25519 approval
+(trust anchor, signature, exact git commit, hashes of all guarded files, fixed manifest, time window, HOLD + upload-free claims), (2) re-hashes and
+re-lints the DO text it is about to execute and compares it with the approved hash, (3) checks that the supervisor already admitted this approval
+(single-use record) and claims its own one-time child token, (4) checks that a supervisor observer session really holds the admission advisory
+lock, and only then connects.  A direct/unsigned/forged/replayed call is refused before any database connection.  Entry points: see
+docs/TASK197_ROLLBACK_REHEARSAL_PLAN.md section 8-D.
+
 PRODUCTION MODE (the default) accepts exactly:   --approval-file <MAGI-signed approval>  [--report out.json]  [--dsn-env NAME]
   * limits are the fixed manifest 3000 ms statement / 250 ms lock / 2000 ms idle-in-transaction / 8 s watchdog, mode begin; no flag can
     change them (any other option is refused before a connection is made);
@@ -45,8 +54,14 @@ SNAPSHOT_PATH = ROOT / "tests/sql/task197_prod_rollback_snapshot.sql"
 PUBKEY_PATH = ROOT / "tests/sql/task197_approval_pubkey.pem"
 ADMISSION_LOCK = (1970617, 197001)            # pg_try_advisory_lock(int4, int4): one admitted run per database
 SUPERVISOR_MARGIN_S = 3.0                       # child watchdog (cancel at limit, exit 2 s later) + this = the supervisor's SIGKILL deadline
-THROWAWAY_DB = re.compile(r"^(t_[a-z0-9_]+|gate[a-z0-9_]*|task197_throwaway_[a-z0-9_]+)$")
-LOCAL_HOSTS = ("", "localhost", "127.0.0.1", "::1")
+THROWAWAY_DB = AP.THROWAWAY_DB
+LOCAL_HOSTS = AP.LOCAL_HOSTS
+SQL_REL = "tests/sql/task197_prod_rollback_rehearsal.sql"
+SNAPSHOT_SQL_SHA256 = "3ff142041013874011639a0b815857e0d7a8aed3afb25cc9d62c38c0d4c6a176"   # the observer's read-only SQL is pinned too (post-check-only has no approval)
+HOSTILE_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT", "PYTHONBREAKPOINT", "PYTHONSAFEPATH", "PYTHONUSERBASE")
+CAP_KEYS = {"v", "mode", "nonce", "approval", "limits", "dsn_env", "fault", "sql_path", "pin"}
+DSN_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,40}$")
+FAULTS = ("sigkill", "exit", "netbreak", "hang", "cancelhang")
 TEST_ONLY = ("sql", "expect", "snapshot", "sha256", "statement_timeout_ms", "lock_timeout_ms", "idle_tx_timeout_ms", "watchdog_s", "mode",
              "test_child_fault", "test_hold_lock_s")
 
@@ -64,12 +79,24 @@ def lint(text):
     problems = []
     if len(re.findall(r"^do \$rehearsal\$", text, re.M)) != 1 or not text.rstrip().endswith("end $rehearsal$;"):
         problems.append("not exactly one DO statement")
-    tail = text[text.rindex("  v_total_ms :="):]
+    i = text.rfind("  v_total_ms :=")
+    tail = text[i:] if i >= 0 else ""
     if not re.fullmatch(r"  v_total_ms :=[^;]*;\n  -- UNCONDITIONAL.*?\n  raise exception using .*?;\nend \$rehearsal\$;\n", tail, re.S):
         problems.append("does not end with the unconditional RAISE EXCEPTION")
     body = re.sub(r"\$gate\$.*?\$gate\$|\$scn\$.*?\$scn\$|--[^\n]*", "", text, flags=re.S)
     bad = sorted(set(m.lower() for m in re.findall(r"\b(commit|savepoint|nextval|setval|truncate|vacuum|concurrently|dblink|notify|pg_notify|copy|grant|delete\s+from)\b", body, re.I)))
     if bad: problems.append("forbidden tokens: " + ",".join(bad))
+    return problems
+
+
+def lint_snapshot(text):
+    """the observer SQL must be one read-only SELECT; the observer session is also read-only on the server side"""
+    body = re.sub(r"'(?:[^']|'')*'", "''", re.sub(r"--[^\n]*", "", text))
+    problems = []
+    if not re.match(r"\s*(select|with)\b", body, re.I): problems.append("snapshot SQL is not a SELECT")
+    if body.strip().rstrip(";").count(";"): problems.append("snapshot SQL has more than one statement")
+    bad = sorted(set(m.lower() for m in re.findall(r"\b(insert|update|delete|create|alter|drop|truncate|grant|revoke|commit|vacuum|copy|call|do|lock|listen|notify|set|reset|analyze|refresh|nextval|setval|pg_terminate_backend|pg_cancel_backend|pg_advisory_\w+|pg_sleep)\b", body, re.I)))
+    if bad: problems.append("snapshot SQL contains forbidden tokens: " + ",".join(bad))
     return problems
 
 
@@ -100,7 +127,6 @@ def build_parser():
     ap.add_argument("--report", default="")
     ap.add_argument("--dsn-env", default="PGDSN")
     ap.add_argument("--post-check-only", action="store_true", help="read-only residue check; opens no rehearsal connection")
-    ap.add_argument("--child", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--test-mode", action="store_true", help="self-tests only; requires TASK197_TEST_MODE=throwaway-server and a local throwaway database")
     t = ap.add_argument_group("test-mode only")
     t.add_argument("--sql", default=None); t.add_argument("--expect", default=None); t.add_argument("--snapshot", default=None)
@@ -131,19 +157,107 @@ def snapshot(obs, sql):
 
 
 # ------------------------------------------------------------------------------------------------------------------ CHILD
-def child_main(cfg_path):
-    """one connection, one DO.  Prints ONE json line.  Faults are injected only when the supervisor was started in test mode."""
-    import psycopg
-    cfg = json.loads(Path(cfg_path).read_text())
-    L, fault = cfg["limits"], cfg.get("fault")
+def canonical_json(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def child_entry(fd):
+    """The ONLY way to reach the rehearsal connection.  Not reachable from the command line (no option, argparse rejects unknown flags);
+    started by the supervisor as `python -I -c ...child_entry(fd)`.  Reads ONE sealed capability from the inherited pipe, verifies it on its own
+    (nothing from argv, nothing it trusts from the parent beyond the signed approval it re-verifies), and refuses BEFORE any connection if any
+    check fails.  Prints one JSON line (always, including refusals)."""
     out = {"events": [], "ok": False}
+    def refuse(why):
+        out["refused"] = why
+        sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush(); return 2
+    try:
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(1 << 20)
+        cap = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return refuse("no valid capability on the inherited pipe")
+    if not isinstance(cap, dict) or set(cap) != CAP_KEYS or cap["v"] != 1 or cap["mode"] not in ("production", "test"):
+        return refuse("capability malformed")
+    if not re.fullmatch(r"[0-9a-f]{32}", str(cap["nonce"])) or not isinstance(cap["dsn_env"], str) or not DSN_ENV_RE.match(cap["dsn_env"]):
+        return refuse("capability fields malformed")
+    out["nonce"] = cap["nonce"]; out["cap_sha256"] = hashlib.sha256(raw).hexdigest()
+    dsn = os.environ.get(cap["dsn_env"])
+    if not dsn:
+        return refuse("DSN variable not set")
+    try:
+        host, dbname = dsn_parts(dsn)
+    except Exception:
+        return refuse("DSN unparseable")
+    used_file = None
+    if cap["mode"] == "production":
+        if cap["fault"] is not None or cap["pin"] is not None or cap["limits"] != AP.PROD_MANIFEST:
+            return refuse("production capability carries test-only fields or a manifest other than the fixed one")
+        try:
+            appr = AP.verify(cap["approval"], PUBKEY_PATH.read_bytes(), ROOT)            # single use is the supervisor's; the child proves its own claim below
+        except AP.Refused as e:
+            return refuse("approval: " + str(e))
+        except Exception as e:
+            return refuse(f"approval check failed: {type(e).__name__}")
+        sql_path, want_sha, L, fault = SQL_PATH, appr["files"][SQL_REL], dict(AP.PROD_MANIFEST), None
+        used_file = AP.state_dir(host, dbname) / "used_approvals"
+        if not AP.claimed(used_file, appr["approval_id"]):
+            return refuse("the supervisor has not admitted this approval (no single-use record)")
+        if not AP.consume_approval_id(used_file, appr["approval_id"] + ":child"):
+            return refuse("this approval's child token was already used")
+    else:
+        if os.environ.get("TASK197_TEST_MODE") != "throwaway-server" or not (host in LOCAL_HOSTS or host.startswith("/")) or not THROWAWAY_DB.match(dbname or ""):
+            return refuse("test capability outside the isolated throwaway setup")
+        if cap["approval"] is not None or not re.fullmatch(r"[0-9a-f]{64}", str(cap["pin"])):
+            return refuse("test capability malformed (approval/pin)")
+        L = cap["limits"]
+        try:
+            ok = (isinstance(L, dict) and set(L) == set(AP.PROD_MANIFEST) and 100 <= L["statement_timeout_ms"] <= 60000 and 10 <= L["lock_timeout_ms"] <= 1000
+                  and 100 <= L["idle_tx_timeout_ms"] <= 30000 and 0.5 <= L["watchdog_s"] <= 30 and L["mode"] in ("begin", "session")
+                  and all(isinstance(L[k], (int, float)) and math.isfinite(L[k]) for k in ("statement_timeout_ms", "lock_timeout_ms", "idle_tx_timeout_ms", "watchdog_s")))
+        except Exception:
+            ok = False
+        if not ok:
+            return refuse("test limits out of bounds")
+        fault = cap["fault"]
+        if fault is not None and fault not in FAULTS:
+            return refuse("unknown test fault")
+        sql_path, want_sha = Path(str(cap["sql_path"])), cap["pin"]
+    try:
+        text = sql_path.read_text(encoding="utf-8")
+    except OSError:
+        return refuse("DO file unreadable")
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if sha != want_sha:
+        return refuse("DO text differs from the approved/pinned hash")
+    if cap["mode"] == "production":
+        try:
+            if sha != json.loads(EXPECT_PATH.read_text(encoding="utf-8"))["sql_sha256"]:
+                return refuse("DO text differs from the expect file")
+        except Exception:
+            return refuse("expect file unreadable")
+    probs = lint(text)
+    if probs:
+        return refuse("lint: " + "; ".join(probs))
+    return _child_execute(text, L, cap["dsn_env"], fault, out, os.getppid())
+
+
+def _child_execute(text, L, dsn_env, fault, out, parent_pid):
+    """one connection, one DO.  Prints ONE json line.  Faults are injected only for a test capability that passed the throwaway-setup checks."""
+    import psycopg
     t0 = time.time()
     def ev(m): out["events"].append(f"+{time.time() - t0:6.3f}s {m}")
-    text = Path(cfg["sql"]).read_text(encoding="utf-8")
-    rehearsal = psycopg.connect(os.environ[cfg["dsn_env"]], autocommit=True, connect_timeout=5, application_name="task197_rehearsal",
+    rehearsal = psycopg.connect(os.environ[dsn_env], autocommit=True, connect_timeout=5, application_name="task197_rehearsal",
                                 keepalives=1, keepalives_idle=1, keepalives_interval=1, keepalives_count=3, tcp_user_timeout=3000)
     ev("rehearsal connection opened (dedicated, autocommit client-side, explicit transaction control)")
     try:
+        # the supervisor's observer must be alive and hold the admission lock (a directly started child has no supervisor)
+        held = rehearsal.execute("select count(*) from pg_locks l join pg_stat_activity a on a.pid = l.pid where l.locktype = 'advisory' and l.classid = %s "
+                                 "and l.objid = %s and l.objsubid = 2 and l.granted and a.application_name = 'task197_observer' and l.pid <> pg_backend_pid()",
+                                 ADMISSION_LOCK).fetchone()[0]
+        if held != 1:
+            out["refused"] = "no supervisor observer holds the admission lock: this child was not started by a live supervisor"
+            sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush(); return 2
+        ev("a supervisor observer holds the admission lock")
         rehearsal.execute(f"set idle_in_transaction_session_timeout = {int(L['idle_tx_timeout_ms'])}")     # session level: SET LOCAL is reverted at abort
         if L["mode"] == "begin":
             rehearsal.execute("begin")
@@ -171,6 +285,17 @@ def child_main(cfg_path):
             out["error"] = "watchdog escalation: process exits to drop the connection"
             sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush(); os._exit(3)
         threading.Thread(target=watchdog, daemon=True).start()
+
+        def parent_watch():                          # supervisor gone (crash / SIGKILL): stop at once instead of running on unsupervised
+            while not done.wait(0.2):
+                if os.getppid() != parent_pid:
+                    ev("PARENT GONE: cancelling the statement")
+                    try: rehearsal.cancel()
+                    except Exception as e: ev(f"cancel failed: {e!r}")
+                    if done.wait(2.0): return
+                    out["error"] = "supervisor vanished; process exits to drop the connection"
+                    sys.stdout.write(json.dumps(out) + "\n"); sys.stdout.flush(); os._exit(3)
+        threading.Thread(target=parent_watch, daemon=True).start()
 
         def inject():
             time.sleep(0.4)
@@ -210,8 +335,6 @@ def child_main(cfg_path):
 def main(argv=None):
     ap = build_parser()
     a = ap.parse_args(argv)
-    if a.child:
-        sys.exit(child_main(a.child))
     import psycopg
 
     rep = {"mode": "test" if a.test_mode else "production", "events": [], "verdict": "FAIL", "reasons": []}
@@ -220,7 +343,12 @@ def main(argv=None):
     def finish(code):
         rep["verdict"] = "PASS" if code == 0 else "FAIL"
         out = json.dumps(rep, ensure_ascii=False, indent=2)
-        if a.report: Path(a.report).write_text(out + "\n", encoding="utf-8")
+        if a.report:
+            try:                                               # exclusive create: an existing file is never overwritten, not even by a refusal report
+                fd = os.open(a.report, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh: fh.write(out + "\n")
+            except FileExistsError:
+                pass
         print(out); sys.exit(code)
     def fail(reason): rep["reasons"].append(reason); ev("FAIL: " + reason)
 
@@ -232,10 +360,18 @@ def main(argv=None):
                 raise Refuse("--test-mode needs TASK197_TEST_MODE=throwaway-server")
         elif given:
             raise Refuse("option(s) only valid in the isolated test mode, refused in production: " + ",".join("--" + g.replace("_", "-") for g in given))
+        if not DSN_ENV_RE.match(a.dsn_env or ""):
+            raise Refuse("--dsn-env must be an upper-case environment variable name")
+        hostile = [k for k in HOSTILE_ENV if os.environ.get(k)]
+        if hostile and not a.test_mode:
+            raise Refuse("interpreter-altering environment variables are set (" + ",".join(hostile) + "): run `python3 -I` with a clean environment")
+        if a.report and Path(a.report).exists():
+            raise Refuse("--report path already exists (reports are never overwritten)")
         dsn = os.environ.get(a.dsn_env)
         if not dsn:
             raise Refuse(f"environment variable {a.dsn_env} is not set")
         host, dbname = dsn_parts(dsn)
+        state_dir = AP.state_dir(host, dbname)
         if a.test_mode and ((host not in LOCAL_HOSTS and not host.startswith("/")) or not THROWAWAY_DB.match(dbname or "")):
             raise Refuse("test mode is only allowed against a local server and a throwaway database name")
         if a.post_check_only:
@@ -253,6 +389,12 @@ def main(argv=None):
         sql_path = Path(a.sql) if a.test_mode and a.sql else SQL_PATH
         expect_path = Path(a.expect) if a.test_mode and a.expect else EXPECT_PATH
         snap_path = Path(a.snapshot) if a.test_mode and a.snapshot else SNAPSHOT_PATH
+        snap_sql = snap_path.read_text(encoding="utf-8")                      # read ONCE; this exact text is what the observer runs
+        if snap_path == SNAPSHOT_PATH and hashlib.sha256(snap_sql.encode("utf-8")).hexdigest() != SNAPSHOT_SQL_SHA256:
+            raise Refuse("observer snapshot SQL differs from the pinned hash")
+        sprobs = lint_snapshot(snap_sql)
+        if sprobs:
+            raise Refuse("; ".join(sprobs))
         approval = None
         if not a.post_check_only:
             if a.test_mode:
@@ -262,8 +404,8 @@ def main(argv=None):
                 if not a.approval_file:
                     raise Refuse("production mode needs --approval-file (MAGI-signed approval)")
                 try:
-                    approval = AP.verify(json.loads(Path(a.approval_file).read_text()), PUBKEY_PATH.read_bytes(), ROOT,
-                                         used_ids_file=Path(os.environ.get("TASK197_STATE_DIR", str(Path.home() / ".task197"))) / "used_approvals")
+                    approval_raw = json.loads(Path(a.approval_file).read_text())
+                    approval = AP.verify(approval_raw, PUBKEY_PATH.read_bytes(), ROOT, used_ids_file=state_dir / "used_approvals")
                 except AP.Refused as e:
                     raise Refuse("approval refused: " + str(e))
                 except (OSError, ValueError) as e:
@@ -287,9 +429,11 @@ def main(argv=None):
     def on_term(signum, frame): raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, on_term)
     obs = None; child = None; lock_held = False; sentinel = None; result = None
-    snap_sql = snap_path.read_text(encoding="utf-8")
     try:
         obs = psycopg.connect(dsn, autocommit=True, connect_timeout=5, application_name="task197_observer")
+        obs.execute("set default_transaction_read_only = on")                   # the observer can read and take the advisory lock, nothing else
+        if obs.execute("show default_transaction_read_only").fetchone()[0] != "on":
+            raise Early()
         rep["server_version"] = obs.execute("show server_version").fetchone()[0]; ev("observer connected, server " + rep["server_version"])
         # the observer must never wait behind the rehearsal's own locks (a stalled DO would otherwise stall the residual check too)
         obs.execute("set lock_timeout = '1000ms'"); obs.execute("set statement_timeout = '5000ms'")
@@ -305,8 +449,7 @@ def main(argv=None):
         lock_held = True; ev("admission advisory lock acquired on the observer session")
         if a.test_mode and a.test_hold_lock_s: time.sleep(a.test_hold_lock_s)
         if approval is not None:
-            sd = Path(os.environ.get("TASK197_STATE_DIR", str(Path.home() / ".task197"))) / "used_approvals"
-            if not AP.consume_approval_id(sd, approval["approval_id"]):
+            if not AP.consume_approval_id(state_dir / "used_approvals", approval["approval_id"]):
                 fail("approval_id was already used (single use)"); raise Early()
         if obs.execute("select count(*) from pg_stat_activity where application_name='task197_rehearsal'").fetchone()[0]:
             fail("a task197_rehearsal session already exists (previous attempt?) - investigate first"); raise Early()
@@ -315,20 +458,26 @@ def main(argv=None):
             fail("pre-snapshot is not clean (gate objects or fixtures already exist)"); raise Early()
 
         # ---- 3. the child does the DO; the supervisor only waits, with a deadline it enforces by SIGKILL
-        cfg = {"sql": str(sql_path), "limits": limits, "dsn_env": a.dsn_env, "fault": a.test_child_fault if a.test_mode else None}
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            json.dump(cfg, f); cfg_path = f.name
+        nonce = os.urandom(16).hex()
+        cap = {"v": 1, "mode": "test" if a.test_mode else "production", "nonce": nonce, "approval": None if a.test_mode else approval_raw, "limits": limits,
+               "dsn_env": a.dsn_env, "fault": a.test_child_fault if a.test_mode else None, "sql_path": str(sql_path) if a.test_mode else None,
+               "pin": a.sha256.lower() if a.test_mode else None}
+        cap_bytes = canonical_json(cap); rep["capability_sha256"] = hashlib.sha256(cap_bytes).hexdigest()
         deadline = limits["watchdog_s"] + 2.0 + SUPERVISOR_MARGIN_S
-        child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--child", cfg_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        ev(f"child started (pid {child.pid}), supervisor deadline {deadline:.1f} s")
+        rfd, wfd = os.pipe()
+        boot = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r}); import task197_safe_runner as R; sys.exit(R.child_entry({rfd}))"
+        child = subprocess.Popen([sys.executable, "-I", "-c", boot], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, pass_fds=(rfd,))
+        os.close(rfd)
+        try:
+            os.write(wfd, cap_bytes)
+        finally:
+            os.close(wfd)
+        ev(f"child started (pid {child.pid}) with a sealed capability on an inherited pipe, supervisor deadline {deadline:.1f} s")
         try:
             out, err = child.communicate(timeout=deadline)
         except subprocess.TimeoutExpired:
             child.kill(); out, err = child.communicate()
             fail(f"child exceeded the supervisor deadline ({deadline:.1f} s) and was SIGKILLed"); rep["child_killed_by_supervisor"] = True
-        finally:
-            try: os.unlink(cfg_path)
-            except OSError: pass
         rep["child_returncode"] = child.returncode
         if child.returncode is not None and child.returncode < 0:
             rep["child_signal"] = -child.returncode
@@ -338,6 +487,10 @@ def main(argv=None):
             result = json.loads(lines[-1]) if lines else None
         except ValueError:
             result = None
+        if result is not None and result.get("refused"):
+            fail("child refused the capability: " + str(result["refused"])); result = {"events": result.get("events", [])}
+        elif result is not None and (result.get("nonce") != nonce or result.get("cap_sha256") != rep["capability_sha256"]):
+            fail("child report does not echo the nonce / capability digest it was given: discarded"); result = None
         if result is None:
             fail(f"child produced no report (returncode {child.returncode}): the outcome of the DO is unprovable from the client side, residue check follows")
         else:

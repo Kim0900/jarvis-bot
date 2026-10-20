@@ -103,7 +103,7 @@ def approval(root, key=KEY, nb=None, na=None, mutate=None, aid=None):
 
 def prod(root, appr, db="t_run", state_dir=None, extra=()):
     return run(["--approval-file", appr] + list(extra), db=db, runner=root / "tests/sql/task197_safe_runner.py", cwd=str(root),
-               env={"TASK197_STATE_DIR": str(state_dir or (TMP / "state"))})
+               env={"TASK197_STATE_DIR": str(state_dir or (TMP / "state")), **TESTENV})
 
 R = make_checkout("co1"); STATE = TMP / "state_a"
 s0 = state(db)
@@ -235,6 +235,154 @@ check("D8 supervisor SIGTERM mid-run: it kills the child, still takes the residu
 db = clone("t_run"); sup(db, "create function public.fn_completion_gate_observe() returns trigger language plpgsql as $f$ begin return new; end $f$;")
 rc, rep, _ = run(["--post-check-only"], db=db)
 check("D9 --post-check-only reports committed gate residue (exit 2, names the invariant)", rc == 2 and "INV_gate_functions" in reasons(rep), reasons(rep))
+
+# =========================================================================================================== P0-FIX-197-01: no path to the rehearsal connection around the gate (CASSANDRA #5719)
+import socket
+class Decoy:
+    """a TCP listener that counts connection attempts: if the runner/child ever tried to reach the database, count > 0"""
+    def __init__(self):
+        self.count = 0; self.ls = socket.socket(); self.ls.bind(("127.0.0.1", 0)); self.ls.listen(20); self.port = self.ls.getsockname()[1]
+        threading.Thread(target=self.loop, daemon=True).start()
+    def loop(self):
+        while True:
+            try: c, _ = self.ls.accept()
+            except OSError: return
+            self.count += 1; c.close()
+    def dsn(self, db="t_decoy"): return f"host=127.0.0.1 port={self.port} dbname={db} user=postgres"
+DEC = Decoy()
+
+def child_direct(root, payload, dsn_str, env=None):
+    """call child_entry exactly as an attacker with a shell could (python -I, own stdin).  Returns (rc, parsed last JSON line, stderr)"""
+    code = f"import sys; sys.path.insert(0, {str(Path(root) / 'tests/sql')!r}); import task197_safe_runner as R; sys.exit(R.child_entry(0))"
+    data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+    p = subprocess.run([sys.executable, "-I", "-c", code], input=data, capture_output=True, env=dict(os.environ, PGDSN=dsn_str, **(env or {})), timeout=60)
+    lines = [l for l in p.stdout.decode().splitlines() if l.startswith("{")]
+    return p.returncode, (json.loads(lines[-1]) if lines else {}), p.stderr.decode()[-300:]
+
+def cap_prod(root, appr_path, **over):
+    c = {"v": 1, "mode": "production", "nonce": os.urandom(16).hex(), "approval": json.loads(Path(appr_path).read_text()), "limits": dict(AP.PROD_MANIFEST),
+         "dsn_env": "PGDSN", "fault": None, "sql_path": None, "pin": None}
+    c.update(over); return c
+
+def cap_test(**over):
+    c = {"v": 1, "mode": "test", "nonce": os.urandom(16).hex(), "approval": None, "limits": dict(AP.PROD_MANIFEST), "dsn_env": "PGDSN", "fault": None,
+         "sql_path": str(ROOT / "tests/sql/task197_prod_rollback_rehearsal.sql"), "pin": EXPECT["sql_sha256"]}
+    c.update(over); return c
+
+ENVS = dict(TESTENV, TASK197_STATE_DIR=str(TMP / "state_e"))
+db = clone("t_run"); s0 = state(db)
+marker = TMP / "pwn.sql"; marker.write_text("create table public.t197_pwn(i int);")
+fake_cfg = TMP / "fake_cfg.json"; fake_cfg.write_text(json.dumps({"sql": str(marker), "limits": dict(AP.PROD_MANIFEST), "dsn_env": "PGDSN", "fault": None}))
+n0 = DEC.count
+r1 = run(["--child", str(fake_cfg)], dsn_override=DEC.dsn())
+r2 = run(["--child", str(fake_cfg), "--test-mode", "--sha256", "0" * 64], dsn_override=DEC.dsn(), env=TESTENV)
+r3 = run(["--child", str(fake_cfg)], db=db)
+check("E1 the old bypass is gone: `--child <fake cfg with arbitrary SQL>` (production, test-mode, against a real throwaway DB) is an unrecognized argument: exit 2, no connection, nothing executed",
+      all(r[0] == 2 and "unrecognized arguments" in r[2] for r in (r1, r2, r3)) and DEC.count == n0 and clean(s0, state(db)) and sup(db, "select to_regclass('public.t197_pwn') is not null") != "t")
+
+n0 = DEC.count
+outs = [child_direct(ROOT, b"", DEC.dsn()), child_direct(ROOT, b"not json at all", DEC.dsn()), child_direct(ROOT, b"{}", DEC.dsn()), child_direct(ROOT, cap_test(v=2), DEC.dsn()),
+        child_direct(ROOT, dict(cap_test(), extra="x"), DEC.dsn()), child_direct(ROOT, cap_test(nonce="zz"), DEC.dsn()), child_direct(ROOT, cap_test(dsn_env="path; rm"), DEC.dsn())]
+check("E2 calling child_entry directly with no / garbage / malformed capability (7 variants): refused with a reason, exit 2, ZERO connections", all(o[0] == 2 and o[1].get("refused") for o in outs) and DEC.count == n0, str([o[1].get("refused", "")[:30] for o in outs][:3]))
+
+R3 = make_checkout("co3")
+good = approval(R3)
+n0 = DEC.count
+o = child_direct(R3, cap_prod(R3, good), DEC.dsn(), ENVS)
+check("E3a a perfectly valid signed approval handed straight to the child (no supervisor ever admitted it): refused, ZERO connections", o[0] == 2 and "not admitted" in o[1].get("refused", "") and DEC.count == n0, o[1].get("refused"))
+used = TMP / "state_e" / "used_approvals"; used.parent.mkdir(parents=True, exist_ok=True)
+aid = json.loads(Path(good).read_text())["payload"]["approval_id"]; used.write_text(aid + "\n")        # as if a supervisor had admitted it
+st = state(db)
+o = child_direct(R3, cap_prod(R3, good), dsn(db), ENVS)
+check("E3b admitted approval, valid signature, but NO supervisor observer holds the admission lock: refused after the lock check, the DO never executed, database untouched",
+      o[0] == 2 and "no supervisor observer" in o[1].get("refused", "") and not any("executing" in e for e in o[1].get("events", [])) and clean(st, state(db)), o[1].get("refused"))
+n0 = DEC.count
+o = child_direct(R3, cap_prod(R3, good), DEC.dsn(), ENVS)
+check("E3c replaying the same capability: the child token is single use - refused before any connection", o[0] == 2 and "already used" in o[1].get("refused", "") and DEC.count == n0, o[1].get("refused"))
+
+def child_refused(name, root, payload, why, env=ENVS):
+    n = DEC.count; o = child_direct(root, payload, DEC.dsn(), env)
+    check(f"{name}: refused by the CHILD itself ({why}), ZERO connections", o[0] == 2 and why in o[1].get("refused", "") and DEC.count == n, o[1].get("refused"))
+nowu = datetime.now(timezone.utc)
+child_refused("E4a approval signed by an attacker key", R3, cap_prod(R3, approval(R3, key=OTHER)), "signature invalid")
+child_refused("E4b expired approval", R3, cap_prod(R3, approval(R3, nb=nowu - timedelta(minutes=40), na=nowu - timedelta(minutes=10))), "time window")
+child_refused("E4c forged: payload edited after signing (HOLD flag flipped)", R3, cap_prod(R3, approval(R3), approval=dict(json.loads(Path(approval(R3)).read_text()), payload=dict(json.loads(Path(approval(R3)).read_text())["payload"], hold_5486_cleared=False))), "signature invalid")
+child_refused("E4d limits tampered in the capability (statement_timeout 0)", R3, cap_prod(R3, good, limits=dict(AP.PROD_MANIFEST, statement_timeout_ms=0)), "manifest other than the fixed one")
+child_refused("E4e limits tampered (lock_timeout 5000)", R3, cap_prod(R3, good, limits=dict(AP.PROD_MANIFEST, lock_timeout_ms=5000)), "manifest other than the fixed one")
+child_refused("E4f production capability carrying a test fault", R3, cap_prod(R3, good, fault="hang"), "test-only fields")
+child_refused("E4g production capability carrying a pin / alternative SQL path", R3, cap_prod(R3, good, pin="0" * 64, sql_path="/etc/passwd"), "test-only fields")
+child_refused("E4h production capability without an approval", R3, cap_prod(R3, good, approval=None), "approval")
+child_refused("E4i unsigned approval ('sig' removed)", R3, cap_prod(R3, good, approval={"payload": json.loads(Path(good).read_text())["payload"]}), "approval")
+R4 = make_checkout("co4"); appr4 = approval(R4)
+(R4 / "tests/sql/task197_prod_rollback_rehearsal.sql").write_text((R4 / "tests/sql/task197_prod_rollback_rehearsal.sql").read_text() + "-- tampered after approval\n")
+child_refused("E4j DO statement modified after the approval was signed", R4, cap_prod(R4, appr4), "uncommitted changes")
+subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-am", "tamper committed"], cwd=R4, check=True)
+child_refused("E4k the same tampering committed (approval pins the old commit and hashes)", R4, cap_prod(R4, appr4), "different commit")
+n = DEC.count; o = child_direct(ROOT, cap_test(), "host=127.0.0.1 port=1 dbname=postgres user=postgres", TESTENV)
+check("E4l test-mode capability against a database that is not a throwaway name: refused by the child, no connection", o[0] == 2 and "throwaway" in o[1].get("refused", ""), o[1].get("refused"))
+o = child_direct(ROOT, cap_test(), "host=db.prod.example.com dbname=t_run user=postgres", TESTENV)
+check("E4m test-mode capability against a non-local host: refused by the child before DNS/connection", o[0] == 2 and "throwaway" in o[1].get("refused", ""), o[1].get("refused"))
+o = child_direct(ROOT, cap_test(), DEC.dsn(), {})
+check("E4n test-mode capability without TASK197_TEST_MODE in the environment", o[0] == 2 and "throwaway" in o[1].get("refused", "") and DEC.count == n, o[1].get("refused"))
+bad_l = [dict(AP.PROD_MANIFEST, statement_timeout_ms=0), dict(AP.PROD_MANIFEST, statement_timeout_ms=10**12), dict(AP.PROD_MANIFEST, watchdog_s=float("inf")), dict(AP.PROD_MANIFEST, lock_timeout_ms=-5), {"x": 1}]
+ok_ = []
+for L_ in bad_l:
+    n = DEC.count; o = child_direct(ROOT, json.dumps(cap_test(limits=L_), allow_nan=True).encode(), DEC.dsn(), TESTENV); ok_.append(o[0] == 2 and "limits out of bounds" in o[1].get("refused", "") and DEC.count == n)
+check("E4o test-mode capability with absurd limits (0 / 1e12 / inf / negative / wrong keys): refused by the child, no connection", all(ok_), str(ok_))
+n = DEC.count; o = child_direct(ROOT, cap_test(fault="rm -rf"), DEC.dsn(), TESTENV)
+check("E4p test-mode capability with an unknown fault name", o[0] == 2 and "unknown test fault" in o[1].get("refused", "") and DEC.count == n, o[1].get("refused"))
+alt_sql = TMP / "alt_consistent.sql"; alt_sql.write_text("select 1;\n"); alt_sha = hashlib.sha256(alt_sql.read_bytes()).hexdigest()
+n = DEC.count; o = child_direct(ROOT, cap_test(sql_path=str(alt_sql), pin=alt_sha), DEC.dsn(), TESTENV)
+check("E4q attacker-consistent SQL (file hash == its own pin) that is not the DO statement: refused by the child's lint, no connection", o[0] == 2 and "lint" in o[1].get("refused", "") and DEC.count == n, o[1].get("refused"))
+o = child_direct(ROOT, cap_test(pin="0" * 64), DEC.dsn(), TESTENV)
+check("E4r pin does not match the DO file: refused, no connection", o[0] == 2 and "differs" in o[1].get("refused", "") and DEC.count == n, o[1].get("refused"))
+st = state(db)
+o = child_direct(ROOT, cap_test(), dsn(db), TESTENV)
+check("E5 test-mode capability that is fully valid (real DO file, right pin, real throwaway DB) but started WITHOUT a supervisor: connects only to check the admission lock, refuses, never executes the DO",
+      o[0] == 2 and "no supervisor observer" in o[1].get("refused", "") and not any("executing" in e for e in o[1].get("events", [])) and clean(st, state(db)), o[1].get("refused"))
+
+# --- other entry points: environment, report path, state dir, git, observer SQL
+n = DEC.count
+rc, rep, err = run(["--approval-file", good], dsn_override=DEC.dsn(), runner=R3 / "tests/sql/task197_safe_runner.py", cwd=str(R3), env=dict(ENVS, PYTHONPATH="/tmp/evil"))
+check("E6 production mode with PYTHONPATH set (import shadowing of `cryptography`/`psycopg`): refused before any connection", rc == 2 and "PYTHONPATH" in reasons(rep) and DEC.count == n, reasons(rep))
+rp = TMP / "exists.json"; rp.write_text("{}")
+rc, rep, err = run(["--test-mode", "--sha256", EXPECT["sql_sha256"], "--report", str(rp)], dsn_override=DEC.dsn(), env=TESTENV)
+check("E7 --report never overwrites an existing file (refused before any connection, file untouched)", rc == 2 and "already exists" in reasons(rep) and rp.read_text() == "{}" and DEC.count == n, reasons(rep))
+sd = subprocess.run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0,'tests/sql'); import task197_approval as A; "
+                     "e={'TASK197_TEST_MODE':'throwaway-server','TASK197_STATE_DIR':'/tmp/elsewhere'}; "
+                     "print(A.state_dir('db.prod.example.com','postgres',e)); print(A.state_dir('db.prod.example.com','t_x',e)); print(A.state_dir('/tmp','t_x',e)); print(A.state_dir('/tmp','t_x',{'TASK197_STATE_DIR':'/tmp/elsewhere'}))"],
+                    cwd=ROOT, capture_output=True, text=True).stdout.split()
+home_dir = str(AP.default_state_dir())
+check("E8 the single-use record location cannot be redirected in production: TASK197_STATE_DIR is honoured only with the test flag AND a local throwaway database", sd == [home_dir, home_dir, "/tmp/elsewhere", home_dir], str(sd))
+fake_bin = TMP / "fakebin"; fake_bin.mkdir(); (fake_bin / "git").write_text("#!/bin/sh\necho 0000000000000000000000000000000000000000\n"); (fake_bin / "git").chmod(0o755)
+gs = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0,'tests/sql'); import task197_approval as A; from pathlib import Path; print(A.git_state(Path({str(R3)!r})))"],
+                    cwd=ROOT, capture_output=True, text=True, env=dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}", GIT_DIR=str(ROOT / ".git"), GIT_WORK_TREE=str(ROOT))).stdout
+check("E9 git state is not spoofable through PATH / GIT_DIR / GIT_WORK_TREE: it still reports the checkout's own commit", head(R3) in gs and "0000000000" not in gs, gs.strip()[:90])
+R5 = make_checkout("co5"); (R5 / "tests/sql/task197_prod_rollback_snapshot.sql").write_text("drop table public.magi_tasks;")
+n = DEC.count
+rc, rep, err = run(["--post-check-only"], dsn_override=DEC.dsn(), runner=R5 / "tests/sql/task197_safe_runner.py", cwd=str(R5), env=ENVS)
+check("E10 --post-check-only (no approval) with a doctored observer SQL: refused by the pinned hash before any connection", rc == 2 and "pinned hash" in reasons(rep) and DEC.count == n, reasons(rep))
+hostile_snap = TMP / "snap_hostile.sql"; hostile_snap.write_text("select 'x' k, '1' v; insert into public.magi_tasks default values")
+rc, rep, err = run(["--test-mode", "--sha256", EXPECT["sql_sha256"], "--snapshot", str(hostile_snap)], dsn_override=DEC.dsn(), env=TESTENV)
+check("E11 test mode with a snapshot SQL that writes: refused by the snapshot lint before any connection", rc == 2 and "snapshot SQL" in reasons(rep) and DEC.count == n, reasons(rep))
+rc, rep, err = prod(R3, approval(R3), db=db, state_dir=TMP / "state_f")
+check("E12 the normal signed path still works end to end through the sealed capability: strict PASS, the child saw the supervisor's admission lock, the capability digest is in the report, nothing left behind",
+      rc == 0 and rep.get("verdict") == "PASS" and rep.get("capability_sha256") and any("supervisor observer holds the admission lock" in e for e in rep.get("events", [])) and clean(st, state(db)), reasons(rep))
+
+# --- parent crash: the child must not run on unsupervised
+db = clone("t_run"); s0 = state(db)
+pr = subprocess.Popen([sys.executable, str(RUNNER), "--test-mode", "--sha256", sleep30[2], "--sql", sleep30[0], "--expect", sleep30[1], "--statement-timeout-ms", "20000", "--watchdog-s", "30"],
+                      env=dict(os.environ, PGDSN=dsn(db), **TESTENV), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+time.sleep(2.5); t_kill = time.time(); pr.send_signal(signal.SIGKILL); pr.wait()
+gone = None
+with psycopg.connect(dsn(db, SUP), autocommit=True) as c:
+    while time.time() - t_kill < 8:
+        if c.execute("select count(*) from pg_stat_activity where application_name='task197_rehearsal'").fetchone()[0] == 0: gone = time.time() - t_kill; break
+        time.sleep(0.1)
+rc_post, rep_post, _ = run(["--post-check-only"], db=db)
+check("E13 supervisor SIGKILLed while the child runs the DO (statement limit 20 s): the child notices, cancels and exits within seconds (not after 20-30 s); --post-check-only then finds no residue",
+      gone is not None and gone < 4.0 and rc_post == 0 and clean(s0, state(db)), f"rehearsal session gone after {gone and round(gone, 2)} s")
+LOG["E13_child_gone_after_parent_kill_s"] = gone
 
 (Path(sys.argv[sys.argv.index("--log") + 1]) if "--log" in sys.argv else TMP / "log.json").write_text(json.dumps(LOG, indent=2, ensure_ascii=False))
 print(f"\n{sum(results)}/{len(results)} passed"); sys.exit(0 if all(results) else 1)
