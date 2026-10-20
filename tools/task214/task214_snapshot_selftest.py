@@ -13,6 +13,7 @@ TOOL, DIFF = HERE / "task214_snapshot.py", HERE / "task214_snapshot_diff.py"
 SOCK, SUP = os.environ["PGHOST"], os.environ.get("PGSUPER", "supabase_admin")
 import psycopg
 results = []
+PW = os.environ.get("PGPASSWORD") or "S3cretPw!"   # the proxy DSN must authenticate against the throwaway server (trust on the socket, md5 in CI)
 
 
 def check(name, ok, info=""):
@@ -73,14 +74,14 @@ class Proxy:
             except OSError: pass
         self.ls.close()
     def dsn(self, extra=""):
-        return f"host=127.0.0.1 port={self.port} dbname=postgres user={SUP} password=S3cretPw! sslmode=disable {extra}"
+        return f"host=127.0.0.1 port={self.port} dbname=postgres user={SUP} password={PW} sslmode=disable {extra}"
 
 DIRECT = f"host={SOCK} port={os.environ.get('PGPORT', '5432')} dbname=postgres user={SUP}" + (f" password={os.environ['PGPASSWORD']} sslmode=disable" if os.environ.get("PGPASSWORD") else "")
 tmp = Path(tempfile.mkdtemp(prefix="t214_"))
 def snaps(d): return sorted(p for p in Path(d).glob("task214_snap_*.json"))
 def leak(*texts, extra=()):
     blob = "\n".join(texts)
-    return [s for s in ("S3cretPw!", "abcdefghijklmnop", "127.0.0.1", *extra) if s in blob]
+    return [s for s in ("S3cretPw!", PW, "abcdefghijklmnop", "127.0.0.1", *extra) if s in blob]
 
 # --- S: the SQL itself is read-only by construction
 m = load_mod()
