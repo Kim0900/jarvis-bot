@@ -1,4 +1,4 @@
-name: Task214 snapshot tools self-test (PostgreSQL 17, throwaway server only)
+name: Task214 snapshot analysis tool self-test (files only)
 
 on:
   pull_request:
@@ -16,37 +16,19 @@ defaults:
     shell: bash
 
 jobs:
-  pg17:
+  selftest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: supabase_admin
-          POSTGRES_PASSWORD: ci_throwaway
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U supabase_admin" --health-interval 3s --health-timeout 3s --health-retries 20
-    env:
-      PGHOST: localhost
-      PGPORT: "5432"
-      PGPASSWORD: ci_throwaway
-      PGSUPER: supabase_admin
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "psycopg[binary]==3.2.3" "cryptography>=42"
-      - name: Server version (must be 17)
-        run: psql -U supabase_admin -d postgres -Atc "select version()" | tee /dev/stderr | grep -q "PostgreSQL 17"
-      - name: Snapshot tools self-test (read-only, outage behaviour, analysis)
+      - name: Self-test (synthetic files; no database, no network, no extra packages)
         run: |
           rc=0
           python tools/task214/task214_snapshot_selftest.py > selftest.log 2>&1 || rc=$?
           cat selftest.log
-          # surface failures as annotations (job logs are not always retrievable)
           grep -E "^FAIL|Traceback|Error" selftest.log | head -10 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
           exit $rc
       - uses: actions/upload-artifact@v4

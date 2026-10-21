@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TASK#214 offline analysis of snapshot files written by task214_snapshot.py.  Reads files only: no database, no network.
+"""TASK#214 offline analysis of snapshot files (input format: docs/TASK214_SNAPSHOT_PROCEDURE.md section 2).  Reads files only: no database, no network.
 
     python3 task214_snapshot_diff.py SNAP1.json SNAP2.json [SNAP3.json ...] [--md report.md] [--json report.json]
 
