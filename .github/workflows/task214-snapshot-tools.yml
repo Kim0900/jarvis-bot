@@ -29,7 +29,7 @@ jobs:
           rc=0
           python tools/task214/task214_snapshot_selftest.py > selftest.log 2>&1 || rc=$?
           cat selftest.log
-          grep -E "^FAIL|Traceback|Error" selftest.log | head -10 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
+          { grep -E "^FAIL|Traceback|Error" selftest.log || true; } | head -10 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
           exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
