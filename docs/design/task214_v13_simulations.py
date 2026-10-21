@@ -214,7 +214,7 @@ async def thread_case():
     while "t" not in th_done and time.monotonic() - t0 < 12: await asyncio.sleep(0.1)
     return t_caller, th_done.get("t"), out
 t_caller, t_thread, out = asyncio.run(thread_case())
-check("B7 sync/thread path: wait_for returns the CALLER at 5.0 s, but the thread keeps working until its own per-phase limits end (~7.7 s): the concurrency permit must be released when the THREAD ends, not at the deadline",
+check("B7 (evidence only; DB calls may not use threads since v1.4) sync/thread path: wait_for returns the CALLER at 5.0 s, but the thread keeps working until its own per-phase limits end (~7.7 s): the concurrency permit must be released when the THREAD ends, not at the deadline",
       out == "caller released" and 4.9 <= t_caller <= 5.3 and t_thread and t_thread > 6.0, f"caller {t_caller:.2f} s, thread occupied {t_thread and round(t_thread, 2)} s")
 
 # ====================================================================================================================== C. report latency under the polling policy
@@ -265,5 +265,138 @@ def after_recovery(drain_catchup):
     return worst
 w_with, w_without = after_recovery(True), after_recovery(False)
 check("C4 after an outage the first poll happens at the moment the circuit closes (catch-up poll): worst wait <= one probe gap (600 s); without it up to ~1200 s", w_with <= 600.0 and w_without > 900, f"with catch-up {w_with:.0f} s, without {w_without:.0f} s")
+
+
+# ====================================================================================================================== D. v1.4 (G214-07, G214-08)
+print("\n== D. absolute deadline with forced termination, isolated permit, single formula (v1.4) ==")
+import ast, re as _re
+DOC = Path(__file__).resolve().parent / "task214_amplification_v1.md"
+doc_text = DOC.read_text(encoding="utf-8")
+HISTORY = ("거짓", "틀렸", "제거", "정정", "v1.2", "v1.3")      # a line that QUOTES the old claim in order to correct it is history, not a claim
+stale = [pat for pat in ("6건/분", "6×60", "분당 6건 ×") for l in doc_text.splitlines() if pat in l and not any(h in l for h in HISTORY)]
+five = [l for l in doc_text.splitlines() if l.lstrip().startswith("- **⑤")]
+check("D1 (G214-08) the design text has no stale per-minute cap ('6건/분', '6×60') and target ⑤ is written with the single interval formula U(L)+P(L)",
+      not stale and len(five) == 1 and "U(L)" in five[0] and "P(L)" in five[0], f"stale={stale} five={len(five)}")
+U = lambda L: 3 + L // 10
+Pf = lambda L: L // 60 + 1
+check("D1b the single formula evaluates to the numbers used elsewhere in the document: U(60)=9, U(600)=63, U(3600)=363, P(3600)=61, total 424 for one hour",
+      (U(60), U(600), U(3600), Pf(3600), U(3600) + Pf(3600)) == (9, 63, 363, 61, 424))
+
+DEADLINE, GRACE, CAP = 5.0, 0.2, 2
+class Guard:
+    """reference model of the v1.4 contract: admission is NON-blocking (over the cap -> reject, zero DB calls); the 5.0 s deadline starts at
+    admission; at the deadline the CALLER is released and the call task is cancelled; the permit is returned when the task REALLY ends
+    (done-callback), so the cap stays truthful even if a task ignores cancellation (it is then counted as stuck)."""
+    def __init__(self, cap=CAP): self.cap, self.active, self.stuck, self.max_active, self.rejected = cap, {}, set(), 0, 0
+    async def call(self, factory):
+        if len(self.active) >= self.cap:
+            self.rejected += 1; return "rejected", 0.0
+        t0 = time.monotonic(); task = asyncio.create_task(factory()); self.active[task] = t0; self.max_active = max(self.max_active, len(self.active))
+        task.add_done_callback(lambda t: (self.active.pop(t, None), self.stuck.discard(t)))
+        done, _ = await asyncio.wait({task}, timeout=DEADLINE)
+        if task in done:
+            try: task.result(); return "ok", time.monotonic() - t0
+            except BaseException as e: return "error:" + type(e).__name__, time.monotonic() - t0
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=GRACE)
+        if task not in done: self.stuck.add(task)
+        return "deadline", time.monotonic() - t0
+
+class RawTLS:
+    """raw TCP server for adversarial server behaviour: mode 'hsdrip' (valid TLS record header then 1 byte/s), 'hdrdrip' (TLS ok, status line then 1 header byte/s), 'silent'"""
+    def __init__(self, mode):
+        self.mode, self.accepted, self.closed = mode, 0, 0
+        self.ls = socket.socket(); self.ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); self.ls.bind(("127.0.0.1", 0)); self.ls.listen(50)
+        self.port = self.ls.getsockname()[1]; threading.Thread(target=self.loop, daemon=True).start()
+    def loop(self):
+        while True:
+            try: c, _ = self.ls.accept()
+            except OSError: return
+            self.accepted += 1; threading.Thread(target=self.serve, args=(c,), daemon=True).start()
+    def serve(self, c):
+        try:
+            if self.mode == "silent":
+                c.settimeout(60)
+                while c.recv(65536): pass
+                return
+            if self.mode == "hsdrip":
+                c.recv(65536); c.sendall(b"\x16\x03\x03\x00\xff")
+                for _ in range(200): time.sleep(1.0); c.sendall(b"\x00")
+                return
+            if self.mode == "hdrdrip":
+                s = sctx.wrap_socket(c, server_side=True); s.recv(65536); s.sendall(b"HTTP/1.1 200 OK\r\n")
+                for _ in range(200): time.sleep(1.0); s.sendall(b"X")
+        except Exception:
+            self.closed += 1
+        finally:
+            try: c.close()
+            except Exception: pass
+
+async def adversary(name, url, wait_close=lambda: True):
+    g = Guard()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=5, write=5, pool=5), verify=cctx) as c:
+        t0 = time.monotonic(); res, el = await g.call(lambda: c.get(url)); t_ret = time.monotonic() - t0
+        t1 = time.monotonic()
+        while g.active and time.monotonic() - t1 < 3: await asyncio.sleep(0.01)
+        t_perm = time.monotonic() - t1
+    return res, t_ret, t_perm, g
+
+async def scenario_d():
+    SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0); g0 = SRV.client_gone
+    res, t_ret, t_perm, g = await adversary("body drip", URL)
+    check("D2 (G214-07) body drip 1 byte/s: caller released at the 5.0 s absolute deadline, permit back <0.3 s later (task really ended)", res == "deadline" and 4.9 <= t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active and not g.stuck, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    SRV.cfg.update(hs=0.0, resp=0.0, drip=0.0)
+    hd = RawTLS("hdrdrip"); res, t_ret, t_perm, g = await adversary("header drip", f"https://localhost:{hd.port}/x")
+    check("D3 response HEADER drip (one byte per second, read timeout never fires): absolute deadline holds, permit released", res == "deadline" and 4.9 <= t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    hs = RawTLS("hsdrip"); res, t_ret, t_perm, g = await adversary("handshake drip", f"https://localhost:{hs.port}/x")
+    check("D4 TLS HANDSHAKE drip (valid record header, then one byte per second): the call ends inside the deadline (here the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    sl = RawTLS("silent"); res, t_ret, t_perm, g = await adversary("silent", f"https://localhost:{sl.port}/x")
+    check("D5 TCP accepted but never answered: the call ends inside the deadline (the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    # saturation: 50 simultaneous user calls against a draining server, cap 2
+    SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0); acc0 = SRV.accepted; g = Guard()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=5, write=5, pool=5), verify=cctx, limits=httpx.Limits(max_connections=4)) as c:
+        t0 = time.monotonic(); out = await asyncio.gather(*[g.call(lambda: c.get(URL)) for _ in range(50)])
+        wave1 = time.monotonic() - t0
+        while g.active and time.monotonic() - t0 < 8: await asyncio.sleep(0.01)
+    rej = sum(1 for r, _ in out if r == "rejected"); dl = sum(1 for r, _ in out if r == "deadline")
+    check("D6 50 simultaneous calls, cap 2, hostile (dripping) server: 48 rejected with ZERO server connections, 2 reach the server, never more than 2 in flight, all callers back within the deadline+grace",
+          rej == 48 and dl == 2 and SRV.accepted - acc0 == 2 and g.max_active == 2 and wave1 <= DEADLINE + GRACE + 0.2, f"rejected {rej}, deadline {dl}, server accepted {SRV.accepted - acc0}, max in flight {g.max_active}, {wave1:.2f} s")
+    # task that ignores cancellation: caller still released, permit stays held (cap truthful), admission fails closed, then recovers
+    g = Guard(); done_at = {}
+    async def stubborn():
+        end = time.monotonic() + 9.0
+        while time.monotonic() < end:
+            try: await asyncio.sleep(end - time.monotonic())
+            except asyncio.CancelledError: continue
+    t0 = time.monotonic(); r12 = await asyncio.gather(g.call(stubborn), g.call(stubborn)); t_back = time.monotonic() - t0
+    t1 = time.monotonic(); r3 = await g.call(stubborn); t_rej = time.monotonic() - t1
+    n_stuck = len(g.stuck)
+    while g.active and time.monotonic() - t0 < 14: await asyncio.sleep(0.05)
+    r4, _ = await g.call(lambda: asyncio.sleep(0.01))
+    check("D7 tasks that IGNORE cancellation: callers still released at 5.0 s+grace, both flagged stuck, the permit stays held so the cap stays truthful, a third call is rejected in <50 ms with zero DB work, and admission recovers when the tasks really end",
+          [x[0] for x in r12] == ["deadline", "deadline"] and t_back <= DEADLINE + GRACE + 0.2 and n_stuck == 2 and r3[0] == "rejected" and t_rej < 0.05 and r4 == "ok", f"callers back {t_back:.2f} s, stuck {n_stuck}, third call {t_rej * 1000:.1f} ms {r3[0]}, after recovery {r4}")
+    # forced termination: closing the shared client aborts in-flight requests
+    SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0)
+    c = httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=5, write=5, pool=5), verify=cctx)
+    tsk = asyncio.create_task(c.get(URL)); await asyncio.sleep(1.2); t0 = time.monotonic(); await c.aclose()
+    try: await asyncio.wait_for(tsk, 2.0); ended = "ok"
+    except Exception as e: ended = type(e).__name__
+    check("D8 forced termination of the whole client (the 'escalation' step): aclose() ends a request in flight within 2 s", ended != "TimeoutError" and tsk.done() and time.monotonic() - t0 < 2.0, f"{ended} after {time.monotonic() - t0:.2f} s")
+
+asyncio.run(scenario_d())
+
+# static: every Supabase helper of the app uses the ASYNC client and never a thread (so cancellation is possible)
+src_app = (Path(__file__).resolve().parents[2] / "bot_v5_legacy.py")
+if src_app.exists():
+    tree = ast.parse(src_app.read_text(encoding="utf-8")); bad, seen = [], 0
+    for fn in [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name.startswith(("sb_", "_sb_"))]:
+        seen += 1
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call):
+                f = ast.unparse(n.func)
+                if f in ("asyncio.to_thread", "httpx.Client", "requests.get", "requests.post", "requests.request") or f.endswith("run_in_executor"): bad.append((fn.name, f))
+    check("D9 (G214-07 scope) every Supabase helper in bot_v5_legacy.py (sb_*) uses only the async client: no to_thread / sync httpx / requests, so a deadline CAN cancel and close the connection", seen >= 10 and not bad, f"{seen} helpers checked, offenders {bad}")
+else:
+    check("D9 bot_v5_legacy.py present for the static check", False, str(src_app))
 
 print(f"\n{sum(results)}/{len(results)} claims reproduced"); sys.exit(0 if all(results) else 1)
