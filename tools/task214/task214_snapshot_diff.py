@@ -20,10 +20,34 @@ from pathlib import Path
 SKIP_KEYS = {"stats_reset", "datid", "oid"}
 
 
+EXIT_OK, EXIT_INPUT, EXIT_NO_PAIR = 0, 2, 3   # 0 >=1 valid pair | 2 usage/input/output error, nothing analysed | 3 inputs fine but ZERO analysable pairs
+REQUIRED = ("schema", "phase", "profile", "outcome", "t_start_utc", "t_start_kst", "sections")
+
+
+class InputError(Exception):
+    pass
+
+
 def load(p):
-    d = json.loads(Path(p).read_text(encoding="utf-8"))
-    if d.get("schema") not in ("task214-snapshot-v1", "task214-snapshot-v2"):
-        raise SystemExit(f"{p}: not a task214 snapshot")
+    try:
+        raw = Path(p).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise InputError(f"{p}: cannot read ({type(e).__name__})")
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        raise InputError(f"{p}: not valid JSON")
+    if not isinstance(d, dict) or d.get("schema") not in ("task214-snapshot-v1", "task214-snapshot-v2"):
+        raise InputError(f"{p}: not a task214 snapshot")
+    missing = [k for k in REQUIRED if k not in d]
+    if missing:
+        raise InputError(f"{p}: required field(s) missing: {', '.join(missing)}")
+    if not isinstance(d["sections"], dict) or not isinstance(d["outcome"], str) or not isinstance(d["phase"], str):
+        raise InputError(f"{p}: sections must be an object, phase and outcome strings")
+    try:
+        ts(d["t_start_utc"])
+    except (ValueError, TypeError):
+        raise InputError(f"{p}: t_start_utc is not an ISO time")
     d["_file"] = Path(p).name
     return d
 
@@ -227,20 +251,60 @@ def render(snaps, pairs):
     return "\n".join(L) + "\n"
 
 
+def summarize(snaps, pairs):
+    """Counts that stay true whatever the exit code: nothing is dropped from the report."""
+    valid = [p for p in pairs if p["valid"]]
+    failed = [{"file": x["_file"], "phase": x["phase"], "outcome": x["outcome"]} for x in snaps if x["outcome"] not in ("ok", "partial")]
+    degraded = [{"file": x["_file"], "phase": x["phase"], "outcome": x["outcome"]} for x in snaps if x["outcome"] == "partial"]
+    bad_pairs = [{"from": p["from_phase"], "to": p["to_phase"], "verdict": p["verdict"]} for p in pairs if not p["valid"]]
+    # a section that is simply absent from one snapshot (light profile, extension not installed) is informational; a discarded section (reset, duplicate key, ...) is not
+    noted = sum(1 for p in pairs if p["valid"] and any(not n.endswith("missing in one snapshot") for n in p["notes"]))
+    info = sum(1 for p in pairs if p["valid"] for n in p["notes"] if n.endswith("missing in one snapshot"))
+    return {"snapshots": len(snaps), "pairs": len(pairs), "valid_pairs": len(valid), "failed_observations": failed, "partial_observations": degraded,
+            "non_valid_pairs": bad_pairs, "valid_pairs_with_notes": noted, "informational_missing_section_notes": info,
+            "complete": len(valid) == len(pairs) and not failed and not degraded and not noted,
+            "analysable": bool(valid)}
+
+
+def banner(sm):
+    if not sm["analysable"]:
+        return [f"**NO ANALYSABLE PAIR** - {sm['snapshots']} snapshot(s), {sm['pairs']} pair(s), 0 valid. This is NOT a completed analysis; the observations below are the result "
+                f"({len(sm['failed_observations'])} failed observation(s)).", ""]
+    if not sm["complete"]:
+        return [f"**PARTIAL** - {sm['valid_pairs']} of {sm['pairs']} pair(s) valid; {len(sm['failed_observations'])} failed observation(s), {len(sm['partial_observations'])} partial, "
+                f"{len(sm['non_valid_pairs'])} pair(s) not valid, {sm['valid_pairs_with_notes']} valid pair(s) with discarded sections. Failed observations are listed, not hidden.", ""]
+    return [f"Complete: {sm['valid_pairs']} of {sm['pairs']} pair(s) valid, no failed observation.", ""]
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("snapshots", nargs="+"); ap.add_argument("--md"); ap.add_argument("--json")
+    ap = argparse.ArgumentParser(description=__doc__ + "\nExit codes: 0 at least one valid pair | 2 input/usage/output error (nothing analysed) | 3 inputs readable but ZERO analysable pairs (report still written).",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("snapshots", nargs="*"); ap.add_argument("--md"); ap.add_argument("--json")
     a = ap.parse_args(argv)
-    snaps = [load(p) for p in a.snapshots]
+    def err(msg):
+        print(f"error: {msg}", file=sys.stderr); return EXIT_INPUT
+    if len(a.snapshots) < 2:
+        return err(f"at least 2 snapshot files are needed to form a pair (got {len(a.snapshots)})")
+    resolved = [str(Path(p).resolve()) for p in a.snapshots]
+    if len(set(resolved)) != len(resolved):
+        return err("the same snapshot file is listed more than once")
+    try:
+        snaps = [load(p) for p in a.snapshots]
+    except InputError as e:
+        return err(str(e))
     pairs = [pair(snaps[i], snaps[i + 1]) for i in range(len(snaps) - 1)]
     for p, x, y in zip(pairs, snaps, snaps[1:]):
         if ts(y["t_start_utc"]) <= ts(x["t_start_utc"]):
             p["notes"].append("snapshots were given out of time order (client start times)")
-    md = render(snaps, pairs)
+    sm = summarize(snaps, pairs)
+    md = "\n".join(banner(sm)) + "\n" + render(snaps, pairs)
     print(md)
-    if a.md: Path(a.md).write_text(md, encoding="utf-8")
-    if a.json: Path(a.json).write_text(json.dumps({"snapshots": [s["_file"] for s in snaps], "pairs": pairs}, ensure_ascii=False, indent=1, default=str) + "\n", encoding="utf-8")
-    return 0
+    try:
+        if a.md: Path(a.md).write_text(md, encoding="utf-8")
+        if a.json: Path(a.json).write_text(json.dumps({"summary": sm, "snapshots": [s["_file"] for s in snaps], "pairs": pairs}, ensure_ascii=False, indent=1, default=str) + "\n", encoding="utf-8")
+    except OSError as e:
+        return err(f"could not write the report file ({type(e).__name__}); the analysis above is on stdout only")
+    return EXIT_OK if sm["analysable"] else EXIT_NO_PAIR
 
 
 if __name__ == "__main__":

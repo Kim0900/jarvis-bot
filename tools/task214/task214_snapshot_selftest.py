@@ -64,7 +64,7 @@ rc, o, e, j = diff([fb, fa], "a7")
 check("A7 snapshots given out of time order: pair is not valid (non-positive elapsed) and the order problem is noted", not j["pairs"][0]["valid"] and any("out of time order" in n for n in j["pairs"][0]["notes"]))
 bad = tmp / "bad.json"; bad.write_text(json.dumps({"schema": "something-else"}))
 p = subprocess.run([sys.executable, "-I", str(DIFF), fa, str(bad)], capture_output=True, text=True)
-check("A8 a file that is not a task214 snapshot is refused (non-zero exit, message)", p.returncode != 0 and "not a task214 snapshot" in p.stderr + p.stdout)
+check("A8 a file that is not a task214 snapshot is refused (exit 2, message)", p.returncode != 0 and "not a task214 snapshot" in p.stderr + p.stdout)
 
 # --- K: composite statement key, duplicate rejection, coverage (CASSANDRA C214-79-01/02)
 def stmt(dbid, userid, queryid, toplevel, calls, ms, rows=0): return {"dbid": dbid, "userid": userid, "queryid": queryid, "toplevel": toplevel, "calls": calls, "total_exec_time": ms, "rows": rows, "q": "select 1"}
@@ -101,6 +101,47 @@ cv = pr["sections"]["statements_top"]["coverage"]
 check("K6 identical membership: complete=True, no warning; without a totals section the report says the covered share is unknown", cv["complete"] is True and cv["warning"] is None and cv["totals"] is None and "share of all activity that this table covers is unknown" in o)
 o, pr = pdiff(with_stmts(a, same, reset="2026-02-12T00:00:00+00:00"), with_stmts(b, grown, reset="2026-09-01T00:00:00+00:00"), "sreset")
 check("K7 pg_stat_statements_info stats_reset differs: statements section discarded", "statements_top" not in pr["sections"] and any("statements_top: stats_reset differs" in n for n in pr["notes"]))
+
+# --- E: inputs, exit codes, nothing dropped (CASSANDRA C214-79-06)
+def run_cli(args):
+    p = subprocess.run([sys.executable, "-I", str(DIFF), *args], capture_output=True, text=True); return p.returncode, p.stdout, p.stderr
+def failed(phase, t, outcome="connect_failed"):
+    d = snap(phase, t, outcome=outcome); d["sections"] = {}; d["connect"] = {"ok": False, "ms": 3000, "error_class": "OperationalError", "sqlstate": None, "message": "timeout"}; return d
+out_md, out_js = tmp / "e.md", tmp / "e.json"
+rc, o, e = run_cli([]); check("E1 no input: exit 2 with a message, nothing analysed", rc == 2 and "at least 2" in e and not o.strip())
+rc, o, e = run_cli([fa, "--md", str(out_md), "--json", str(out_js)])
+check("E2 ONE input file: exit 2 (this was exit 0 with zero pairs), message names the minimum, no report file is created", rc == 2 and "at least 2" in e and not out_md.exists() and not out_js.exists(), e.strip()[:90])
+rc, o, e = run_cli([fa, fa]); check("E3 the same file listed twice: exit 2", rc == 2 and "more than once" in e)
+rc, o, e = run_cli([fa, str(tmp / "nope.json")]); check("E4 missing file: exit 2, clean message, no traceback", rc == 2 and "cannot read" in e and "Traceback" not in e)
+(tmp / "junk.json").write_text("{not json"); rc, o, e = run_cli([fa, str(tmp / "junk.json")]); check("E5 invalid JSON: exit 2, clean message", rc == 2 and "not valid JSON" in e and "Traceback" not in e)
+(tmp / "arr.json").write_text("[1,2]"); rc, o, e = run_cli([fa, str(tmp / "arr.json")]); check("E6 JSON that is not an object: exit 2", rc == 2 and "not a task214 snapshot" in e and "Traceback" not in e)
+nt = json.loads(json.dumps(b)); del nt["t_start_utc"]; rc, o, e = run_cli([fa, write("nt.json", nt)]); check("E7 required field missing (t_start_utc): exit 2 and the field is named", rc == 2 and "t_start_utc" in e and "Traceback" not in e)
+bt = json.loads(json.dumps(b)); bt["t_start_utc"] = "yesterday"; rc, o, e = run_cli([fa, write("bt.json", bt)]); check("E8 unparsable start time: exit 2", rc == 2 and "ISO time" in e and "Traceback" not in e)
+f1, f2 = write("e_f1.json", failed("during1", T1)), write("e_f2.json", failed("during2", T2, "query_timeout"))
+rc, o, e = run_cli([f1, f2, "--md", str(out_md), "--json", str(out_js)]); jj = json.loads(out_js.read_text()) if out_js.exists() else {}
+check("E9 two FAILED observations only (zero analysable pairs): exit 3 (not 0, not the input-error 2), banner says it is NOT a completed analysis, both failures listed in stdout, --md and --json, summary.analysable false",
+      rc == 3 and "NO ANALYSABLE PAIR" in o and "connect_failed" in o and "query_timeout" in o and out_md.exists() and "NO ANALYSABLE PAIR" in out_md.read_text()
+      and jj.get("summary", {}).get("analysable") is False and [x["outcome"] for x in jj["summary"]["failed_observations"]] == ["connect_failed", "query_timeout"], f"rc={rc}")
+rc, o, e = run_cli([fa, f1, fb]); 
+check("E10 one OK snapshot between failures (0 valid pairs out of 2): exit 3, both pairs UNMEASURABLE and listed", rc == 3 and o.count("UNMEASURABLE") >= 2 and "NO ANALYSABLE PAIR" in o)
+mixed = [fa, write("e_ok2.json", snap("during1", T1, reads=300, writes=1300, commits=5600, ckpt_written=650)), f2]
+rc, o, e = run_cli(mixed + ["--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("E11 valid pair + failed observation: exit 0 (an analysis exists) but the report says PARTIAL, lists the failure, summary.complete false, 1 of 2 pairs valid",
+      rc == 0 and "PARTIAL" in o and "query_timeout" in o and jj["summary"]["complete"] is False and jj["summary"]["valid_pairs"] == 1 and jj["summary"]["pairs"] == 2 and len(jj["summary"]["failed_observations"]) == 1)
+rc, o, e = run_cli([fa, fb, "--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("E12 clean series: exit 0, 'Complete', summary.complete true, no failed observations", rc == 0 and o.startswith("Complete:") and jj["summary"]["complete"] is True and not jj["summary"]["failed_observations"])
+rc, o, e = run_cli([fa, fb, "--json", str(tmp / "no_such_dir" / "x.json")])
+check("E13 report file cannot be written: exit 2 with a message (the analysis was printed, and the code does not claim success)", rc == 2 and "could not write" in e and "Complete:" in o)
+wd = snap("during1", T1); wd["outcome"] = "weird_new_outcome"
+rc, o, e = run_cli([fa, write("e_wd.json", wd)]); check("E14 an unknown outcome value is never treated as ok: pair UNMEASURABLE, exit 3, the value is shown", rc == 3 and "weird_new_outcome" in o and "UNMEASURABLE" in o)
+ps = snap("during1", T1); ps["outcome"] = "partial"
+rc, o, e = run_cli([fa, write("e_ps.json", ps), "--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("E15 a 'partial' snapshot still yields a pair but the series is not 'complete': PARTIAL banner, listed under partial_observations", rc == 0 and "PARTIAL" in o and len(jj["summary"]["partial_observations"]) == 1 and jj["summary"]["complete"] is False)
+
+rc, o, e = run_cli([write("e16a.json", with_stmts(a, same)), write("e16b.json", with_stmts(b, grown + [stmt(1, 10, 777, True, 999, 9999)])), "--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("E16 a valid pair whose statements section was REJECTED (duplicate key) is not 'complete': PARTIAL banner, valid_pairs_with_notes 1", rc == 0 and "PARTIAL" in o and jj["summary"]["valid_pairs_with_notes"] == 1 and jj["summary"]["complete"] is False)
+rc, o, e = run_cli([fa, fb, "--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("E17 sections merely absent from a snapshot (no statements in these fixtures) are informational only: still 'Complete', counted separately", jj["summary"]["complete"] is True and jj["summary"]["informational_missing_section_notes"] >= 1)
 
 # --- N: scope (MAGI #5848): analysis only, no database access, no approval machinery
 src = DIFF.read_text()
