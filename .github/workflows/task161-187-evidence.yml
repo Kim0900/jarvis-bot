@@ -1,0 +1,35 @@
+name: Task161/187 evidence tests
+
+on:
+  pull_request:
+    paths:
+      - "tests/test_task161_hold_visibility.py"
+      - "tests/test_task187_notify_evidence.py"
+      - "tests/fake_postgrest.py"
+      - "docs/TASK161_187_EVIDENCE.md"
+      - ".github/workflows/task161-187-evidence.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: "#161 HOLD visibility / patrol cooldown (in-process PostgREST stand-in)"
+        run: python -m unittest tests.test_task161_hold_visibility -v
+        env: &env
+          PYTHONPATH: .
+          SUPABASE_URL: http://127.0.0.1:1
+          SUPABASE_KEY: ci-test-key
+          TELEGRAM_BOT_TOKEN: ci-test-token
+      - name: "#187 notification queue (fake Telegram)"
+        run: python -m unittest tests.test_task187_notify_evidence -v
+        env: *env
