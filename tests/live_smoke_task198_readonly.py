@@ -140,6 +140,12 @@ def main(argv=None):
     url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_KEY")
     if not url or not key:
         print("SUPABASE_URL / SUPABASE_KEY not set"); return 2
+    rf = None
+    if a.report:                                       # claim the report file BEFORE any request: an existing/unwritable path must not cost a run
+        try:
+            rf = open(a.report, "x", encoding="utf-8")
+        except OSError as ex:
+            print(f"--report {a.report!r} cannot be created ({type(ex).__name__}); nothing was sent"); return 2
     p = ReadSmoke(url, key, os.environ.get("SUPABASE_INTERNAL_RPC_SECRET"), not_after=not_after)
     start = datetime.now(timezone.utc).isoformat(timespec="seconds"); stopped = None
     try:
@@ -148,12 +154,14 @@ def main(argv=None):
         stopped = str(s)
     except Exception as ex:                            # anything unexpected also ends the run
         stopped = f"unexpected {type(ex).__name__}"
+    except KeyboardInterrupt:                          # Ctrl-C: still write what was observed
+        stopped = "interrupted"
     ok = stopped is None and all(r["ok"] for r in p.results)
     rep = dict(git_commit(), start_utc=start, end_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"), not_after=a.not_after, stopped_early=stopped,
                requests=p.requests, results=p.results, secret_set=bool(p.secret), ok=ok)
-    if a.report:
-        with open(a.report, "x", encoding="utf-8") as f:
-            json.dump(rep, f, ensure_ascii=False, indent=1)
+    if rf is not None:
+        with rf:
+            json.dump(rep, rf, ensure_ascii=False, indent=1)
     print("STOPPED EARLY: " + stopped if stopped else ("ALL PASS" if ok else "FAILED"))
     return 3 if stopped else (0 if ok else 1)
 

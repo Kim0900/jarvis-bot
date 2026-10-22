@@ -117,8 +117,18 @@ class ReadSmokeAgainstFake(unittest.TestCase):
             for secret in ("KEYVALUE", "SECRETVALUE", "job_a", "patrol_meta::y"):
                 self.assertNotIn(secret, text)               # no key, no secret, no row contents
             self.assertTrue(all("param_names" in r and "status" in r for r in rep["requests"]))
-            with self.assertRaises(FileExistsError):
-                self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", rp)     # never overwrite
+            before = len(self.srv.requests)
+            self.assertEqual(self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", rp), 2)   # never overwrite,
+            self.assertEqual(len(self.srv.requests), before)                                                                                 # and nothing is sent
+            self.assertEqual(json.loads(open(rp, encoding="utf-8").read()), rep)
+            self.assertEqual(self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", os.path.join(d, "no_dir", "r.json")), 2)
+            self.assertEqual(len(self.srv.requests), before)
+
+    def test_ctrl_c_still_writes_the_report(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ls.ReadSmoke, "run", side_effect=KeyboardInterrupt):
+            rp = os.path.join(d, "r.json")
+            self.assertEqual(self._main("--not-after", (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "--report", rp), 3)
+            self.assertEqual(json.load(open(rp, encoding="utf-8"))["stopped_early"], "interrupted")
 
     def test_main_exit_codes(self):
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -127,6 +137,22 @@ class ReadSmokeAgainstFake(unittest.TestCase):
         self.srv.fail_mode = None
         self.assertEqual(self._main("--not-after", (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()), 3)
         self.assertEqual(self._main("--not-after", future, env={"SUPABASE_INTERNAL_RPC_SECRET": ""}), 1)    # not-run checks are not a pass
+
+    def test_procedure_doc_matches_the_script_and_stays_read_only(self):
+        import hashlib, re
+        root = os.path.join(os.path.dirname(__file__), "..")
+        doc = open(os.path.join(root, "docs", "TASK198_READONLY_SMOKE.md"), encoding="utf-8").read()
+        digest = hashlib.sha256(open(ls.__file__, "rb").read()).hexdigest()
+        self.assertIn(digest, doc.lower(), "the script changed: update the hash in docs/TASK198_READONLY_SMOKE.md (step 4)")
+        blocks = re.findall(r"```\n(.*?)\n```", doc, re.S)
+        self.assertGreaterEqual(len(blocks), 18)
+        for b in blocks:
+            self.assertEqual(len(b.splitlines()), 1, "every block is ONE copy-paste line: " + b)
+        cmds = "\n".join(blocks)
+        for bad in ("Invoke-WebRequest", "Invoke-RestMethod", "curl ", "-Method Post", "-Method Patch", "-Method Delete", "git push", "git merge", "git commit"):
+            self.assertNotIn(bad, cmds)
+        self.assertIn("live_smoke_task198_readonly.py --not-after", cmds)
+        self.assertNotIn("--allow-write", cmds)
 
     def test_this_repository_contains_no_write_probe_any_more(self):
         with open(ls.__file__, encoding="utf-8") as f:
