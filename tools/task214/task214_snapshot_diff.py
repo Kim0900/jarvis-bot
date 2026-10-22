@@ -20,7 +20,7 @@ from pathlib import Path
 SKIP_KEYS = {"stats_reset", "datid", "oid"}
 
 
-EXIT_OK, EXIT_INPUT, EXIT_NO_PAIR = 0, 2, 3   # 0 >=1 valid pair | 2 usage/input/output error, nothing analysed | 3 inputs fine but ZERO analysable pairs
+EXIT_OK, EXIT_INPUT, EXIT_NO_PAIR = 0, 2, 3   # 0 >=1 valid pair | 2 usage/input/output error, nothing analysed | 3 inputs fine but ZERO analysable pairs (incl. ANALYSIS_EMPTY)
 REQUIRED = ("schema", "phase", "profile", "outcome", "t_start_utc", "t_start_kst", "sections")
 
 
@@ -151,6 +151,7 @@ def pair(a, b):
     r["elapsed_s"] = secs
     r["valid"] = True
     r["verdict"] = "VALID"
+    compared = 0   # numeric counter comparisons actually performed (delta 0 counts: "nothing happened" is a measurement; "nothing compared" is not)
     for name, idk in (("io", ("backend_type", "object", "context")), ("database", ("datname",)), ("statements_top", STMT_KEY)):
         x, y = sec(a, name), sec(b, name)
         if x is None or y is None:
@@ -174,6 +175,7 @@ def pair(a, b):
                 r["notes"].append("statements_top: stats_reset differs or unknown -> section discarded"); continue
         rows, flagged = rows_delta(x, y, idk, secs)
         r["sections"][name] = {"rows": rows, "flagged_backwards": flagged}
+        compared += sum(len(x["delta"]) for x in rows)
         if name == "statements_top":
             r["sections"][name]["coverage"] = coverage(x, y, sec(a, "statements_totals"), sec(b, "statements_totals"))
     for name in ("checkpointer", "bgwriter", "wal"):
@@ -186,6 +188,12 @@ def pair(a, b):
         if badk:
             r["notes"].append(f"{name}: counters went backwards {badk} -> section discarded"); continue
         r["sections"][name] = {"delta": d, "rate": {k: v / secs for k, v in d.items()}}
+        compared += len(d)
+    r["compared_counters"] = compared
+    if compared == 0:
+        r["valid"] = False
+        r["verdict"] = ("ANALYSIS_EMPTY: the snapshots are compatible but ZERO numeric counters were compared (every section missing, discarded or without comparable "
+                        "counters); see the notes. A delta of 0 would have counted as valid.")
     r["activity"] = {"from": sec(a, "activity"), "to": sec(b, "activity")}
     return r
 
@@ -209,6 +217,9 @@ def render(snaps, pairs):
         L += ["", f"## {p['from_phase']} -> {p['to_phase']}: {p['verdict']}" + (f"  (elapsed {p['elapsed_s']:.1f} s)" if p.get("elapsed_s") else "")]
         for n in p["notes"]:
             L.append(f"- note: {n}")
+        for sname, sv in p["sections"].items():      # dropped rows are reported for EVERY pair, valid or ANALYSIS_EMPTY
+            for f in sv.get("flagged_backwards", []):
+                L.append(f"- flagged (counter went backwards, row dropped): {sname} {f['id']} {f['backwards']}")
         if not p["valid"]:
             continue
         io = p["sections"].get("io", {}).get("rows", [])
@@ -244,9 +255,6 @@ def render(snaps, pairs):
                 L.append(f"- the shown queries account for {sh(t['calls_share'])} of all calls and {sh(t['exec_share'])} of all exec time in this interval (all: {t['delta_calls_all']} calls, {fmt(t['delta_exec_ms_all'])} ms).")
             else:
                 L.append("- no totals section in these snapshots: the share of all activity that this table covers is unknown.")
-        for sname, sv in p["sections"].items():
-            for f in sv.get("flagged_backwards", []):
-                L.append(f"- flagged (counter went backwards, row dropped): {sname} {f['id']} {f['backwards']}")
     L += ["", "Interpretation rules (pre-registered): no correlation here is a cause; a phase-dependent delta is a candidate hypothesis to confirm with the dashboard Disk IO graph and Supabase support."]
     return "\n".join(L) + "\n"
 
@@ -260,7 +268,8 @@ def summarize(snaps, pairs):
     # a section that is simply absent from one snapshot (light profile, extension not installed) is informational; a discarded section (reset, duplicate key, ...) is not
     noted = sum(1 for p in pairs if p["valid"] and any(not n.endswith("missing in one snapshot") for n in p["notes"]))
     info = sum(1 for p in pairs if p["valid"] for n in p["notes"] if n.endswith("missing in one snapshot"))
-    return {"snapshots": len(snaps), "pairs": len(pairs), "valid_pairs": len(valid), "failed_observations": failed, "partial_observations": degraded,
+    return {"snapshots": len(snaps), "pairs": len(pairs), "valid_pairs": len(valid), "analysis_empty_pairs": [{"from": p["from_phase"], "to": p["to_phase"]} for p in pairs if p["verdict"].startswith("ANALYSIS_EMPTY")],
+            "failed_observations": failed, "partial_observations": degraded,
             "non_valid_pairs": bad_pairs, "valid_pairs_with_notes": noted, "informational_missing_section_notes": info,
             "complete": len(valid) == len(pairs) and not failed and not degraded and not noted,
             "analysable": bool(valid)}
@@ -268,7 +277,7 @@ def summarize(snaps, pairs):
 
 def banner(sm):
     if not sm["analysable"]:
-        return [f"**NO ANALYSABLE PAIR** - {sm['snapshots']} snapshot(s), {sm['pairs']} pair(s), 0 valid. This is NOT a completed analysis; the observations below are the result "
+        return [f"**NO ANALYSABLE PAIR** - {sm['snapshots']} snapshot(s), {sm['pairs']} pair(s), 0 valid ({len(sm['analysis_empty_pairs'])} ANALYSIS_EMPTY: compatible snapshots, no counter compared). This is NOT a completed analysis; the observations below are the result "
                 f"({len(sm['failed_observations'])} failed observation(s)).", ""]
     if not sm["complete"]:
         return [f"**PARTIAL** - {sm['valid_pairs']} of {sm['pairs']} pair(s) valid; {len(sm['failed_observations'])} failed observation(s), {len(sm['partial_observations'])} partial, "

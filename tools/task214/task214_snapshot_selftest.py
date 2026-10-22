@@ -143,6 +143,52 @@ check("E16 a valid pair whose statements section was REJECTED (duplicate key) is
 rc, o, e = run_cli([fa, fb, "--json", str(out_js)]); jj = json.loads(out_js.read_text())
 check("E17 sections merely absent from a snapshot (no statements in these fixtures) are informational only: still 'Complete', counted separately", jj["summary"]["complete"] is True and jj["summary"]["informational_missing_section_notes"] >= 1)
 
+# --- S: ANALYSIS_EMPTY (CASSANDRA C214-79-07): a pair is valid only if at least one numeric counter was really compared; delta 0 is a valid result
+def only(base, keep, mut=None):
+    d = json.loads(json.dumps(base)); d["sections"] = {k: v for k, v in d["sections"].items() if k in keep or k == "meta"}
+    if mut: mut(d)
+    return d
+def empty_case(tag, x, y):
+    rc, o, e = run_cli([write(f"s_{tag}_a.json", x), write(f"s_{tag}_b.json", y), "--md", str(tmp / f"s_{tag}.md"), "--json", str(tmp / f"s_{tag}.json")])
+    return rc, o, json.loads((tmp / f"s_{tag}.json").read_text())
+rc, o, jj = empty_case("meta", only(a, ()), only(b, ()))
+check("S1 meta only (every counter section missing): ANALYSIS_EMPTY, exit 3 (was VALID/exit 0), nothing compared, report written and says so",
+      rc == 3 and jj["pairs"][0]["verdict"].startswith("ANALYSIS_EMPTY") and jj["pairs"][0]["valid"] is False and jj["pairs"][0]["compared_counters"] == 0
+      and "ANALYSIS_EMPTY" in o and "NO ANALYSABLE PAIR" in o and (tmp / "s_meta.md").exists() and jj["summary"]["analysable"] is False and len(jj["summary"]["analysis_empty_pairs"]) == 1, o[:120])
+def blank(d):
+    for k in list(d["sections"]):
+        if k != "meta": d["sections"][k] = {"ok": True, "data": [] if k in ("io", "database") else {}}
+rc, o, jj = empty_case("blank", only(a, set(a["sections"]), blank), only(b, set(b["sections"]), blank))
+check("S2 every section present but with no rows / no fields: ANALYSIS_EMPTY, exit 3", rc == 3 and jj["pairs"][0]["verdict"].startswith("ANALYSIS_EMPTY"))
+def nonnum(d):
+    for k in ("io", "database"):
+        for r in d["sections"][k]["data"]:
+            for f in list(r):
+                if isinstance(r[f], (int, float)) and f not in ("dbid",): r[f] = None
+    for k in ("checkpointer", "bgwriter", "wal"):
+        for f in list(d["sections"][k]["data"]):
+            if isinstance(d["sections"][k]["data"][f], (int, float)): d["sections"][k]["data"][f] = "n/a"
+rc, o, jj = empty_case("nonnum", only(a, set(a["sections"]), nonnum), only(b, set(b["sections"]), nonnum))
+check("S3 all counters null / non-numeric: ANALYSIS_EMPTY, exit 3 (rows exist but nothing was compared)", rc == 3 and jj["pairs"][0]["verdict"].startswith("ANALYSIS_EMPTY") and jj["pairs"][0]["compared_counters"] == 0)
+rc, o, jj = empty_case("allreset", a, snap("post_normal", T1, reset="2099-01-01T00:00:00+00:00"))
+check("S4 stats_reset differs in EVERY section (all discarded): ANALYSIS_EMPTY, exit 3, the discard notes are kept", rc == 3 and jj["pairs"][0]["verdict"].startswith("ANALYSIS_EMPTY") and sum("stats_reset differs" in n for n in jj["pairs"][0]["notes"]) >= 4)
+back = snap("post_normal", T1, reads=1, writes=1, commits=1, ckpt_written=1)
+def only_back(d):
+    d["sections"]["bgwriter"]["data"] = {"buffers_clean": 0, "buffers_alloc": 1, "stats_reset": d["sections"]["bgwriter"]["data"]["stats_reset"]}
+rc, o, jj = empty_case("back", only(a, ("io", "database", "checkpointer"), None), only(back, ("io", "database", "checkpointer"), None))
+check("S4b every counter went backwards (all rows/sections dropped): ANALYSIS_EMPTY, exit 3, the dropped rows stay listed as flagged/notes", rc == 3 and jj["pairs"][0]["verdict"].startswith("ANALYSIS_EMPTY") and "flagged" in o and "went backwards" in o, o[:100])
+rc, o, jj = empty_case("zero", a, snap("post_normal", T1))
+check("S5 delta 0 on every counter (identical snapshots 10 min apart): VALID, exit 0 - an idle interval is a measurement; compared_counters > 0, rates 0",
+      rc == 0 and jj["pairs"][0]["verdict"] == "VALID" and jj["pairs"][0]["compared_counters"] > 0 and jj["pairs"][0]["sections"]["wal"]["delta"]["wal_bytes"] == 0 and o.startswith("Complete:"))
+rc, o, jj = empty_case("walonly", only(a, ("wal",)), only(b, ("wal",)))
+check("S6 optional sections absent in BOTH snapshots (only wal present): still VALID, exit 0; the absence is informational, not a failure, and the banner stays Complete",
+      rc == 0 and jj["pairs"][0]["verdict"] == "VALID" and jj["pairs"][0]["compared_counters"] > 0 and jj["summary"]["complete"] is True and jj["summary"]["informational_missing_section_notes"] >= 1)
+rc, o, jj = empty_case("onesided", only(a, ("wal", "io")), only(b, ("wal",)))
+check("S6b a section present in one snapshot only is a note, not a failure: VALID via wal, exit 0", rc == 0 and jj["pairs"][0]["verdict"] == "VALID")
+rc, o, e = run_cli([write("s8a.json", only(a, ())), write("s8b.json", only(snap("x", T1), ())), write("s8c.json", snap("post_normal", T2)), write("s8d.json", snap("post_late", "2026-10-20T11:30:00+00:00", reads=900, writes=1900, commits=7000, ckpt_written=900)), "--json", str(out_js)]); jj = json.loads(out_js.read_text())
+check("S8 mixed series [empty, empty, VALID]: exit 0, PARTIAL banner names the pairs that are not valid, analysis_empty_pairs lists 2, valid_pairs 1 of 3",
+      rc == 0 and "PARTIAL" in o and "ANALYSIS_EMPTY" in o and jj["summary"]["valid_pairs"] == 1 and jj["summary"]["pairs"] == 3 and len(jj["summary"]["analysis_empty_pairs"]) == 2 and jj["summary"]["complete"] is False, str(jj["summary"])[:200])
+
 # --- N: scope (MAGI #5848): analysis only, no database access, no approval machinery
 src = DIFF.read_text()
 imports = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)", src, re.M))

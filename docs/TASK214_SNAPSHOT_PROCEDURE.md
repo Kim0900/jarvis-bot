@@ -32,11 +32,12 @@
 |---|---|
 | 0 | 입력이 모두 정상이고 **유효한 쌍이 1개 이상**. 단 `PARTIAL` 배너가 붙을 수 있다(아래) |
 | 2 | 사용·입력·출력 오류 — **분석하지 않았다**: 파일 2개 미만, 같은 파일을 두 번 지정, 읽을 수 없음/JSON 아님/스냅샷 아님/필수 필드(`schema, phase, profile, outcome, t_start_utc, t_start_kst, sections`) 누락/시각 형식 오류, 보고서 파일 쓰기 실패 |
-| 3 | 입력은 읽혔지만 **분석 가능한 쌍이 0건**(전부 UNMEASURABLE/DISCARDED). 정상 완료가 아니다. 보고서(`--md`/`--json`)는 **그대로 써지고** 실패한 관측이 결과로 들어 있다 |
-- 보고서 맨 위 배너: `Complete`(모든 쌍 유효·실패 관측 없음) / `PARTIAL`(유효한 쌍이 있으나 실패·부분 관측, 유효하지 않은 쌍, 또는 버려진 섹션이 있음 — 모두 나열됨) / `NO ANALYSABLE PAIR`(종료코드 3). JSON에는 같은 내용이 `summary`(`analysable, complete, valid_pairs, pairs, failed_observations, partial_observations, non_valid_pairs, valid_pairs_with_notes, informational_missing_section_notes`)로 들어간다.
+| 3 | 입력은 읽혔지만 **분석 가능한 쌍이 0건**(전부 UNMEASURABLE/DISCARDED/**ANALYSIS_EMPTY**). 정상 완료가 아니다. 보고서(`--md`/`--json`)는 **그대로 써지고** 실패한 관측이 결과로 들어 있다 |
+- 보고서 맨 위 배너: `Complete`(모든 쌍 유효·실패 관측 없음) / `PARTIAL`(유효한 쌍이 있으나 실패·부분 관측, 유효하지 않은 쌍, 또는 버려진 섹션이 있음 — 모두 나열됨) / `NO ANALYSABLE PAIR`(종료코드 3). JSON에는 같은 내용이 `summary`(`analysable, complete, valid_pairs, analysis_empty_pairs, pairs, failed_observations, partial_observations, non_valid_pairs, valid_pairs_with_notes, informational_missing_section_notes`)로 들어간다.
 - 실패한 관측(연결 실패·타임아웃 등)은 **어느 종료코드에서도 보고서 표에서 빠지지 않는다.** 알 수 없는 `outcome` 값은 ok로 취급하지 않고 UNMEASURABLE로 올린다.
 - 한 스냅샷에만 없는 섹션(light 프로필, 확장 미설치)은 정보 항목이며 `Complete`를 막지 않는다. 버려진 섹션(reset 불일치, 중복 키 등)은 막는다.
-- **결정 사항(마기 확인 요청)**: 유효한 쌍이 하나라도 있으면 종료코드는 0이고 부분성은 배너·`summary`로만 알린다. 부분 결과에 별도 종료코드(예: 4)를 주길 원하면 알려 달라.
+- **ANALYSIS_EMPTY (C214-79-07)**: 쌍이 시계·재시작 검사를 통과해도 **실제로 비교된 수치 카운터가 0개**(섹션이 모두 없음/버려짐/비어 있음/수치 아님, 전 행이 거꾸로 감)이면 유효 쌍이 아니다 — 판정 `ANALYSIS_EMPTY`, 쌍 `valid=false`, `compared_counters=0`. 버려진 섹션 메모와 거꾸로 간 행은 이 쌍에서도 보고서에 남는다. 반대로 **델타가 0**이어도(한가한 구간) 비교가 이루어졌으므로 유효하다. 선택 섹션(statements, wal 등)이 일부 빠진 것은 실패가 아니다 — 하나라도 비교되면 유효.
+- **결정(마기 답변 반영)**: 유효한 쌍이 하나라도 있으면 종료코드는 0이고 부분성은 배너·`summary`로만 알린다. 별도 종료코드는 만들지 않는다.
 
 ## 5. 사용
 `python3 tools/task214/task214_snapshot_diff.py pre.json during1.json post_immediate.json --md report.md --json report.json` (시간순). 출력은 표준출력과 선택 파일뿐이다.
