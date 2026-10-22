@@ -1,0 +1,38 @@
+name: Task214 snapshot analysis tool self-test (files only)
+
+on:
+  pull_request:
+    paths:
+      - "tools/task214/**"
+      - "docs/TASK214_SNAPSHOT_PROCEDURE.md"
+      - ".github/workflows/task214-snapshot-tools.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Self-test (synthetic files; no database, no network, no extra packages)
+        run: |
+          rc=0
+          python tools/task214/task214_snapshot_selftest.py > selftest.log 2>&1 || rc=$?
+          cat selftest.log
+          { grep -E "^FAIL|Traceback|Error" selftest.log || true; } | head -10 | while IFS= read -r l; do echo "::error::${l:0:400}"; done
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: task214-selftest-log
+          path: selftest.log
