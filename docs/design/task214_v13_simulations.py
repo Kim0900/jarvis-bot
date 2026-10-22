@@ -282,25 +282,40 @@ Pf = lambda L: L // 60 + 1
 check("D1b the single formula evaluates to the numbers used elsewhere in the document: U(60)=9, U(600)=63, U(3600)=363, P(3600)=61, total 424 for one hour",
       (U(60), U(600), U(3600), Pf(3600), U(3600) + Pf(3600)) == (9, 63, 363, 61, 424))
 
-DEADLINE, GRACE, CAP = 5.0, 0.2, 2
+DEADLINE, GRACE, CAP, SLACK = 5.0, 0.2, 2, 0.08      # SLACK: allowed caller overshoot (timer + scheduling jitter), NOT cleanup time
 class Guard:
-    """reference model of the v1.4 contract: admission is NON-blocking (over the cap -> reject, zero DB calls); the 5.0 s deadline starts at
-    admission; at the deadline the CALLER is released and the call task is cancelled; the permit is returned when the task REALLY ends
-    (done-callback), so the cap stays truthful even if a task ignores cancellation (it is then counted as stuck)."""
-    def __init__(self, cap=CAP): self.cap, self.active, self.stuck, self.max_active, self.rejected = cap, {}, set(), 0, 0
+    """reference model of the v1.4/v1.5 contract.  Admission is NON-blocking (over the cap -> reject, zero DB calls).  The absolute deadline starts at
+    admission and is enforced by a TIMER (loop.call_later), not by awaiting the task: when it fires the CALLER is released at once (deadline+scheduling
+    jitter only) and the task is cancelled in the background.  The permit is returned by the task's done-callback, i.e. when the task REALLY ended;
+    a task still alive GRACE seconds after the cancel is counted as stuck (also by timer, never by the caller).  A result that arrives after the
+    deadline is discarded (counted), an exception is always retrieved (no 'never retrieved' warnings)."""
+    def __init__(self, cap=CAP, deadline=None, grace=None):
+        self.cap, self.deadline, self.grace = cap, DEADLINE if deadline is None else deadline, GRACE if grace is None else grace
+        self.active, self.stuck, self.max_active, self.rejected, self.late_discarded, self.stuck_total, self.settled_twice = {}, set(), 0, 0, 0, 0, 0
     async def call(self, factory):
         if len(self.active) >= self.cap:
             self.rejected += 1; return "rejected", 0.0
-        t0 = time.monotonic(); task = asyncio.create_task(factory()); self.active[task] = t0; self.max_active = max(self.max_active, len(self.active))
-        task.add_done_callback(lambda t: (self.active.pop(t, None), self.stuck.discard(t)))
-        done, _ = await asyncio.wait({task}, timeout=DEADLINE)
-        if task in done:
-            try: task.result(); return "ok", time.monotonic() - t0
-            except BaseException as e: return "error:" + type(e).__name__, time.monotonic() - t0
-        task.cancel()
-        done, _ = await asyncio.wait({task}, timeout=GRACE)
-        if task not in done: self.stuck.add(task)
-        return "deadline", time.monotonic() - t0
+        loop = asyncio.get_running_loop(); t0 = loop.time(); fut = loop.create_future()
+        def settle(kind):
+            if fut.done(): self.settled_twice += 1; return
+            fut.set_result((kind, loop.time() - t0))
+        task = asyncio.ensure_future(factory()); self.active[task] = t0; self.max_active = max(self.max_active, len(self.active))
+        def on_done(t):
+            self.active.pop(t, None); self.stuck.discard(t)
+            exc = None if t.cancelled() else t.exception()                       # always retrieved
+            if fut.done():
+                if not t.cancelled() and exc is None: self.late_discarded += 1   # finished after the deadline: result thrown away
+                return
+            settle("ok" if (not t.cancelled() and exc is None) else "error:" + (type(exc).__name__ if exc else "Cancelled"))
+        def check_stuck():
+            if not task.done(): self.stuck.add(task); self.stuck_total += 1
+        def on_deadline():
+            if fut.done(): return
+            settle("deadline"); task.cancel(); loop.call_later(self.grace, check_stuck)
+        task.add_done_callback(on_done)
+        timer = loop.call_later(self.deadline, on_deadline)
+        try: return await fut
+        finally: timer.cancel()
 
 class RawTLS:
     """raw TCP server for adversarial server behaviour: mode 'hsdrip' (valid TLS record header then 1 byte/s), 'hdrdrip' (TLS ok, status line then 1 header byte/s), 'silent'"""
@@ -344,14 +359,14 @@ async def adversary(name, url, wait_close=lambda: True):
 async def scenario_d():
     SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0); g0 = SRV.client_gone
     res, t_ret, t_perm, g = await adversary("body drip", URL)
-    check("D2 (G214-07) body drip 1 byte/s: caller released at the 5.0 s absolute deadline, permit back <0.3 s later (task really ended)", res == "deadline" and 4.9 <= t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active and not g.stuck, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    check("D2 (G214-07) body drip 1 byte/s: caller released at the 5.0 s absolute deadline, permit back <0.3 s later (task really ended)", res == "deadline" and 4.9 <= t_ret <= DEADLINE + SLACK and t_perm < 0.3 and not g.active and not g.stuck, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
     SRV.cfg.update(hs=0.0, resp=0.0, drip=0.0)
     hd = RawTLS("hdrdrip"); res, t_ret, t_perm, g = await adversary("header drip", f"https://localhost:{hd.port}/x")
-    check("D3 response HEADER drip (one byte per second, read timeout never fires): absolute deadline holds, permit released", res == "deadline" and 4.9 <= t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    check("D3 response HEADER drip (one byte per second, read timeout never fires): absolute deadline holds, permit released", res == "deadline" and 4.9 <= t_ret <= DEADLINE + SLACK and t_perm < 0.3 and not g.active, f"caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
     hs = RawTLS("hsdrip"); res, t_ret, t_perm, g = await adversary("handshake drip", f"https://localhost:{hs.port}/x")
-    check("D4 TLS HANDSHAKE drip (valid record header, then one byte per second): the call ends inside the deadline (here the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    check("D4 TLS HANDSHAKE drip (valid record header, then one byte per second): the call ends inside the deadline (here the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + SLACK and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
     sl = RawTLS("silent"); res, t_ret, t_perm, g = await adversary("silent", f"https://localhost:{sl.port}/x")
-    check("D5 TCP accepted but never answered: the call ends inside the deadline (the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + GRACE + 0.1 and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
+    check("D5 TCP accepted but never answered: the call ends inside the deadline (the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released", res in ("deadline", "error:ConnectTimeout", "error:ReadTimeout") and t_ret <= DEADLINE + SLACK and t_perm < 0.3 and not g.active, f"{res}: caller {t_ret:.2f} s, permit +{t_perm:.2f} s")
     # saturation: 50 simultaneous user calls against a draining server, cap 2
     SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0); acc0 = SRV.accepted; g = Guard()
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=5, write=5, pool=5), verify=cctx, limits=httpx.Limits(max_connections=4)) as c:
@@ -360,21 +375,75 @@ async def scenario_d():
         while g.active and time.monotonic() - t0 < 8: await asyncio.sleep(0.01)
     rej = sum(1 for r, _ in out if r == "rejected"); dl = sum(1 for r, _ in out if r == "deadline")
     check("D6 50 simultaneous calls, cap 2, hostile (dripping) server: 48 rejected with ZERO server connections, 2 reach the server, never more than 2 in flight, all callers back within the deadline+grace",
-          rej == 48 and dl == 2 and SRV.accepted - acc0 == 2 and g.max_active == 2 and wave1 <= DEADLINE + GRACE + 0.2, f"rejected {rej}, deadline {dl}, server accepted {SRV.accepted - acc0}, max in flight {g.max_active}, {wave1:.2f} s")
-    # task that ignores cancellation: caller still released, permit stays held (cap truthful), admission fails closed, then recovers
-    g = Guard(); done_at = {}
+          rej == 48 and dl == 2 and SRV.accepted - acc0 == 2 and g.max_active == 2 and wave1 <= DEADLINE + SLACK + 0.1, f"rejected {rej}, deadline {dl}, server accepted {SRV.accepted - acc0}, max in flight {g.max_active}, {wave1:.2f} s")
+    # task that ignores cancellation: caller released AT the deadline, cleanup/permit decoupled, stuck flagged later by timer, admission fails closed, recovers
+    g = Guard()
     async def stubborn():
         end = time.monotonic() + 9.0
         while time.monotonic() < end:
             try: await asyncio.sleep(end - time.monotonic())
             except asyncio.CancelledError: continue
     t0 = time.monotonic(); r12 = await asyncio.gather(g.call(stubborn), g.call(stubborn)); t_back = time.monotonic() - t0
+    stuck_at_return = len(g.stuck); await asyncio.sleep(GRACE + 0.1); n_stuck = len(g.stuck)
     t1 = time.monotonic(); r3 = await g.call(stubborn); t_rej = time.monotonic() - t1
-    n_stuck = len(g.stuck)
     while g.active and time.monotonic() - t0 < 14: await asyncio.sleep(0.05)
     r4, _ = await g.call(lambda: asyncio.sleep(0.01))
-    check("D7 tasks that IGNORE cancellation: callers still released at 5.0 s+grace, both flagged stuck, the permit stays held so the cap stays truthful, a third call is rejected in <50 ms with zero DB work, and admission recovers when the tasks really end",
-          [x[0] for x in r12] == ["deadline", "deadline"] and t_back <= DEADLINE + GRACE + 0.2 and n_stuck == 2 and r3[0] == "rejected" and t_rej < 0.05 and r4 == "ok", f"callers back {t_back:.2f} s, stuck {n_stuck}, third call {t_rej * 1000:.1f} ms {r3[0]}, after recovery {r4}")
+    check("D7 (G214-09) tasks that IGNORE cancellation: callers back AT the deadline (<= 5.0 s + 80 ms, no grace wait), not yet flagged stuck at that instant, flagged stuck 0.2 s later by timer, a third call is rejected in <50 ms with zero DB work, admission recovers when the tasks really end",
+          [x[0] for x in r12] == ["deadline", "deadline"] and DEADLINE - 0.01 <= t_back <= DEADLINE + SLACK and stuck_at_return == 0 and n_stuck == 2 and r3[0] == "rejected" and t_rej < 0.05 and r4 == "ok" and g.stuck_total == 2,
+          f"callers back {t_back:.3f} s, stuck at return {stuck_at_return}, +0.3 s {n_stuck}, third call {t_rej * 1000:.1f} ms {r3[0]}, after recovery {r4}")
+    # D10: the 5-second boundary.  A task that ends at deadline +-: before -> ok, after -> deadline at the deadline and the late result is discarded
+    g = Guard(cap=4)
+    async def ends_at(dt, val="v"):
+        end = time.monotonic() + dt
+        while time.monotonic() < end:
+            try: await asyncio.sleep(max(0.0, end - time.monotonic()))
+            except asyncio.CancelledError: continue            # uncooperative, so a result can arrive AFTER the deadline
+        return val
+    t0 = time.monotonic(); before, after = await asyncio.gather(g.call(lambda: ends_at(DEADLINE - 0.05)), g.call(lambda: ends_at(DEADLINE + 0.05)))
+    await asyncio.sleep(0.3)
+    check("D10 (G214-09) 5-second boundary: finishing 50 ms BEFORE the deadline -> ok; finishing 50 ms AFTER -> caller already back at the deadline with 'deadline', the late result is DISCARDED (counted), permit returned, not stuck",
+          before[0] == "ok" and before[1] < DEADLINE and after[0] == "deadline" and DEADLINE - 0.01 <= after[1] <= DEADLINE + SLACK and g.late_discarded == 1 and not g.active and not g.stuck and g.stuck_total == 0 and g.settled_twice == 0,
+          f"before {before[0]}@{before[1]:.3f}, after {after[0]}@{after[1]:.3f}, discarded {g.late_discarded}, settled twice {g.settled_twice}")
+    # D11: 300 races exactly on the boundary (scaled deadline 0.4 s, finish at deadline +-2 ms): exactly one outcome per call, caller never later than deadline+SLACK, no unretrieved exceptions
+    unretrieved = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, ctx: unretrieved.append(ctx.get("message")))
+    gs = Guard(cap=300, deadline=0.4, grace=0.05); rnd2 = random.Random(2142)
+    async def finish_near(off, boom):
+        await asyncio.sleep(0.4 + off)
+        if boom: raise RuntimeError("boom after/near deadline")
+        return "v"
+    res = await asyncio.gather(*[gs.call(lambda o=rnd2.uniform(-0.01, 0.01), b=(i % 3 == 0): finish_near(o, b)) for i in range(300)])
+    await asyncio.sleep(0.3); import gc; gc.collect(); await asyncio.sleep(0.05)
+    kinds = {}
+    for k, _ in res: kinds[k.split(":")[0]] = kinds.get(k.split(":")[0], 0) + 1
+    over = max(el for _, el in res) - 0.4
+    check("D11 (G214-09) 300 calls finishing within +-10 ms of the (scaled 0.4 s) deadline, a third of them raising: exactly one outcome per call (never settled twice), worst caller overshoot < 80 ms, no 'exception never retrieved', every permit returned",
+          sum(kinds.values()) == 300 and {"ok", "error", "deadline"} <= set(kinds) and gs.settled_twice == 0 and over < SLACK and not unretrieved and not gs.active, f"{kinds}, worst overshoot {over * 1000:.1f} ms, unretrieved {len(unretrieved)}, discarded {gs.late_discarded}")
+    # D12: slow CLEANUP after cancel (3 s) is the cleanup's business: caller still back at the deadline, permit comes back when cleanup ends, flagged stuck during the cleanup
+    g = Guard()
+    async def slow_cleanup():
+        try: await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await asyncio.sleep(3.0); raise
+    t0 = time.monotonic(); r = await g.call(slow_cleanup); t_back = time.monotonic() - t0
+    await asyncio.sleep(0.3); stuck_mid, active_mid = len(g.stuck), len(g.active)
+    while g.active and time.monotonic() - t0 < 10: await asyncio.sleep(0.05)
+    t_perm = time.monotonic() - t0
+    check("D12 (G214-09) cancellation CLEANUP that takes 3 s: caller back at 5.0 s (+80 ms max), permit held and task flagged stuck while it cleans up, permit returned only when the cleanup really ended (~8 s)",
+          r[0] == "deadline" and DEADLINE - 0.01 <= t_back <= DEADLINE + SLACK and stuck_mid == 1 and active_mid == 1 and 7.9 <= t_perm <= 8.5 and not g.active and not g.stuck, f"caller {t_back:.3f} s, mid: stuck {stuck_mid} active {active_mid}, permit back at {t_perm:.2f} s")
+    # D13: scaled stress - 400 hanging calls, cap 400, deadline 0.5 s: the overshoot of the CALLER does not grow with the amount of cleanup going on
+    g = Guard(cap=400, deadline=0.5, grace=0.1)
+    async def hang_stubborn():
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end:
+            try: await asyncio.sleep(end - time.monotonic())
+            except asyncio.CancelledError: continue
+    t0 = time.monotonic(); res = await asyncio.gather(*[g.call(hang_stubborn) for _ in range(400)])
+    over = max(el for _, el in res) - 0.5; mx_back = time.monotonic() - t0
+    await asyncio.sleep(0.2); n_st = len(g.stuck)
+    while g.active and time.monotonic() - t0 < 5: await asyncio.sleep(0.05)
+    check("D13 (G214-09, scaled time) 400 simultaneous uncooperative calls: every caller back within deadline + 80 ms regardless of the 400 cleanups still running, all 400 flagged stuck by timer, all permits recovered at the end",
+          all(k == "deadline" for k, _ in res) and over < SLACK and n_st == 400 and not g.active, f"worst caller overshoot {over * 1000:.1f} ms, stuck {n_st}")
     # forced termination: closing the shared client aborts in-flight requests
     SRV.cfg.update(hs=0.0, resp=0.0, drip=1.0)
     c = httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=5, write=5, pool=5), verify=cctx)
@@ -398,5 +467,12 @@ if src_app.exists():
     check("D9 (G214-07 scope) every Supabase helper in bot_v5_legacy.py (sb_*) uses only the async client: no to_thread / sync httpx / requests, so a deadline CAN cancel and close the connection", seen >= 10 and not bad, f"{seen} helpers checked, offenders {bad}")
 else:
     check("D9 bot_v5_legacy.py present for the static check", False, str(src_app))
+
+
+# doc <-> code constants: the sentence and the implementation must not drift apart again (G214-09 was exactly that)
+doc_text = DOC.read_text(encoding="utf-8")
+need = {"deadline": f"{DEADLINE:.1f}초", "grace": f"GRACE({GRACE}초)", "slack": f"허용 {int(SLACK * 1000)} ms", "cap": f"동시성 상한 {CAP}"}
+miss = [k for k, v in need.items() if v not in doc_text]
+check("D14 (G214-09 sweep) the numbers the design text states for the deadline, grace, caller slack and concurrency cap are the ones the reference model uses", not miss, f"missing in doc: {miss}")
 
 print(f"\n{sum(results)}/{len(results)} claims reproduced"); sys.exit(0 if all(results) else 1)

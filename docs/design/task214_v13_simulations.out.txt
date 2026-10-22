@@ -19,7 +19,7 @@ PASS A10 wake bucket (burst 3, one token per 60 s): N(T) <= 3 + floor(T/60); 1 h
 PASS A9 the corrected interval formula holds on the 1-hour greedy run for L = 60 / 600 / 3600
 
 == B. five-second end-to-end deadline vs per-phase timeouts (real local TLS server, httpx) ==
-PASS B1 per-phase timeouts alone do NOT bound the total: handshake 2.8 s (<3) + response 4.8 s (<5) took more than 5 s and succeeded  [7.64 s outcome=ok]
+PASS B1 per-phase timeouts alone do NOT bound the total: handshake 2.8 s (<3) + response 4.8 s (<5) took more than 5 s and succeeded  [7.63 s outcome=ok]
 PASS B2 one monotonic end-to-end deadline (asyncio.timeout 5.0 s around the whole request) ends the same request at 5.0 s  [5.00 s]
 PASS B3 cancellation closes the connection: the server sees the client go away  [client_gone=1]
 PASS B4 pool wait counts: the second request waits ~3.9 s for the single pooled connection and then needs 4 s -> 8-9 s without a deadline (it may even end as ReadTimeout), exactly the deadline with one  [no deadline 9.01 s (ReadTimeout), with deadline 5.00 s]
@@ -40,13 +40,18 @@ PASS C4 after an outage the first poll happens at the moment the circuit closes 
 == D. absolute deadline with forced termination, isolated permit, single formula (v1.4) ==
 PASS D1 (G214-08) the design text has no stale per-minute cap ('6건/분', '6×60') and target ⑤ is written with the single interval formula U(L)+P(L)  [stale=[] five=1]
 PASS D1b the single formula evaluates to the numbers used elsewhere in the document: U(60)=9, U(600)=63, U(3600)=363, P(3600)=61, total 424 for one hour
-PASS D2 (G214-07) body drip 1 byte/s: caller released at the 5.0 s absolute deadline, permit back <0.3 s later (task really ended)  [caller 5.00 s, permit +0.00 s]
-PASS D3 response HEADER drip (one byte per second, read timeout never fires): absolute deadline holds, permit released  [caller 5.00 s, permit +0.00 s]
+PASS D2 (G214-07) body drip 1 byte/s: caller released at the 5.0 s absolute deadline, permit back <0.3 s later (task really ended)  [caller 5.00 s, permit +0.01 s]
+PASS D3 response HEADER drip (one byte per second, read timeout never fires): absolute deadline holds, permit released  [caller 5.00 s, permit +0.01 s]
 PASS D4 TLS HANDSHAKE drip (valid record header, then one byte per second): the call ends inside the deadline (here the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released  [error:ConnectTimeout: caller 3.00 s, permit +0.00 s]
 PASS D5 TCP accepted but never answered: the call ends inside the deadline (the 3 s connect timeout fires first; the 5.0 s deadline is the backstop), permit released  [error:ConnectTimeout: caller 3.01 s, permit +0.00 s]
 PASS D6 50 simultaneous calls, cap 2, hostile (dripping) server: 48 rejected with ZERO server connections, 2 reach the server, never more than 2 in flight, all callers back within the deadline+grace  [rejected 48, deadline 2, server accepted 2, max in flight 2, 5.00 s]
-PASS D7 tasks that IGNORE cancellation: callers still released at 5.0 s+grace, both flagged stuck, the permit stays held so the cap stays truthful, a third call is rejected in <50 ms with zero DB work, and admission recovers when the tasks really end  [callers back 5.21 s, stuck 2, third call 0.0 ms rejected, after recovery ok]
+PASS D7 (G214-09) tasks that IGNORE cancellation: callers back AT the deadline (<= 5.0 s + 80 ms, no grace wait), not yet flagged stuck at that instant, flagged stuck 0.2 s later by timer, a third call is rejected in <50 ms with zero DB work, admission recovers when the tasks really end  [callers back 5.006 s, stuck at return 0, +0.3 s 2, third call 0.0 ms rejected, after recovery ok]
+PASS D10 (G214-09) 5-second boundary: finishing 50 ms BEFORE the deadline -> ok; finishing 50 ms AFTER -> caller already back at the deadline with 'deadline', the late result is DISCARDED (counted), permit returned, not stuck  [before ok@4.955, after deadline@5.001, discarded 1, settled twice 0]
+PASS D11 (G214-09) 300 calls finishing within +-10 ms of the (scaled 0.4 s) deadline, a third of them raising: exactly one outcome per call (never settled twice), worst caller overshoot < 80 ms, no 'exception never retrieved', every permit returned  [{'deadline': 188, 'ok': 76, 'error': 36}, worst overshoot 0.8 ms, unretrieved 0, discarded 3]
+PASS D12 (G214-09) cancellation CLEANUP that takes 3 s: caller back at 5.0 s (+80 ms max), permit held and task flagged stuck while it cleans up, permit returned only when the cleanup really ended (~8 s)  [caller 5.005 s, mid: stuck 1 active 1, permit back at 8.02 s]
+PASS D13 (G214-09, scaled time) 400 simultaneous uncooperative calls: every caller back within deadline + 80 ms regardless of the 400 cleanups still running, all 400 flagged stuck by timer, all permits recovered at the end  [worst caller overshoot 2.9 ms, stuck 400]
 PASS D8 forced termination of the whole client (the 'escalation' step): aclose() ends a request in flight within 2 s  [ReadError after 0.00 s]
 PASS D9 (G214-07 scope) every Supabase helper in bot_v5_legacy.py (sb_*) uses only the async client: no to_thread / sync httpx / requests, so a deadline CAN cancel and close the connection  [12 helpers checked, offenders []]
+PASS D14 (G214-09 sweep) the numbers the design text states for the deadline, grace, caller slack and concurrency cap are the ones the reference model uses  [missing in doc: []]
 
-31/31 claims reproduced
+36/36 claims reproduced
