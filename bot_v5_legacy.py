@@ -14,6 +14,7 @@ import logging
 import threading
 import queue
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -1652,7 +1653,7 @@ class SupabaseReadError(RuntimeError):
     """A Supabase GET whose answer cannot be trusted (task #194 / CASSANDRA 5067 F1)."""
 
 
-async def sb_get_strict(table: str, params: dict = None) -> list:
+async def sb_get_strict(table: str, params: dict = None, *, headers: dict = None) -> list:
     """Strict PostgREST GET that returns a JSON list or raises.
 
     ``sb_h`` is lenient on purpose for legacy callers: HTTP 200 with an empty body or
@@ -1662,7 +1663,7 @@ async def sb_get_strict(table: str, params: dict = None) -> list:
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.request("GET", url, headers=HEADERS_SB, params=params or {})
+            r = await client.request("GET", url, headers=headers or HEADERS_SB, params=params or {})
     except Exception as exc:
         raise SupabaseReadError(f"{table}: transport {type(exc).__name__}: {exc!r}") from exc
     if r.status_code != 200:
@@ -1687,8 +1688,17 @@ async def sb_get_all_strict(
     *,
     page_size: int = 1000,
     max_pages: int = 200,
+    key_col: str = "id",
+    key_type: type = int,
+    headers: dict = None,
 ) -> list:
     """Task #206: read EVERY matching row, or raise.
+
+    Task #198 generalisation: ``key_col``/``key_type`` name the unique key used for the
+    stable ordering and the integrity checks (default: the integer ``id`` of raw_calls,
+    behaviour unchanged).  For an integer key the ids must be strictly increasing; for a
+    text key (``scheduler_status.job_name``) the key must be a non-empty ``str`` and unique,
+    but its order is NOT compared in Python (the database collation decides it).
 
     PostgREST silently caps a response at the project's ``db-max-rows`` (often 1000), so
     "I asked for limit=N and got fewer" can mean "truncated" and "rows == limit" is not
@@ -1700,12 +1710,14 @@ async def sb_get_all_strict(
     transport error, or too many pages - raises :class:`SupabaseReadError`.
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = dict(HEADERS_SB)
+    headers = dict(headers or HEADERS_SB)      # Task #198: secret-gated tables pass their own headers
     headers["Prefer"] = "count=exact"
     # A stable, unique ordering is what makes offset paging trustworthy: the caller's
     # ``order`` (if any) is ignored on purpose.
     base = {k: v for k, v in (params or {}).items() if k not in ("limit", "offset", "order")}
-    base["order"] = "id.asc"
+    if key_type not in (int, str):
+        raise ValueError("key_type must be int or str")
+    base["order"] = f"{key_col}.asc"
     rows: list = []
     total = None
     for _ in range(max_pages):
@@ -1749,16 +1761,26 @@ async def sb_get_all_strict(
             raise SupabaseReadError(f"{table}: Content-Range lists rows but body is empty")
         for row in page:
             # Task #206 (CASSANDRA F2): raw_calls.id is an integer; only a real int counts
-            # (not bool, not a numeric string, not a float, not None).
-            if not isinstance(row, dict) or type(row.get("id")) is not int:
-                raise SupabaseReadError(f"{table}: row without a valid integer id (cannot verify paging)")
-        # Task #206 (CASSANDRA 5296): the request asks for order=id.asc, so ids must be strictly
-        # increasing inside a page and across pages; anything else is an unreliable read.
-        prev_id = rows[-1]["id"] if rows else None
-        for row in page:
-            if prev_id is not None and row["id"] <= prev_id:
-                raise SupabaseReadError(f"{table}: ids not strictly increasing (order=id.asc violated)")
-            prev_id = row["id"]
+            # (not bool, not a numeric string, not a float, not None).  Task #198: a text key
+            # must be a non-empty str.
+            if not isinstance(row, dict):
+                raise SupabaseReadError(f"{table}: row without a valid {key_col} (cannot verify paging)")
+            kv = row.get(key_col)
+            if key_type is int:
+                valid = type(kv) is int
+            else:
+                valid = type(kv) is str and kv != ""
+            if not valid:
+                kind = "integer id" if key_type is int else f"text {key_col}"
+                raise SupabaseReadError(f"{table}: row without a valid {kind} (cannot verify paging)")
+        if key_type is int:
+            # Task #206 (CASSANDRA 5296): the request asks for order=<key>.asc, so integer keys
+            # must be strictly increasing inside a page and across pages.
+            prev_id = rows[-1][key_col] if rows else None
+            for row in page:
+                if prev_id is not None and row[key_col] <= prev_id:
+                    raise SupabaseReadError(f"{table}: ids not strictly increasing (order={key_col}.asc violated)")
+                prev_id = row[key_col]
         rows.extend(page)
         if len(rows) >= total:
             break
@@ -1768,11 +1790,147 @@ async def sb_get_all_strict(
         raise SupabaseReadError(f"{table}: too many pages")
     if len(rows) != total:
         raise SupabaseReadError(f"{table}: collected {len(rows)} rows but total is {total}")
-    ids = [r["id"] for r in rows]
+    ids = [r[key_col] for r in rows]
     if len(ids) != len(set(ids)):
         # rows were inserted/deleted between pages: a row was read twice (so another was missed)
         raise SupabaseReadError(f"{table}: duplicate ids while paging (data changed mid-read)")
     return rows
+
+
+WRITE_WIN = "WIN"
+WRITE_LOSE = "LOSE"
+WRITE_AMBIGUOUS = "AMBIGUOUS"
+
+
+async def sb_write_strict(
+    method: str,
+    table: str,
+    *,
+    json_body,
+    params: dict = None,
+    extra_prefer: str = "",
+    timeout: float = 10.0,
+):
+    """Task #198: a write whose outcome is told apart exactly, or reported as ambiguous.
+
+    Returns ``(outcome, rows)``.  ``WIN``: a 2xx answer whose body is a JSON list of exactly
+    one object (the row that was inserted/updated).  ``LOSE``: a 2xx answer whose body is
+    exactly the empty list (a conditional PATCH that matched no row, or a POST with
+    ``resolution=ignore-duplicates`` that hit a conflict).  EVERYTHING else - a transport
+    error or timeout, a non-2xx status, an empty/garbled/non-list body, more than one row -
+    is ``AMBIGUOUS``: the write may or may not have been applied.  ``sb_h``/``sb_patch``/
+    ``sb_upsert`` cannot be used here (they swallow empty bodies and use return=minimal).
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    headers = dict(HEADERS_SB)
+    headers["Prefer"] = "return=representation" + (f",{extra_prefer}" if extra_prefer else "")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.request(method, url, headers=headers, params=params or {}, json=json_body)
+    except Exception as exc:
+        logger.warning(f"sb_write_strict {method} {table}: transport {type(exc).__name__}")
+        return WRITE_AMBIGUOUS, None
+    if not (200 <= r.status_code < 300) or not r.content or not r.content.strip():
+        return WRITE_AMBIGUOUS, None
+    try:
+        data = r.json()
+    except Exception:
+        return WRITE_AMBIGUOUS, None
+    if not isinstance(data, list) or any(not isinstance(x, dict) for x in data):
+        return WRITE_AMBIGUOUS, None
+    if len(data) == 1:
+        return WRITE_WIN, data
+    if len(data) == 0:
+        return WRITE_LOSE, []
+    return WRITE_AMBIGUOUS, None
+
+
+async def sb_rpc_strict(path: str, json_body: dict, *, headers: dict = None) -> list:
+    """Task #198: POST rpc/<fn> that returns a JSON list or raises (no lenient ``[]``)."""
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.request("POST", url, headers=headers or HEADERS_SB, json=json_body)
+    except Exception as exc:
+        raise SupabaseReadError(f"{path}: transport {type(exc).__name__}: {exc!r}") from exc
+    if r.status_code != 200:
+        raise SupabaseReadError(f"{path}: HTTP {r.status_code}")
+    if not r.content or not r.content.strip():
+        raise SupabaseReadError(f"{path}: empty 200 body")
+    try:
+        data = r.json()
+    except Exception as exc:
+        raise SupabaseReadError(f"{path}: invalid JSON body") from exc
+    if not isinstance(data, list):
+        raise SupabaseReadError(f"{path}: non-list body {type(data).__name__}")
+    return data
+
+
+TG_OK = "ok"
+TG_FAIL = "fail"   # definitely NOT delivered (safe to retry)
+TG_AMB = "amb"     # may have been delivered (never retried automatically)
+
+
+def telegram_recipients() -> list:
+    """[(short stable hash, chat_id)] for ALLOWED_CHAT_ID / ALLOWED_CHAT_ID2 (non-empty only)."""
+    import hashlib
+
+    out = []
+    for cid in (os.getenv("ALLOWED_CHAT_ID", ""), os.getenv("ALLOWED_CHAT_ID2", "")):
+        cid = (cid or "").strip()
+        if cid and cid not in [c for _h, c in out]:       # the same chat twice is one recipient
+            out.append((hashlib.sha256(cid.encode()).hexdigest()[:8], cid))
+    return out
+
+
+def classify_telegram_error(exc: BaseException) -> str:
+    """Task #198 G3 table (python-telegram-bot 20.7 over httpx).
+
+    ``TG_FAIL`` only when the message was certainly NOT accepted by Telegram: the request
+    never connected (httpx ConnectError / ConnectTimeout / PoolTimeout as ``__cause__``) or
+    Telegram itself rejected it (BadRequest, Forbidden, InvalidToken, ChatMigrated,
+    RetryAfter).  Everything else - read/write timeouts, protocol errors, 5xx, unknown
+    exceptions - is ambiguous: the message may have been delivered.
+    """
+    try:
+        import httpx as _httpx
+        from telegram import error as tgerr
+    except Exception:
+        return TG_AMB
+    if isinstance(exc, (tgerr.BadRequest, tgerr.Forbidden, tgerr.InvalidToken,
+                        tgerr.ChatMigrated, tgerr.RetryAfter)):
+        return TG_FAIL
+    if isinstance(exc, (tgerr.NetworkError, tgerr.TimedOut)):
+        cause = exc.__cause__
+        if isinstance(cause, (_httpx.ConnectError, _httpx.ConnectTimeout, _httpx.PoolTimeout)):
+            return TG_FAIL
+    return TG_AMB
+
+
+async def send_telegram_checked(text: str, only_hashes=None) -> dict:
+    """Task #198: per-recipient delivery result {hash: 'ok'|'fail'|'amb'} (never raises).
+
+    ``only_hashes`` restricts the send (retry of definite failures only).  No recipient
+    configured -> {} (the caller treats that as 'nothing could be delivered').
+    """
+    from telegram import Bot
+
+    results: dict = {}
+    recipients = telegram_recipients()
+    if not recipients:
+        logger.error("send_telegram_checked: ALLOWED_CHAT_ID 미설정")
+        return results
+    bot = Bot(token=TELEGRAM_TOKEN)
+    for h, cid in recipients:
+        if only_hashes is not None and h not in only_hashes:
+            continue
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+            results[h] = TG_OK
+        except Exception as exc:
+            results[h] = classify_telegram_error(exc)
+            logger.error(f"텔레그램 발송 {results[h]}(recipient={h}): {type(exc).__name__}")
+    return results
 
 
 async def sb_select_required(table: str, params: dict = None) -> list:
@@ -6222,9 +6380,6 @@ GEOMNURI_PATROL_TASK_ID = int(os.getenv("GEOMNURI_PATROL_TASK_ID", "160") or "16
 GEOMNURI_PATROL_INTERVAL_SECONDS = max(
     int(os.getenv("GEOMNURI_PATROL_INTERVAL_SECONDS", "300") or "300"), 60
 )
-GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS = max(
-    int(os.getenv("GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS", "7200") or "7200"), 300
-)
 GEOMNURI_PATROL_P0_STALE_HOURS = max(
     float(os.getenv("GEOMNURI_PATROL_P0_STALE_HOURS", "4") or "4"), 1.0
 )
@@ -6276,72 +6431,157 @@ def _patrol_parse_dt(value):
         return None
 
 
-async def _patrol_emit_once(
-    key: str,
-    detail: str,
-    *,
-    task_id: int | None = None,
-    severity: str = "WARN",
-    cooldown_seconds: int | None = None,
-) -> bool:
-    """동일 사건의 반복경보를 scheduler_status를 이용해 억제한다.
-    공식 사건은 대상 task(없으면 task#160)에 PATROL_ALERT로 기록한다."""
-    cooldown = cooldown_seconds or GEOMNURI_PATROL_ALERT_COOLDOWN_SECONDS
-    state_key = f"patrol_alert::{key}"[:240]
+PATROL_DEFAULT_COOLDOWN_SECONDS = 7200      # Task #198: fixed; the old env knob is no longer read
+PATROL_SELF_FAILURE_COOLDOWN_SECONDS = 7200
+PATROL_SCHEDULER_COOLDOWN_SECONDS = 6 * 3600
+
+
+def _patrol_dispatch_priority(key: str, severity: str) -> int:
+    """Task #198 (CASSANDRA 5431 F2): explicit dispatch classes under the 8-alerts-per-run cap.
+    Lower runs first.  10 = the patrol's own failures (nothing else can be trusted), 11 = scheduler
+    job FAIL/MISMATCH (a job that ran and reported failure), 20 = other CRITICAL (stale / missing /
+    long-held P0 / stuck ingestion), 30 = everything else.  A flood of stale jobs therefore cannot
+    crowd out the first scheduler FAILs; inside a class the detection order is kept."""
+    if key.startswith("patrol_internal_"):
+        return 10
+    if key.startswith("scheduler_fail::"):
+        return 11
+    return 20 if str(severity).upper() == "CRITICAL" else 30
+
+
+def _patrol_exc_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text[:300] if text else type(exc).__name__
+
+
+async def _patrol_read_events(cutoff) -> list:
+    """Strict read of the events since ``cutoff``.  New events arriving between two pages change
+    the total and make the strict reader refuse, so the read is repeated once before the
+    detector reports a self-failure."""
+    params = {"created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}"}
     try:
-        rows = await sb_select("scheduler_status", {"job_name": f"eq.{state_key}", "limit": "1"})
-    except Exception:
-        rows = []
+        return await sb_get_all_strict("magi_task_events", params, key_col="event_id")
+    except SupabaseReadError:
+        return await sb_get_all_strict("magi_task_events", params, key_col="event_id")
 
-    now = datetime.now(KST)
-    if rows:
-        last_dt = _patrol_parse_dt(rows[0].get("last_run_at"))
-        if last_dt is not None:
-            try:
-                age = (now - last_dt.astimezone(KST)).total_seconds()
-                if age < cooldown:
-                    return False
-            except Exception:
-                pass
 
-    target_task = int(task_id or GEOMNURI_PATROL_TASK_ID)
-    event_detail = f"[{severity}] {detail}"[:3500]
-    await sb_insert("magi_task_events", {
-        "task_id": target_task,
-        "event_type": "PATROL_ALERT",
-        "actor": "GEOMNURI_PATROL",
-        "detail": event_detail,
-    })
-    await sb_upsert("scheduler_status", {
-        "job_name": state_key,
-        "last_run_at": now.isoformat(),
-        "last_result": event_detail[:900],
-    }, on_conflict="job_name")
-    return True
+class PatrolLedgerIO:
+    """Task #198: the real I/O behind patrol_alert_ledger.AlertDispatcher."""
+
+    def now(self):
+        return datetime.now(timezone.utc)
+
+    def monotonic(self):
+        return time.monotonic()
+
+    def recipient_hashes(self):
+        return [h for h, _ in telegram_recipients()]
+
+    async def send(self, text, only_hashes):
+        return await send_telegram_checked(text, None if only_hashes is None else set(only_hashes))
+
+    @staticmethod
+    def _ledger_row(row):
+        from patrol_alert_ledger import LedgerRow
+
+        lra, lres = row.get("last_run_at"), row.get("last_result")
+        if (lra is not None and not isinstance(lra, str)) or (lres is not None and not isinstance(lres, str)):
+            raise SupabaseReadError("scheduler_status: ledger row has non-text last_run_at/last_result")
+        return LedgerRow(state_key=row["job_name"], last_run_at=lra, last_result=lres)
+
+    async def read_ledger(self):
+        out = {}
+        for ns in ("patrol_alert", "patrol_meta"):
+            rows = await sb_get_all_strict(
+                "scheduler_status", {"job_name": f"like.{ns}::*"}, key_col="job_name", key_type=str)
+            for row in rows:
+                if row["job_name"].startswith(f"{ns}::"):      # client-side guard for the like filter
+                    out[row["job_name"]] = self._ledger_row(row)
+        return out
+
+    async def read_row(self, state_key):
+        rows = await sb_get_strict("scheduler_status", {"job_name": f"eq.{state_key}"})
+        rows = [r for r in rows if isinstance(r, dict) and r.get("job_name") == state_key]
+        if len(rows) > 1:
+            raise SupabaseReadError("scheduler_status: duplicate ledger rows")
+        return self._ledger_row(rows[0]) if rows else None
+
+    async def create_row(self, state_key, text, last_run_at):
+        return await sb_write_strict(
+            "POST", "scheduler_status",
+            json_body={"job_name": state_key, "last_run_at": last_run_at, "last_result": text},
+            params={"on_conflict": "job_name"}, extra_prefer="resolution=ignore-duplicates",
+        )
+
+    async def cas_row(self, state_key, expected_last_run_at, text, last_run_at):
+        params = {"job_name": f"eq.{state_key}"}
+        params["last_run_at"] = "is.null" if expected_last_run_at is None else f"eq.{expected_last_run_at}"
+        return await sb_write_strict(
+            "PATCH", "scheduler_status",
+            json_body={"last_run_at": last_run_at, "last_result": text}, params=params)
+
+    async def insert_event(self, task_id, detail):
+        outcome, rows = await sb_write_strict(
+            "POST", "magi_task_events",
+            json_body={"task_id": task_id, "event_type": "PATROL_ALERT",
+                       "actor": "GEOMNURI_PATROL", "detail": detail})
+        if outcome == WRITE_WIN and type(rows[0].get("event_id")) is int:
+            return True, rows[0]["event_id"]
+        return False, None
+
+    async def read_event(self, event_id):
+        rows = await sb_get_strict("magi_task_events", {"event_id": f"eq.{event_id}"})
+        rows = [r for r in rows if isinstance(r, dict) and r.get("event_id") == event_id]
+        if not rows:
+            return None
+        if len(rows) > 1 or not isinstance(rows[0].get("detail"), str):
+            raise SupabaseReadError("magi_task_events: unusable event row")
+        return rows[0]["detail"]
+
+    async def task_statuses(self, ids):
+        if not ids:
+            return {}
+        rows = await sb_get_strict(
+            "magi_tasks", {"task_id": "in.(" + ",".join(str(int(i)) for i in ids) + ")",
+                           "select": "task_id,status"})
+        out = {}
+        for r in rows:
+            if not isinstance(r, dict) or type(r.get("task_id")) is not int:
+                raise SupabaseReadError("magi_tasks: unusable task row")
+            out[r["task_id"]] = r.get("status")
+        return out
 
 
 async def run_geomnuri_patrol_once() -> dict:
     """결정론적 순라 1회.
     자동복구/상태변경은 하지 않고 이상 감지·기록·알림만 수행한다."""
+    import patrol_alert_ledger as pal
+
     now = datetime.now(KST)
-    emitted = []
     findings = []
+    candidates = []
 
     async def emit(key, detail, *, task_id=None, severity="WARN", cooldown_seconds=None):
+        """Task #198: only COLLECT here; the ledger-guarded dispatch runs once at the end."""
+        if key.startswith("patrol_internal_") and cooldown_seconds is None:
+            cooldown_seconds = PATROL_SELF_FAILURE_COOLDOWN_SECONDS
         findings.append({"key": key, "detail": detail, "severity": severity, "task_id": task_id})
-        try:
-            if await _patrol_emit_once(
-                key, detail, task_id=task_id, severity=severity,
-                cooldown_seconds=cooldown_seconds,
-            ):
-                emitted.append({"key": key, "detail": detail, "severity": severity, "task_id": task_id})
-        except Exception as e:
-            logger.error(f"순라 사건기록 실패({key}): {e}")
+        candidates.append(pal.Candidate(
+            key=key, detail=detail, severity=severity, task_id=task_id,
+            cooldown_seconds=cooldown_seconds or PATROL_DEFAULT_COOLDOWN_SECONDS,
+            priority=_patrol_dispatch_priority(key, severity)))
 
     # 1) scheduler 누락/실패
     try:
-        rows = await sb_select("scheduler_status", {}) or []
-        sched = {str(r.get("job_name")): r for r in rows if r.get("job_name")}
+        rows = await sb_get_strict(
+            "scheduler_status",
+            {"job_name": "in.(" + ",".join(_PATROL_SCHEDULER_MAX_AGE_SECONDS) + ")"})
+        sched = {}
+        for r in rows:
+            name = r.get("job_name") if isinstance(r, dict) else None
+            if name not in _PATROL_SCHEDULER_MAX_AGE_SECONDS or name in sched:
+                raise SupabaseReadError("scheduler_status: unexpected or duplicate job row")
+            sched[name] = r
         for job_name, max_age in _PATROL_SCHEDULER_MAX_AGE_SECONDS.items():
             row = sched.get(job_name)
             if not row:
@@ -6375,25 +6615,25 @@ async def run_geomnuri_patrol_once() -> dict:
                     f"스케줄러 정체: {job_name}, 마지막 실행 {age_sec/3600:.1f}시간 전 "
                     f"(허용 {max_age/3600:.1f}시간), result={row.get('last_result')}",
                     severity="CRITICAL",
-                    cooldown_seconds=3600,
+                    cooldown_seconds=PATROL_SCHEDULER_COOLDOWN_SECONDS,
                 )
             if result_upper.startswith("FAIL") or "MISMATCH" in result_upper:
                 await emit(
                     f"scheduler_fail::{job_name}",
                     f"스케줄러 최근 결과 이상: {job_name} → {result[:500]}",
                     severity="CRITICAL",
-                    cooldown_seconds=3600,
+                    cooldown_seconds=PATROL_SCHEDULER_COOLDOWN_SECONDS,
                 )
     except Exception as e:
-        await emit("patrol_internal_scheduler_check", f"순라 scheduler 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_scheduler_check", f"순라 scheduler 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
     # 2) P0/P1 장기점유 — WAITING/HOLD/VERIFICATION은 의도적 대기이므로 제외
     try:
-        tasks = await sb_select("magi_tasks", {
+        tasks = await sb_get_strict("magi_tasks", {
             "status": "in.(ASSIGNED,IN_PROGRESS)",
             "priority": "in.(P0,P1)",
             "order": "updated_at.asc",
-        }) or []
+        })
         for t in tasks:
             updated = _patrol_parse_dt(t.get("updated_at"))
             if updated is None:
@@ -6411,16 +6651,12 @@ async def run_geomnuri_patrol_once() -> dict:
                     cooldown_seconds=6 * 3600,
                 )
     except Exception as e:
-        await emit("patrol_internal_task_check", f"순라 Task 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_task_check", f"순라 Task 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
     # 3) 자동 에이전트 이벤트 반복루프 — task#68 Golden Failure Case 대응
     try:
         cutoff = now - timedelta(minutes=GEOMNURI_PATROL_EVENT_LOOP_WINDOW_MINUTES)
-        events = await sb_select("magi_task_events", {
-            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
-            "order": "created_at.desc",
-            "limit": "1000",
-        }) or []
+        events = await _patrol_read_events(cutoff)
         groups = {}
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))
@@ -6446,35 +6682,47 @@ async def run_geomnuri_patrol_once() -> dict:
                     cooldown_seconds=3600,
                 )
     except Exception as e:
-        await emit("patrol_internal_event_loop_check", f"순라 반복루프 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_event_loop_check", f"순라 반복루프 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
     # 4) CALL/OCR ingestion 장기 PROCESSING 및 최근 FAILED
     try:
-        ingest_rows = await sb_h(
-            "GET",
-            "call_image_ingestions",
-            params={"order": "updated_at.asc", "limit": "200"},
-            headers=_internal_rpc_headers(),
-        )
-        if not isinstance(ingest_rows, list):
-            ingest_rows = []
-        failed_recent = []
-        stuck = []
+        # Task #198 (CASSANDRA 5431 F1): COMPLETE, scoped reads instead of "oldest 200 rows".  Each scope is read
+        # with the strict paged reader (true total from Content-Range, stable order, duplicate/forged-range
+        # checks), so a table above db-max-rows can no longer hide newer FAILED/PROCESSING rows; a read that
+        # cannot be proven complete raises and becomes the "ingestion check failed" self-alert.
         fail_cutoff = now - timedelta(hours=1)
         stuck_cutoff = now - timedelta(minutes=GEOMNURI_PATROL_INGEST_STUCK_MINUTES)
-        for row in ingest_rows:
+        # Task #198 (CASSANDRA 5707 B4): the table key is (source_type, source_id); the ingestion pipeline only
+        # accepts google_drive, so the scope is pinned to it and a different source_type can never collide in
+        # the source_id uniqueness proof.
+        # Task #198 (CASSANDRA 5707 B1): ALL FAILED rows are read (not just the last hour), so a failure that
+        # happened during an outage / before patrol recovered stays visible as BACKLOG instead of silently aging out.
+        processing_rows = await sb_get_all_strict(
+            "call_image_ingestions", {"status": "eq.PROCESSING", "source_type": "eq.google_drive"},
+            key_col="source_id", key_type=str, headers=_internal_rpc_headers())
+        failed_rows = await sb_get_all_strict(
+            "call_image_ingestions", {"status": "eq.FAILED", "source_type": "eq.google_drive"},
+            key_col="source_id", key_type=str, headers=_internal_rpc_headers())
+        failed_recent = []
+        failed_backlog = []
+        stuck = []
+        invalid_processing = []       # Task #198 (CASSANDRA 5718 P1): PROCESSING rows whose age cannot be trusted
+        for row in processing_rows + failed_rows:
             updated = _patrol_parse_dt(row.get("updated_at"))
+            if row.get("status") == "PROCESSING" and (updated is None or updated.tzinfo is None or updated > now + timedelta(minutes=10)):
+                # missing / unparseable / timezone-less / future timestamp: the stuck test below cannot be applied, and silently
+                # skipping such a row would hide a stuck job forever -> explicit internal alarm after the loop
+                invalid_processing.append(row)
+                continue
             if updated is None:
+                if row.get("status") == "FAILED" and not _patrol_terminal_ingestion_failure(row):
+                    failed_backlog.append(row)       # unknown age: never dropped silently
                 continue
             local_updated = updated.astimezone(KST)
             if row.get("status") == "PROCESSING" and local_updated < stuck_cutoff:
                 stuck.append(row)
-            if (
-                row.get("status") == "FAILED"
-                and local_updated >= fail_cutoff
-                and not _patrol_terminal_ingestion_failure(row)
-            ):
-                failed_recent.append(row)
+            if row.get("status") == "FAILED" and not _patrol_terminal_ingestion_failure(row):
+                (failed_recent if local_updated >= fail_cutoff else failed_backlog).append(row)
         if stuck:
             sample = ", ".join(str(x.get("source_id"))[:24] for x in stuck[:3])
             await emit(
@@ -6485,8 +6733,18 @@ async def run_geomnuri_patrol_once() -> dict:
                 cooldown_seconds=3600,
             )
 
-        # FAILED는 집계키 하나로 매시간 재경보하지 않는다.
-        # source_id별로 24시간 쿨다운하여 신규 실패는 알리되 동일 파일 반복실패는 스팸 방지.
+        if invalid_processing:
+            inv_ids = sorted(str(r.get("source_id") or "unknown") for r in invalid_processing)
+            inv_digest = hashlib.sha256("\n".join(inv_ids).encode("utf-8")).hexdigest()[:10]
+            await emit(
+                f"patrol_internal_ingestion_updated_at::{inv_digest}",
+                f"순라 ingestion 점검: PROCESSING {len(inv_ids)}건의 updated_at이 없거나 해석 불가·시간대 없음·미래 값이라 "
+                f"장기 점유 여부를 판정할 수 없음(건너뛰지 않고 경보). sample={', '.join(i[:24] for i in inv_ids[:3])}",
+                severity="CRITICAL",
+            )
+
+        # Recent FAILED: per-source_id alert, 24h cooldown (new failures are told, repeats are not spammed).
+        failed_recent.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)     # newest first under the cap
         for row in failed_recent[:10]:
             source_id = str(row.get("source_id") or "unknown")
             fmt = str(row.get("format") or "unknown")
@@ -6496,8 +6754,25 @@ async def run_geomnuri_patrol_once() -> dict:
                 severity="WARN",
                 cooldown_seconds=24 * 3600,
             )
+        # Unresolved FAILED older than 1h: ONE daily digest (not one alert per row).  The key carries a hash of the
+        # exact id set, so a changed set is announced again at once while an unchanged set repeats only every 24h.
+        # Rows beyond the recent cap are folded into the digest, so a burst can never be lost behind the cap.
+        overflow = failed_recent[10:]
+        backlog = failed_backlog + overflow
+        if backlog:
+            ids = sorted(str(r.get("source_id") or "unknown") for r in backlog)
+            digest = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:10]
+            ages = [a for a in (_patrol_parse_dt(r.get("updated_at")) for r in backlog) if a is not None]
+            oldest = f"{(now - min(ages).astimezone(KST)).total_seconds() / 3600:.0f}시간" if ages else "알 수 없음"
+            await emit(
+                f"ingestion_failed_backlog::{digest}",
+                f"call_image_ingestions 미해결 FAILED 적체 {len(backlog)}건(1시간 초과 또는 상한 초과), 가장 오래된 {oldest}. "
+                f"sample={', '.join(i[:24] for i in ids[:3])}",
+                severity="WARN",
+                cooldown_seconds=24 * 3600,
+            )
     except Exception as e:
-        await emit("patrol_internal_ingestion_check", f"순라 ingestion 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_ingestion_check", f"순라 ingestion 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
     # 4-B) Task#181 Kakao A-axis completeness mismatch
     # OPEN은 control total 미확보 상태이므로 장애가 아니다. 월별 control이
@@ -6505,17 +6780,14 @@ async def run_geomnuri_patrol_once() -> dict:
     try:
         end_date = today_kst()
         start_date = end_date - timedelta(days=45)
-        completeness_rows = await sb_h(
-            "POST",
+        completeness_rows = await sb_rpc_strict(
             "rpc/get_kakao_daily_completeness_v1",
-            json={
+            {
                 "p_start_date": str(start_date),
                 "p_end_date": str(end_date),
             },
             headers=_internal_rpc_headers(),
         )
-        if not isinstance(completeness_rows, list):
-            completeness_rows = []
         for row in completeness_rows:
             if str(row.get("completeness_status") or "").upper() != "MISMATCH":
                 continue
@@ -6525,7 +6797,7 @@ async def run_geomnuri_patrol_once() -> dict:
             missing = int(row.get("missing_count") or 0)
             extra = int(row.get("extra_count") or 0)
             await emit(
-                f"kakao_completeness::{page_date}::{expected}::{observed}",
+                f"kakao_completeness::{page_date}",
                 f"카카오 A축 완결성 불일치: {page_date}, "
                 f"월별 정본={expected}건 / 일별 evidence={observed}건 "
                 f"(누락={missing}, 초과={extra}). 최종 일별 화면 재업로드 필요.",
@@ -6536,20 +6808,16 @@ async def run_geomnuri_patrol_once() -> dict:
     except Exception as e:
         await emit(
             "patrol_internal_kakao_completeness_check",
-            f"순라 Kakao A축 완결성 점검 자체 실패: {e}",
+            f"순라 Kakao A축 완결성 점검 자체 실패: {_patrol_exc_text(e)}",
             task_id=181,
             severity="CRITICAL",
-            cooldown_seconds=3600,
+            cooldown_seconds=PATROL_SELF_FAILURE_COOLDOWN_SECONDS,
         )
 
     # 5) task-linked domain NULL 재발 — task#83 회귀 감시
     try:
         cutoff = now - timedelta(hours=1)
-        events = await sb_select("magi_task_events", {
-            "created_at": f"gte.{cutoff.astimezone(timezone.utc).isoformat()}",
-            "order": "created_at.desc",
-            "limit": "1000",
-        }) or []
+        events = await _patrol_read_events(cutoff)
         bad = []
         for ev in events:
             created = _patrol_parse_dt(ev.get("created_at"))
@@ -6566,14 +6834,14 @@ async def run_geomnuri_patrol_once() -> dict:
                 cooldown_seconds=3600,
             )
     except Exception as e:
-        await emit("patrol_internal_domain_check", f"순라 domain 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_domain_check", f"순라 domain 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
     # 6) HOLD 메타데이터 완전성 — 오래된 보류 맥락 유실 방지(task#161)
     try:
-        hold_tasks = await sb_select("magi_tasks", {
+        hold_tasks = await sb_get_strict("magi_tasks", {
             "status": "eq.HOLD",
             "order": "priority.asc,updated_at.desc",
-        }) or []
+        })
         for t in hold_tasks:
             missing = [
                 name for name in ("blocked_reason", "waiting_for", "next_action")
@@ -6590,26 +6858,33 @@ async def run_geomnuri_patrol_once() -> dict:
                     cooldown_seconds=6 * 3600,
                 )
     except Exception as e:
-        await emit("patrol_internal_hold_metadata_check", f"순라 HOLD 메타데이터 점검 자체 실패: {e}", severity="CRITICAL")
+        await emit("patrol_internal_hold_metadata_check", f"순라 HOLD 메타데이터 점검 자체 실패: {_patrol_exc_text(e)}", severity="CRITICAL")
 
-    # 건강한 스캔도 scheduler_status에는 heartbeat만 남긴다.
+    # Task #198: ledger-guarded dispatch (burst-proof, fail-closed), then the heartbeat.
+    report = await pal.AlertDispatcher(PatrolLedgerIO()).dispatch(candidates)
+    emitted = report.emitted
     result = f"alerts={len(emitted)} findings={len(findings)}"
+    if report.ledger_unreadable:
+        result += " ledger_unreadable"
+    if report.deferred:
+        result += f" deferred={len(report.deferred)}"
     await mark_scheduler_run("geomnuri_patrol", result)
 
-    if emitted:
-        lines = [f"🚨 검누리 순라 경보 {len(emitted)}건"]
-        for item in emitted[:8]:
-            lines.append(f"• [{item['severity']}] {item['detail'][:260]}")
-        if len(emitted) > 8:
-            lines.append(f"• ...외 {len(emitted)-8}건")
-        lines.append("공식 원장: Supabase magi_task_events")
-        try:
-            await send_telegram_broadcast("\n".join(lines))
-        except Exception as e:
-            logger.error(f"순라 Telegram 경보 발송 실패: {e}")
-
     logger.info(f"검누리 순라 완료: {result}")
-    return {"ok": True, "alerts": emitted, "findings": findings}
+    return {"ok": True, "alerts": emitted, "findings": findings,
+            "sent": report.sent, "skipped": report.skipped, "deferred": report.deferred}
+
+
+async def _patrol_report_loop_error(exc: BaseException) -> None:
+    """Task #198: the patrol loop's own failure goes through the same ledger (claim/CAS,
+    cooldown) instead of a Telegram message on every failing cycle."""
+    import patrol_alert_ledger as pal
+
+    cand = pal.Candidate(
+        key="loop_error", namespace=pal.NS_META, write_event=False, severity="CRITICAL",
+        detail=f"검누리 순라 자체 오류: {_patrol_exc_text(exc)}",
+        cooldown_seconds=PATROL_SELF_FAILURE_COOLDOWN_SECONDS)
+    await pal.AlertDispatcher(PatrolLedgerIO()).dispatch([cand])
 
 
 def geomnuri_patrol_scheduler():
@@ -6628,11 +6903,9 @@ def geomnuri_patrol_scheduler():
             except Exception:
                 pass
             try:
-                loop.run_until_complete(send_telegram_broadcast(
-                    f"🚨 검누리 순라 자체 오류\n{str(e)[:700]}"
-                ))
-            except Exception:
-                pass
+                loop.run_until_complete(_patrol_report_loop_error(e))
+            except Exception as e2:
+                logger.error(f"검누리 순라 자체 오류 보고 실패: {type(e2).__name__}")
         elapsed = time.time() - started
         time.sleep(max(GEOMNURI_PATROL_INTERVAL_SECONDS - elapsed, 30))
 
